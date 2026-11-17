@@ -1,0 +1,83 @@
+{
+  "limits": {
+    "min_images": 20,
+    "max_images": 600
+  },
+  "video": {
+    "target_frames": 240,
+    "similar_bits": 4,
+    "max_long_side": 3840
+  },
+  "masks": {
+    "model_file": "sam3-f16.ggml",
+    "detector_file": null,
+    "prompt": "person"
+  },
+  "subject": {
+    "model_file": "birefnet-general.safetensors"
+  },
+  "sfm": {
+    "quality": "high",
+    "min_registered_fraction": 0.6,
+    "attempts": [
+      {"features": "sift", "matcher": "bruteforce"},
+      {"features": "aliked-n16rot", "matcher": "lightglue",
+       "aliked_model": "aliked-n16rot.onnx", "lightglue_model": "aliked-lightglue.onnx"}
+    ]
+  },
+  "normals": {
+    "model_file": "moge2-vitb-normal.onnx"
+  },
+  "dense_seed": {
+    "model_file": "romav2.0.1.pt",
+    "preset": "balanced"
+  },
+  "quality": {
+    "preview": {
+      "max_image_size": 1280,
+      "iterations": 7000,
+      "cap_max": 500000,
+      "masks": false,
+      "subject_only": false,
+      "normals": false,
+      "dense_seed": false,
+      "train_preset": "3dgs",
+      "train_args": [],
+      "mesh": {"visual_faces": 150000, "collision_faces": 10000, "texture_size": 2048}
+    },
+    "standard": {
+      "max_image_size": 1920,
+      "iterations": 15000,
+      "cap_max": 1000000,
+      "masks": true,
+      "subject_only": false,
+      "normals": true,
+      "dense_seed": false,
+      "train_preset": "3dgs",
+      "train_args": [],
+      "mesh": {"visual_faces": 300000, "collision_faces": 20000, "texture_size": 4096}
+    },
+    "high": {
+      "max_image_size": 3072,
+      "iterations": 30000,
+      "cap_max": 2000000,
+      "masks": true,
+      "subject_only": false,
+      "normals": true,
+      "dense_seed": false,
+      "train_preset": "3dgs",
+      "train_args": [],
+      "mesh": {"visual_faces": 600000, "collision_faces": 30000, "texture_size": 8192}
+    }
+  },
+  "timeouts_seconds": {
+    "extract": 3600,
+    "masks": 7200,
+    "sfm": 7200,
+    "normals": 3600,
+    "dense": 7200,
+    "train": 14400,
+    "train_stall": 1800,
+    "gpu_lock_wait": 43200
+  }
+}

@@ -1,0 +1,9 @@
+# Downloaded by setup.ps1, not part of the source
+tools/
+
+# Sample inputs and scan results
+data/
+runs/
+
+__pycache__/
+*.pyc

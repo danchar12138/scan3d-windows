@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>三维扫描</title>
+<link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/style.css">
+<!-- Where the 3D viewer's libraries live (all local files; nothing is fetched from the internet).
+     The server allows this one inline block by its hash, so keep it on one line. -->
+<script type="importmap">{"imports":{"three":"/static/vendor/three/three.module.js","three/addons/":"/static/vendor/three/addons/","@sparkjsdev/spark":"/static/vendor/spark/spark.module.js"}}</script>
+</head>
+<body>
+
+<header class="topbar">
+  <a class="brand" href="#/">
+    <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+      <path d="M16 3 4.5 9.5v13L16 29l11.5-6.5v-13z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+      <path d="M4.5 9.5 16 16l11.5-6.5M16 16v13" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/>
+    </svg>
+    <span>三维扫描</span>
+  </a>
+  <span class="conn" id="conn" hidden></span>
+</header>
+
+<main>
+  <div class="banner" id="banner" role="status" hidden></div>
+
+  <!-- ===================================================== home: new scan + job list -->
+  <div id="view-home">
+    <!-- The network weights the features need and the licences they come under. One line
+         while nothing a default scan needs is missing; the rows are built by app.js. -->
+    <details class="card slim models" id="models-card" hidden>
+      <summary>
+        <h2>模型与许可</h2>
+        <span class="models-summary" id="models-summary"></span>
+      </summary>
+      <p class="hint">部分功能要用到第三方模型。带许可的模型，需要你本人同意许可后才会下载和使用；没同意的功能会被跳过，其余照常运行。</p>
+      <ul class="model-list" id="model-list"></ul>
+      <p class="hint" id="models-remote" hidden>同意许可和下载模型要在运行扫描程序的电脑上操作。</p>
+      <p class="form-error" id="models-error" role="alert" hidden></p>
+    </details>
+
+    <section class="card" id="new-scan" aria-labelledby="new-scan-title">
+      <h1 id="new-scan-title">新建扫描</h1>
+      <p class="lead">围绕物体或场景拍一组照片或一段视频，电脑会算出相机位置、训练三维高斯并生成网格模型。</p>
+
+      <div class="tabs" id="source-tabs" role="tablist" hidden>
+        <button type="button" class="tab is-active" id="tab-upload" role="tab" aria-selected="true">上传照片或视频</button>
+        <button type="button" class="tab" id="tab-path" role="tab" aria-selected="false">使用这台电脑上的文件夹</button>
+      </div>
+
+      <div id="source-upload">
+        <div class="dropzone" id="dropzone">
+          <p class="dropzone-title">把照片或视频拖到这里</p>
+          <label class="btn" for="file-input">选择文件</label>
+          <input class="visually-hidden" type="file" id="file-input" multiple
+                 accept="image/*,video/*,.jpg,.jpeg,.png,.webp,.heic,.heif,.tif,.tiff,.bmp,.mp4,.mov,.m4v,.mkv,.avi,.webm">
+          <p class="hint">支持 JPG、PNG、BMP 图片和 MP4、MOV、M4V、MKV、AVI、WebM 视频。HEIC、WebP、TIFF 图片会被跳过，请先在手机相机里把照片格式设为 JPG。<br>建议 50–300 张相互重叠的照片，或一段 1–2 分钟的环绕视频。</p>
+        </div>
+
+        <div class="file-summary" id="file-summary" hidden>
+          <span id="file-summary-text"></span>
+          <button type="button" class="link-btn" id="btn-clear-files">清空</button>
+        </div>
+        <ul class="file-list" id="file-list" hidden></ul>
+      </div>
+
+      <div id="source-path" hidden>
+        <label class="field">
+          <span class="field-label">文件夹或视频文件的完整路径</span>
+          <input type="text" id="local-path" autocomplete="off" spellcheck="false" placeholder="例如 D:\photos\living-room">
+        </label>
+        <p class="hint">文件夹里放图片和（或）视频；也可以直接填一个视频文件的路径。文件不会被复制或修改。</p>
+      </div>
+
+      <fieldset class="quality" id="quality">
+        <legend>质量</legend>
+        <label class="quality-option">
+          <input type="radio" name="quality" value="preview">
+          <span class="quality-body">
+            <span class="quality-name">预览</span>
+            <span class="quality-desc">约 3–5 分钟。快速确认素材能不能用，细节比较粗。</span>
+          </span>
+        </label>
+        <label class="quality-option">
+          <input type="radio" name="quality" value="standard" checked>
+          <span class="quality-body">
+            <span class="quality-name">标准</span>
+            <span class="quality-desc">约 10–15 分钟。质量和耗时比较均衡，适合大多数场景。</span>
+          </span>
+        </label>
+        <label class="quality-option">
+          <input type="radio" name="quality" value="high">
+          <span class="quality-body">
+            <span class="quality-name">高质量</span>
+            <span class="quality-desc">约 40–50 分钟。近看更清晰，但文件大一倍，照片少于 150 张时提升有限。</span>
+          </span>
+        </label>
+      </fieldset>
+      <p class="hint">耗时以 130 张照片、RTX 5070 Ti 笔记本显卡为参考，实际取决于素材数量和显卡性能。同一时间只运行一个任务，其余的会排队。</p>
+
+      <fieldset class="seg scan-kind" id="scan-kind">
+        <legend>扫描类型</legend>
+        <label><input type="radio" name="scan-kind" value="scene" checked><span>场景</span></label>
+        <label><input type="radio" name="scan-kind" value="object"><span>物体（只保留主体，背景不重建）</span></label>
+      </fieldset>
+      <p class="hint option-note" id="scan-kind-note" hidden></p>
+
+      <label class="check" for="opt-masks">
+        <input type="checkbox" id="opt-masks" checked aria-describedby="opt-masks-note">
+        <span>抠除画面里的人</span>
+      </label>
+      <p class="hint option-note" id="opt-masks-note" hidden></p>
+
+      <label class="field">
+        <span class="field-label">名称（可选）</span>
+        <input type="text" id="job-name" autocomplete="off" autocapitalize="none" spellcheck="false"
+               maxlength="64" placeholder="留空则自动生成，例如 scan-20260101-120000">
+        <span class="hint">只能用英文字母、数字、- 和 _。</span>
+      </label>
+
+      <div class="upload-progress" id="upload-progress" hidden>
+        <div class="progress"><div class="progress-bar" id="upload-bar"></div></div>
+        <p class="upload-text" id="upload-text"></p>
+        <p class="hint">上传期间请保持这个页面打开，手机不要锁屏。</p>
+      </div>
+
+      <p class="form-error" id="form-error" role="alert" hidden></p>
+
+      <div class="actions">
+        <button type="button" class="btn primary" id="btn-start">开始扫描</button>
+        <button type="button" class="btn" id="btn-abort" hidden>取消上传</button>
+      </div>
+    </section>
+
+    <section class="card slim" id="lan-card" hidden>
+      <h2>用手机访问</h2>
+      <p id="lan-text"></p>
+      <div class="phone" id="lan-body" hidden>
+        <div class="phone-qr" id="lan-qr" role="img" aria-label="手机访问地址的二维码"></div>
+        <div class="phone-side">
+          <ul class="lan-urls" id="lan-urls"></ul>
+          <p class="hint">用手机相机扫二维码，或在手机浏览器里输入上面的地址。地址里带有配对码，每次启动都不变，可以存为书签；不要发给不认识的人。打不开时，请在 Windows 防火墙的提示里允许访问。</p>
+        </div>
+      </div>
+    </section>
+
+    <section class="jobs" aria-labelledby="jobs-title">
+      <h2 id="jobs-title">扫描记录</h2>
+      <p class="empty" id="jobs-empty">还没有扫描记录。</p>
+      <ul class="job-list" id="job-list"></ul>
+    </section>
+  </div>
+
+  <!-- ===================================================== detail of one job -->
+  <div id="view-detail" hidden>
+    <a class="back" href="#/">‹ 返回列表</a>
+
+    <section class="card">
+      <div class="detail-head">
+        <h1 id="d-name"></h1>
+        <span class="badge" id="d-state"></span>
+      </div>
+      <p class="meta" id="d-meta"></p>
+
+      <ol class="stages" id="d-stages"></ol>
+
+      <div class="progress-row" id="d-progress-row" hidden>
+        <div class="progress" id="d-progress"><div class="progress-bar" id="d-bar"></div></div>
+        <span class="progress-percent" id="d-percent"></span>
+      </div>
+      <p class="message" id="d-message" role="status"></p>
+
+      <div class="error-box" id="d-error" role="alert" hidden>
+        <h2>扫描失败</h2>
+        <pre id="d-error-text"></pre>
+      </div>
+
+      <ul class="warn-box" id="d-warnings" hidden></ul>
+
+      <div class="outputs" id="d-outputs" hidden>
+        <h2>输出文件</h2>
+        <ul class="output-list" id="d-output-list"></ul>
+        <div class="actions">
+          <button type="button" class="btn" id="btn-open-folder" hidden>打开输出文件夹</button>
+          <button type="button" class="btn" id="btn-open-viewer" hidden>在查看器中打开</button>
+        </div>
+      </div>
+
+      <p class="form-error" id="d-action-error" role="alert" hidden></p>
+
+      <div class="actions" id="d-actions">
+        <button type="button" class="btn primary" id="btn-job-start" hidden>开始扫描</button>
+        <button type="button" class="btn danger" id="btn-job-cancel" hidden>取消任务</button>
+        <button type="button" class="btn" id="btn-job-folder" hidden>打开任务文件夹</button>
+        <button type="button" class="btn quiet-danger" id="btn-job-delete" hidden>删除</button>
+      </div>
+    </section>
+
+    <!-- ===================================================== everything in output/, in the page -->
+    <section class="card viewer" id="d-viewer" hidden>
+      <h2>在线查看</h2>
+      <nav class="tabs viewer-tabs" id="v-tabs" aria-label="查看内容">
+        <a class="tab" data-view="report" href="#/">报告</a>
+        <a class="tab" data-view="splat" href="#/">高斯</a>
+        <a class="tab" data-view="mesh" href="#/">网格</a>
+        <a class="tab" data-view="collision" href="#/">碰撞网格</a>
+        <a class="tab" data-view="overlay" href="#/">叠加对齐</a>
+      </nav>
+
+      <div id="v-3d" hidden>
+        <div class="viewer-stage" id="v-stage">
+          <div class="viewer-status" id="v-status" role="status" hidden>
+            <p id="v-status-text"></p>
+            <div class="progress" id="v-progress"><div class="progress-bar" id="v-progress-bar"></div></div>
+            <button type="button" class="btn small" id="v-retry" hidden>重试</button>
+          </div>
+          <div class="viewer-status viewer-confirm" id="v-confirm" role="alertdialog" aria-labelledby="v-confirm-title" hidden>
+            <p class="viewer-confirm-title" id="v-confirm-title"></p>
+            <p id="v-confirm-text"></p>
+            <div class="viewer-confirm-actions">
+              <button type="button" class="btn small" id="v-confirm-no">不加载</button>
+              <button type="button" class="btn small" id="v-confirm-yes">仍然加载</button>
+            </div>
+          </div>
+          <button type="button" class="viewer-expand" id="v-expand" aria-pressed="false">全屏</button>
+        </div>
+        <div class="viewer-tools">
+          <fieldset class="seg" id="v-quality" hidden>
+            <legend>画质</legend>
+            <label><input type="radio" name="v-quality" value="lite"><span id="v-quality-lite">轻量</span></label>
+            <label><input type="radio" name="v-quality" value="full"><span id="v-quality-full">完整</span></label>
+            <label><input type="radio" name="v-quality" value="original"><span id="v-quality-original">原画质</span></label>
+          </fieldset>
+          <fieldset class="seg" id="v-style" hidden>
+            <legend>碰撞网格显示</legend>
+            <label><input type="radio" name="v-style" value="wire"><span>线框</span></label>
+            <label><input type="radio" name="v-style" value="solid"><span>实体</span></label>
+            <label><input type="radio" name="v-style" value="both"><span>实体＋线框</span></label>
+          </fieldset>
+          <div class="viewer-buttons">
+            <button type="button" class="btn small" id="v-reset">重置视角</button>
+            <button type="button" class="btn small" id="v-next-camera" hidden>换个机位</button>
+          </div>
+        </div>
+        <p class="hint" id="v-note"></p>
+        <p class="hint">拖动旋转，滚轮或双指缩放，右键拖动或双指平移。开始时的视角是其中一张照片的拍摄位置；高斯在拍摄位置附近看最清楚，离得越远越模糊。</p>
+      </div>
+
+      <div id="v-report" hidden>
+        <p class="hint" id="v-report-status"></p>
+        <dl class="report" id="v-report-list"></dl>
+        <ul class="warn-box" id="v-report-warnings" hidden></ul>
+        <details class="raw" id="v-report-raw-box" hidden>
+          <summary>report.json 原始内容</summary>
+          <pre class="raw-text" id="v-report-raw" tabindex="0"></pre>
+        </details>
+        <h3 id="v-transform-title" hidden>场景变换（scene_transform.json）</h3>
+        <p id="v-transform-summary" hidden></p>
+        <details class="raw" id="v-transform-raw-box" hidden>
+          <summary>scene_transform.json 原始内容</summary>
+          <pre class="raw-text" id="v-transform-raw" tabindex="0"></pre>
+        </details>
+      </div>
+    </section>
+
+    <details class="card log" id="d-log">
+      <summary>运行日志</summary>
+      <div class="log-tools">
+        <label for="d-log-file" class="visually-hidden">日志文件</label>
+        <select id="d-log-file"></select>
+        <span class="hint" id="d-log-note"></span>
+      </div>
+      <pre class="log-text" id="d-log-text" tabindex="0"></pre>
+    </details>
+  </div>
+</main>
+
+<!-- shown when the page itself cannot run -->
+<noscript><p class="noscript">这个页面需要启用 JavaScript。</p></noscript>
+
+<script src="/static/jobview.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
