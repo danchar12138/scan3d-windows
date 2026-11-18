@@ -192,6 +192,7 @@ ATLAS_FILL = 0.76
 ATLAS_GOOD_FILL = 0.70
 ATLAS_SCALE_TOLERANCE = 0.03
 ATLAS_PROBES = 8
+ATLAS_MAX_EDGE = 8192     # the texture is enlarged to at most this when the patches do not fit
 # The texturer holds every photo in memory at once: above this many pixels in all, the photos
 # are made smaller when they are undistorted (a 4096 atlas uses a fifth of the photos'
 # resolution on a typical scan, so this costs no texture detail).
@@ -1857,6 +1858,25 @@ _DELAUNAY_PHASES = (("Triangulating points", 0.79), ("Initializing ray tracer", 
                     ("Extracting surface", 0.95), ("Writing surface mesh", 0.97))
 
 
+def _fusion_masks(dataset_dir: Path, names, out: Path) -> int:
+    """Copy the masks of the photos dense matching used to where `stereo_fusion` looks for them:
+    `<out>/<photo name>.png`. In fusion a pixel whose mask value is 0 (black) is left out of the
+    points, so the people and, in a scan of an object, the whole background never become
+    surface. Returns how many photos have a mask."""
+    masks_dir = dataset_dir / "masks"
+    count = 0
+    if not masks_dir.is_dir():
+        return 0
+    for name in names:
+        src = (masks_dir / name).with_suffix(".png")
+        if src.is_file():
+            dst = out / (name + ".png")
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(src, dst)
+            count += 1
+    return count
+
+
 def _dense_geometry(*, colmap, dataset_dir: Path, work_dir: Path, log_path, cancel_file,
                     progress) -> dict:
     """Dense matching, fusion and meshing with COLMAP. Returns {"path" (PLY, dataset frame),
@@ -1900,9 +1920,12 @@ def _dense_geometry(*, colmap, dataset_dir: Path, work_dir: Path, log_path, canc
     _check_cancel(cancel_file)
     progress(0.70, "融合点云")
     fused = workspace / "fused.ply"
+    fusion_masks = work_dir / "fusion_masks"
+    masked = _fusion_masks(dataset_dir, names, fusion_masks)
+    mask_args = ("--StereoFusion.mask_path", fusion_masks) if masked else ()
     cmd = _colmap_cmd(colmap, "stereo_fusion", "--workspace_path", workspace,
                       "--workspace_format", "COLMAP", "--input_type", "geometric",
-                      "--output_path", fused, *FUSION_OPTIONS)
+                      "--output_path", fused, *mask_args, *FUSION_OPTIONS)
     state = {"points": 0}
 
     def on_fused(line: str) -> None:
@@ -1946,7 +1969,7 @@ def _dense_geometry(*, colmap, dataset_dir: Path, work_dir: Path, log_path, canc
         raise MeshError(f"colmap delaunay_mesher wrote no mesh. Log: {log_path}")
     progress(1.0, "重建表面")
     return {"path": meshed, "images": len(names), "points": state["points"],
-            "sparse": workspace / "sparse"}
+            "sparse": workspace / "sparse", "masked_photos": masked}
 
 
 def face_pixel_sizes(mesh: Mesh, cameras: dict, images: list, settle: float = 0.0):
@@ -2116,7 +2139,20 @@ def texture_mesh(*, colmap, dataset_dir: Path, work_dir: Path, mesh: Mesh, world
         runs.append((scale, state["atlas"]))
         return state["atlas"]
 
-    scale, planned, probes = fit_texture_scale(probe, edge)
+    # A mesh made of very many small separate patches (a thin, rough object such as slatted
+    # rails, seen in many nearly identical frames) can need more than the requested texture even
+    # at the smallest scale: every patch has a gutter. Rather than give no mesh at all, the
+    # texture is doubled, up to ATLAS_MAX_EDGE, and the result says so ("texture_enlarged").
+    requested_edge = edge
+    while True:
+        try:
+            scale, planned, probes = fit_texture_scale(probe, edge)
+            break
+        except MeshError:
+            if edge * 2 > ATLAS_MAX_EDGE:
+                raise
+            _note(log_path, f"the patches do not fit a {edge} px texture; trying {edge * 2} px")
+            edge *= 2
     _note(log_path, "texture scale probes: " + ", ".join(f"{s:.4f} -> {w}x{h}" for s, (w, h) in runs)
           + f"; chosen {scale:.4f}")
     _check_cancel(cancel_file)
@@ -2150,7 +2186,7 @@ def texture_mesh(*, colmap, dataset_dir: Path, work_dir: Path, mesh: Mesh, world
     return {"mesh": Mesh(xyz_out, tris_out, uv_out), "image": image, "edge": atlas_w,
             "scale": scale, "probes": probes, "regions": state["regions"],
             "masked_photos": masked, "occluders": len(occluders),
-            "photo_size": limit, **fill}
+            "photo_size": limit, "texture_enlarged": edge > requested_edge, **fill}
 
 
 # =============================================================================================
@@ -2172,7 +2208,9 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
     visual_faces, collision_faces
                   upper bounds on the triangle counts of the two meshes.
     texture_size  upper bound on the texture's edge, in pixels. The texture is square, with a
-                  power-of-two edge.
+                  power-of-two edge. Only a mesh with so many separate patches that they do not
+                  fit it at any scale gets a larger one (up to ATLAS_MAX_EDGE; the result has
+                  "texture_enlarged": true).
     log_path      the tools' output and a summary of each step are appended here.
     cancel_file   if this path appears the work stops and proc.Cancelled is raised.
     on_progress   called as on_progress(fraction 0..1, message), never going backwards.
@@ -2350,12 +2388,14 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
         "texture_format": "png",
         "texture_scale": round(textured["scale"], 4),
         "texture_patches": textured["regions"],
+        "texture_enlarged": textured["texture_enlarged"],
         "faces_flat_coloured": textured["faces_flat_coloured"],
         "faces_unseen_dropped": textured["faces_unseen_dropped"],
         "masked_photos": textured["masked_photos"],
         "geometry": "colmap-dense",
         "dense_photos": dense["images"],
         "dense_points": dense["points"],
+        "dense_masked_photos": dense["masked_photos"],
         "raw_faces": raw_faces,
         "faces_shards_removed": shards,
         "raw_components": cut["components_before"],

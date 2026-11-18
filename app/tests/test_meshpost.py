@@ -919,6 +919,12 @@ elif command == "stereo_fusion":
     for k, name in enumerate(names):
         assert (ws / "stereo" / "depth_maps" / (name + ".geometric.bin")).is_file()
         log("Fusing image [%d/%d] with index %d" % (k + 1, len(names), k))
+    masks = arg("--StereoFusion.mask_path")
+    if masks:
+        # what the real tool reads: <mask folder>/<photo name>.png
+        listing = sorted(str(f.relative_to(masks)).replace(os.sep, "/") for f in Path(masks).rglob("*.png"))
+        with open(os.environ["FAKE_CALLS"], "a") as calls:
+            calls.write("fusion-masks %s\n" % " ".join(listing))
     Path(arg("--output_path")).write_bytes(b"ply points")
     Path(arg("--output_path") + ".vis").write_bytes(b"vis")
     log("Number of fused points: 4321")
@@ -980,7 +986,7 @@ elif command == "mesh_texturer":
     log("%d / %d faces assigned to views" % (unseen.count(False), n))
     log("Found %d regions" % max(1, n // 8))
     # Atlas: the patches take 4e6 * scale^2 px plus a gutter per patch; COLMAP's layout rule.
-    area = 4e6 * scale * scale + (n // 8) * 25
+    area = 4e6 * scale * scale + (n // 8) * float(os.environ.get("FAKE_GUTTER", 25))
     w = 1
     while w < math.sqrt(1.3 * area):
         w *= 2
@@ -1098,6 +1104,8 @@ class PipelineTests(TempDirCase):
         self.assertGreater(result["faces_flat_coloured"], 0)    # the band the stand-in leaves out
         self.assertEqual(result["faces_unseen_dropped"], 0)
         self.assertEqual(result["masked_photos"], 0)
+        self.assertEqual(result["dense_masked_photos"], 0)
+        self.assertEqual(self.calls_to("fusion-masks"), [])     # no masks: fusion gets no mask folder
         self.assertEqual(result["geometry"], "colmap-dense")
         self.assertEqual(result["dense_photos"], 1)
         self.assertEqual(result["dense_points"], 4321)
@@ -1201,6 +1209,10 @@ class PipelineTests(TempDirCase):
         (self.dataset / "masks" / "photos" / "a.png").write_bytes(png_bytes(64, 48, person, 1, (0, 2, 4)))
         result = self.build(self.make_run())
         self.assertEqual(result["masked_photos"], 1)
+        # dense geometry leaves the masked pixels out of the points too: the mask of photo
+        # photos/a.jpg is where fusion looks for it, photos/a.jpg.png
+        self.assertEqual(result["dense_masked_photos"], 1)
+        self.assertEqual(self.calls_to("fusion-masks"), ["fusion-masks photos/a.jpg.png"])
         faces = [int(line.split()[1]) for line in self.calls_to("faces ")]
         _, tris, _ = mp.read_ply(self.tmp / "work" / "texture_in.ply")
         self.assertGreater(len(tris) // 3, result["mesh_faces"])          # occluders handed to COLMAP...
@@ -1249,6 +1261,22 @@ class PipelineTests(TempDirCase):
         b, _, _ = mp.read_ply(self.tmp / "work_t" / "texture_in.ply")
         self.assertEqual(len(a), len(b))
         self.assertLess(max(abs(p - q) for p, q in zip(a, b)), 1e-5)
+
+    def test_patches_that_do_not_fit_the_texture_get_a_larger_one(self):
+        run = self.make_run()
+        base = self.build(run)
+        self.assertFalse(base["texture_enlarged"])
+        self.assertEqual(base["texture_size"], 1024)
+        # a gutter so large that the patches cannot fit 1024 x 1024 at any scale
+        with unittest.mock.patch.dict(os.environ, {"FAKE_GUTTER": "20000"}):
+            result = self.build(run, work_dir=self.tmp / "work2", out_dir=self.tmp / "out2")
+        self.assertTrue(result["texture_enlarged"])
+        self.assertEqual(result["texture_size"], 2048)
+        self.assertEqual(mp.validate_glb(result["mesh"])["texture_width"], 2048)
+        # and when not even the largest allowed texture holds them the mesh step says so
+        with unittest.mock.patch.dict(os.environ, {"FAKE_GUTTER": "1000000"}):
+            with self.assertRaisesRegex(mp.MeshError, "too many separate texture patches"):
+                self.build(run, work_dir=self.tmp / "work3", out_dir=self.tmp / "out3")
 
     def test_an_atlas_other_than_planned_is_refused(self):
         with unittest.mock.patch.dict(os.environ, {"FAKE_ATLAS_HEIGHT": "4096"}):
