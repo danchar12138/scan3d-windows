@@ -60,9 +60,10 @@ foreach ($c in $programs) {
     Write-Host "[ok] $($c.name)"
 }
 
-# Network weights (tools\models). app\models.py knows which files the settings in
-# app\settings.json need and where they come from; weights under a licence nobody has accepted
-# on this machine yet are left out, and the web page offers them later.
+# Network weights (tools\models). app\models.py knows which files each stage needs and where
+# they come from. This fetches the ones the default template uses; any other weights download
+# by themselves when a stage that needs them starts (the licence that covers them is recorded
+# then).
 Write-Host '[models] checking network weights'
 & (Join-Path $tools 'python\python.exe') (Join-Path $root 'app\scan3d.py') models --download
 if ($LASTEXITCODE -ne 0) { throw 'model download failed' }

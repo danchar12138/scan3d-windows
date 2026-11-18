@@ -442,7 +442,8 @@ def quat_from_matrix(R):
 
 
 def write_model(folder, cameras, images):
-    """cameras: {id: (model, w, h, params)}; images: [(id, name, R row-major, t, camera id)]."""
+    """cameras: {id: (model, w, h, params)}; images: [(id, name, R row-major, t, camera id
+    [, [3D point ids the image observes]])]."""
     folder = Path(folder)
     folder.mkdir(parents=True, exist_ok=True)
     out = bytearray(struct.pack("<Q", len(cameras)))
@@ -450,9 +451,12 @@ def write_model(folder, cameras, images):
         out += struct.pack("<iiQQ", cid, model, w, h) + struct.pack("<%dd" % len(params), *params)
     (folder / "cameras.bin").write_bytes(bytes(out))
     out = bytearray(struct.pack("<Q", len(images)))
-    for iid, name, R, t, cid in images:
+    for iid, name, R, t, cid, *rest in images:
+        points = rest[0] if rest else []
         out += struct.pack("<i4d3di", iid, *quat_from_matrix(R), *t, cid)
-        out += name.encode() + b"\x00" + struct.pack("<Q", 0)
+        out += name.encode() + b"\x00" + struct.pack("<Q", len(points))
+        for k, pid in enumerate(points):
+            out += struct.pack("<ddq", float(k), float(k), pid)
     (folder / "images.bin").write_bytes(bytes(out))
 
 
@@ -1038,18 +1042,20 @@ class PipelineTests(TempDirCase):
         # spirula is passed by the pipeline but not used for meshing
         self.tools = {"spirula": str(self.tmp / "no_spirula.exe"), "colmap": str(self.tmp / "colmap.cmd")}
         self.dataset = self.tmp / "dataset"
-        self.add_photos(["photos/a.jpg"])
+        self.add_photos(["photos/a.jpg", "photos/b.jpg"])
         self.calls = self.tmp / "calls.txt"
         patch = unittest.mock.patch.dict(os.environ, {"FAKE_APP_DIR": str(APP), "FAKE_CALLS": str(self.calls)})
         patch.start()
         self.addCleanup(patch.stop)
 
-    def add_photos(self, names):
+    def add_photos(self, names, tracks=None):
+        """Photos of the dataset; `tracks` {name: [3D point ids]}, default: all see points 1..20."""
         for name in names:
             (self.dataset / "images" / name).parent.mkdir(parents=True, exist_ok=True)
             (self.dataset / "images" / name).write_bytes(b"jpeg")
         write_model(self.dataset / "sparse" / "0", {1: LOOK_CAMERA},
-                    [(k + 1, name, LOOK_R, WIDE_T, 1) for k, name in enumerate(names)])
+                    [(k + 1, name, LOOK_R, WIDE_T, 1,
+                      (tracks or {}).get(name, list(range(1, 21)))) for k, name in enumerate(names)])
 
     def make_run(self, name="run", transform=None):
         run = self.tmp / name
@@ -1060,10 +1066,31 @@ class PipelineTests(TempDirCase):
             (run / "scene_transform.json").write_text(json.dumps(transform))
         return run
 
+    DENSE_KEYS = ("max_images", "image_size", "source_images", "geom_consistency")
+
+    def build_dense(self, name="work", **kwargs):
+        """The first half: the dense surface kept in <tmp>/<name>_dense, scratch in <tmp>/<name>."""
+        args = dict(dataset_dir=self.dataset, out_dir=self.tmp / (name + "_dense"),
+                    work_dir=self.tmp / name, tools=self.tools, log_path=self.tmp / "dense.log")
+        args.update(kwargs)
+        return mp.build_dense(**args)
+
     def build(self, run, **kwargs):
+        """Both halves in turn. The dense scratch folder is <tmp>/<work name>; the mesh step's
+        own is <tmp>/<work name>_mesh. Pass dense=... to skip the first half."""
+        name = Path(kwargs.pop("work_dir", self.tmp / "work")).name
+        dense_kw = {k: kwargs.pop(k) for k in self.DENSE_KEYS if k in kwargs}
+        dense = kwargs.pop("dense", None)
+        if dense is None:
+            if "cancel_file" in kwargs:
+                dense_kw["cancel_file"] = kwargs["cancel_file"]
+            dense_kw.setdefault("use_masks", kwargs.get("use_masks", True))
+            dense = self.build_dense(name, **{**{k: kwargs[k] for k in ("dataset_dir", "tools")
+                                                 if k in kwargs}, **dense_kw})
         args = dict(run_dir=run, dataset_dir=self.dataset, out_dir=self.tmp / "out",
-                    work_dir=self.tmp / "work", tools=self.tools, visual_faces=1000,
-                    collision_faces=200, texture_size=1024, log_path=self.tmp / "mesh.log")
+                    work_dir=self.tmp / (name + "_mesh"), tools=self.tools, dense=dense,
+                    visual_faces=1000, collision_faces=200, texture_size=1024,
+                    log_path=self.tmp / "mesh.log")
         args.update(kwargs)
         return mp.build_meshes(**args)
 
@@ -1075,8 +1102,9 @@ class PipelineTests(TempDirCase):
         return [line for line in self.calls.read_text(encoding="utf-8").splitlines() if line.startswith(command)]
 
     def test_builds_both_files(self):
-        seen = []
-        result = self.build(self.make_run(), on_progress=lambda f, m: seen.append((f, m)))
+        seen, seen_dense = [], []
+        dense = self.build_dense(on_progress=lambda f, m: seen_dense.append((f, m)))
+        result = self.build(self.make_run(), dense=dense, on_progress=lambda f, m: seen.append((f, m)))
         mesh = mp.validate_glb(result["mesh"])
         collision = mp.validate_glb(result["collision"])
         self.assertEqual(Path(result["mesh"]).name, "mesh.glb")
@@ -1107,7 +1135,7 @@ class PipelineTests(TempDirCase):
         self.assertEqual(result["dense_masked_photos"], 0)
         self.assertEqual(self.calls_to("fusion-masks"), [])     # no masks: fusion gets no mask folder
         self.assertEqual(result["geometry"], "colmap-dense")
-        self.assertEqual(result["dense_photos"], 1)
+        self.assertEqual(result["dense_photos"], 2)
         self.assertEqual(result["dense_points"], 4321)
         self.assertEqual(result["raw_faces"], 3260)
         self.assertEqual(result["faces_shards_removed"], 0)
@@ -1125,7 +1153,8 @@ class PipelineTests(TempDirCase):
         self.assertLess(collision["bbox_max"][0], 5)
         # dense matching on the photo, with the configured number of source photos
         cfg = (self.tmp / "work" / "dense" / "stereo" / "patch-match.cfg").read_text().splitlines()
-        self.assertEqual(cfg, ["photos/a.jpg", "__auto__, %d" % mp.MVS_SOURCE_IMAGES])
+        # explicit source photos: the other photo of the pair (never "__auto__")
+        self.assertEqual(cfg, ["photos/a.jpg", "photos/b.jpg", "photos/b.jpg", "photos/a.jpg"])
         self.assertIn("--max_image_size %d" % mp.MVS_IMAGE_SIZE, self.calls_to("image_undistorter")[0])
         self.assertEqual(len(self.calls_to("patch_match_stereo")), 1)
         self.assertEqual(self.calls_to("image_deleter"), [])   # every photo used: nothing to drop
@@ -1133,19 +1162,25 @@ class PipelineTests(TempDirCase):
         texturer = self.calls_to("mesh_texturer")
         self.assertGreaterEqual(len(texturer), 2)
         self.assertIn("--MeshTextureMapping.texture_scale_factor %r" % result["texture_scale"], texturer[-1])
-        fractions = [f for f, _ in seen]
-        self.assertEqual(fractions, sorted(fractions))
-        self.assertEqual(fractions[-1], 1.0)
-        self.assertTrue(all(0.0 <= f <= 1.0 for f in fractions))
-        self.assertLessEqual({"准备照片", "计算深度图", "融合点云", "重建表面", "清除零散碎片", "简化网格",
+        for steps in (seen, seen_dense):
+            fractions = [f for f, _ in steps]
+            self.assertEqual(fractions, sorted(fractions))
+            self.assertEqual(fractions[-1], 1.0)
+            self.assertTrue(all(0.0 <= f <= 1.0 for f in fractions))
+        self.assertLessEqual({"准备照片", "计算深度图", "融合点云", "重建表面"}, {m for _, m in seen_dense})
+        self.assertLessEqual({"清除零散碎片", "简化网格",
                               "处理遮罩", "估算贴图尺寸", "生成贴图", "整理贴图", "写出带贴图网格",
                               "简化碰撞网格", "写出碰撞网格", "检查文件", "网格完成"},
                              {m for _, m in seen})
         log = (self.tmp / "mesh.log").read_text(encoding="utf-8", errors="replace")
-        for word in ("patch_match_stereo", "stereo_fusion", "delaunay_mesher", "mesh_simplifier",
-                     "mesh_texturer", "[meshpost] texture scale probes", "[meshpost] wrote mesh.glb"):
+        for word in ("mesh_simplifier", "mesh_texturer", "[meshpost] texture scale probes",
+                     "[meshpost] wrote mesh.glb"):
             self.assertIn(word, log)
-        self.assertNotIn("spirula", log.lower().replace("spirula-train", ""))
+        dense_log = (self.tmp / "dense.log").read_text(encoding="utf-8", errors="replace")
+        for word in ("patch_match_stereo", "stereo_fusion", "delaunay_mesher"):
+            self.assertIn(word, dense_log)
+            self.assertNotIn(word, log)
+        self.assertNotIn("spirula", (log + dense_log).lower().replace("spirula-train", ""))
 
     def test_dense_matching_uses_a_spread_of_the_photos(self):
         names = ["photos/p_%03d.jpg" % k for k in range(9)] + ["v1/f_%03d.jpg" % k for k in range(3)]
@@ -1164,7 +1199,7 @@ class PipelineTests(TempDirCase):
         kept = [n for _, n, _, _, _ in mp.read_images_bin(self.tmp / "work" / "dense" / "sparse" / "images.bin")]
         self.assertEqual(sorted(kept), sorted(chosen))
         # ...while the texture is made from every photo
-        textured = [n for _, n, _, _, _ in mp.read_images_bin(self.tmp / "work" / "undistorted" / "sparse" / "images.bin")]
+        textured = [n for _, n, _, _, _ in mp.read_images_bin(self.tmp / "work_mesh" / "undistorted" / "sparse" / "images.bin")]
         self.assertEqual(len(textured), 12)
         self.assertEqual(mp.mvs_images([(0, n, None, None, 1) for n in names], 50), sorted(names))
 
@@ -1214,7 +1249,7 @@ class PipelineTests(TempDirCase):
         self.assertEqual(result["dense_masked_photos"], 1)
         self.assertEqual(self.calls_to("fusion-masks"), ["fusion-masks photos/a.jpg.png"])
         faces = [int(line.split()[1]) for line in self.calls_to("faces ")]
-        _, tris, _ = mp.read_ply(self.tmp / "work" / "texture_in.ply")
+        _, tris, _ = mp.read_ply(self.tmp / "work_mesh" / "texture_in.ply")
         self.assertGreater(len(tris) // 3, result["mesh_faces"])          # occluders handed to COLMAP...
         self.assertEqual(set(faces), {len(tris) // 3})
         mesh = mp.validate_glb(result["mesh"])
@@ -1257,8 +1292,8 @@ class PipelineTests(TempDirCase):
         self.assertEqual(mp.validate_glb(moved["mesh"])["extras"]["frame"],
                          "spirula-train (same numbers as splat.ply)")
         # ...and the texturer was given them back in the dataset frame, where the cameras are
-        a, _, _ = mp.read_ply(self.tmp / "work_p" / "texture_in.ply")
-        b, _, _ = mp.read_ply(self.tmp / "work_t" / "texture_in.ply")
+        a, _, _ = mp.read_ply(self.tmp / "work_p_mesh" / "texture_in.ply")
+        b, _, _ = mp.read_ply(self.tmp / "work_t_mesh" / "texture_in.ply")
         self.assertEqual(len(a), len(b))
         self.assertLess(max(abs(p - q) for p, q in zip(a, b)), 1e-5)
 
@@ -1312,14 +1347,125 @@ class PipelineTests(TempDirCase):
         out.mkdir()
         (out / "mesh.glb").write_bytes(b"old")
         (out / "collision.glb").write_bytes(b"old")
-        (self.tmp / "work" / "dense").mkdir(parents=True)
-        (self.tmp / "work" / "dense_mesh.ply").write_bytes(b"old")
+        (self.tmp / "work_dense").mkdir()
+        (self.tmp / "work_dense" / "dense_mesh.ply").write_bytes(b"old")
         with unittest.mock.patch.dict(os.environ, {"FAKE_FAIL": "stereo_fusion"}):
             with self.assertRaises(mp.MeshError):
-                self.build(self.make_run())
-        self.assertFalse((out / "mesh.glb").exists())
+                self.build_dense()
+        self.assertFalse((self.tmp / "work_dense").exists())     # no half-finished surface
+        dense = self.build_dense()
+        with unittest.mock.patch.dict(os.environ, {"FAKE_FAIL": "mesh_texturer"}):
+            with self.assertRaises(mp.MeshError):
+                self.build(self.make_run(), dense=dense)
+        self.assertFalse((out / "mesh.glb").exists())            # the mesh step owns these two
         self.assertFalse((out / "collision.glb").exists())
-        self.assertFalse((self.tmp / "work" / "dense_mesh.ply").exists())
+        self.assertTrue((self.tmp / "work_dense" / "dense_mesh.ply").is_file())   # the surface stays
+
+    def test_dense_step_keeps_only_the_surface_and_its_cameras(self):
+        dense = self.build_dense()
+        folder = self.tmp / "work_dense"
+        self.assertEqual(sorted(p.name for p in folder.iterdir()), ["dense.json", "dense_mesh.ply", "sparse"])
+        self.assertEqual(sorted(p.name for p in (folder / "sparse").iterdir()), ["cameras.bin", "images.bin"])
+        self.assertEqual(dense["path"], folder / "dense_mesh.ply")
+        self.assertEqual((dense["images"], dense["points"], dense["masked_photos"]), (2, 4321, 0))
+        self.assertEqual(dense["photos_dropped"], 0)
+        self.assertEqual(dense["faces"], 3260)
+        loaded = mp.load_dense(folder)
+        self.assertEqual((loaded["images"], loaded["points"], loaded["faces"]),
+                         (dense["images"], dense["points"], dense["faces"]))
+        self.assertIsInstance(loaded["path"], Path)
+        with self.assertRaisesRegex(mp.MeshError, "dense reconstruction"):
+            mp.load_dense(self.tmp / "nothing")
+
+    def test_the_meshes_can_be_made_again_without_repeating_the_dense_step(self):
+        dense = self.build_dense()
+        before = len(self.calls_to("patch_match_stereo"))
+        run = self.make_run()
+        big = self.build(run, dense=dense, visual_faces=5000, collision_faces=5000, texture_size=1024)
+        small = self.build(run, dense=self.tmp / "work_dense", visual_faces=500, collision_faces=100,
+                           texture_size=1024)
+        self.assertGreater(big["mesh_faces"], small["mesh_faces"])
+        self.assertLessEqual(small["mesh_faces"], 500)
+        self.assertEqual(len(self.calls_to("patch_match_stereo")), before)
+        self.assertEqual(len(self.calls_to("stereo_fusion")), 1)
+        self.assertEqual(small["dense_points"], 4321)
+
+    def test_a_photo_that_shares_no_point_is_left_out_of_dense_matching(self):
+        names = ["photos/p_%d.jpg" % k for k in range(5)]
+        tracks = {names[0]: [1, 2, 3, 4], names[1]: [1, 2, 3, 9], names[2]: [2, 3, 4, 9],
+                  names[3]: [3, 4, 9], names[4]: [77, 78]}               # the last sees points of its own
+        self.add_photos(names, tracks)
+        dense = self.build_dense()
+        self.assertEqual((dense["images"], dense["photos_dropped"]), (4, 1))
+        self.assertEqual(dense["dropped"], [names[4]])
+        cfg = (self.tmp / "work" / "dense" / "stereo" / "patch-match.cfg").read_text().splitlines()
+        self.assertEqual(cfg[0::2], names[:4])
+        self.assertNotIn(names[4], " ".join(cfg))
+        fusion = (self.tmp / "work" / "dense" / "stereo" / "fusion.cfg").read_text().split()
+        self.assertEqual(fusion, names[:4])                              # consistent with the cfg
+        self.assertEqual(len(self.calls_to("image_deleter")), 1)
+        kept = [n for _, n, _, _, _ in mp.read_images_bin(self.tmp / "work" / "dense" / "sparse" / "images.bin")]
+        self.assertEqual(sorted(kept), names[:4])
+        self.assertEqual(mp.load_dense(self.tmp / "work_dense")["photos_dropped"], 1)
+        self.assertIn(names[4], (self.tmp / "dense.log").read_text(encoding="utf-8", errors="replace"))
+
+    def test_sources_are_the_photos_sharing_the_most_points(self):
+        tracks = {"a": list(range(1, 11)), "b": list(range(1, 9)), "c": list(range(1, 4)),
+                  "d": list(range(100, 105)) + [1, 2], "e": list(range(1, 11))}
+        kept, sources, dropped = mp.dense_view_plan(["a", "b", "c", "d", "e"], tracks, 2)
+        self.assertEqual((kept, dropped), (["a", "b", "c", "d", "e"], []))
+        self.assertEqual(sources["a"], ["e", "b"])        # 10 shared with e, 8 with b, then 3 with c
+        self.assertEqual(sources["d"], ["a", "b"])        # points 1, 2 only, all tie: by name
+        self.assertTrue(all(len(v) <= 2 for v in sources.values()))
+        self.assertTrue(all(n not in v for n, v in sources.items()))
+        kept, sources, dropped = mp.dense_view_plan(["a", "b", "c"], {"a": [1], "b": [2], "c": [1]}, 5)
+        self.assertEqual((kept, dropped, sources), (["a", "c"], ["b"], {"a": ["c"], "c": ["a"]}))
+
+    def test_dense_matching_needs_two_photos_that_share_points(self):
+        self.add_photos(["photos/a.jpg", "photos/b.jpg"], {"photos/a.jpg": [1, 2], "photos/b.jpg": [3, 4]})
+        with self.assertRaisesRegex(mp.MeshError, "Fewer than two photos"):
+            self.build_dense()
+        self.assertFalse(self.calls.exists())                 # no tool was started
+
+    def test_image_tracks_are_read_from_images_bin(self):
+        self.add_photos(["photos/a.jpg", "photos/b.jpg"], {"photos/a.jpg": [5, 6, 7], "photos/b.jpg": []})
+        tracks = mp.read_image_points(self.dataset / "sparse" / "0" / "images.bin")
+        self.assertEqual(tracks, {"photos/a.jpg": [5, 6, 7], "photos/b.jpg": []})
+        self.assertEqual(len(mp.read_images_bin(self.dataset / "sparse" / "0" / "images.bin")), 2)
+
+    def test_dense_parameters_reach_colmap(self):
+        self.build_dense(image_size=800, source_images=7, max_images=5, geom_consistency=False)
+        self.assertIn("--max_image_size 800", self.calls_to("image_undistorter")[0])
+        cfg = (self.tmp / "work" / "dense" / "stereo" / "patch-match.cfg").read_text().splitlines()
+        self.assertEqual(cfg, ["photos/a.jpg", "photos/b.jpg", "photos/b.jpg", "photos/a.jpg"])
+        match = self.calls_to("patch_match_stereo")[0]
+        self.assertIn("--PatchMatchStereo.geom_consistency 0", match)
+        self.assertIn("--input_type photometric", self.calls_to("stereo_fusion")[0])
+        self.build_dense("work2")
+        self.assertIn("--PatchMatchStereo.geom_consistency 1", self.calls_to("patch_match_stereo")[1])
+        self.assertIn("--input_type geometric", self.calls_to("stereo_fusion")[1])
+        with self.assertRaisesRegex(mp.MeshError, "image_size"):
+            self.build_dense("work3", image_size=10)
+
+    def test_masks_can_be_ignored_by_both_steps(self):
+        (self.dataset / "masks" / "photos").mkdir(parents=True)
+        person = [bytes(0 if (20 <= x < 30 and 10 <= y < 30) else 255 for x in range(64)) for y in range(48)]
+        (self.dataset / "masks" / "photos" / "a.png").write_bytes(png_bytes(64, 48, person, 1, (0, 2, 4)))
+        result = self.build(self.make_run(), use_masks=False)
+        self.assertEqual((result["masked_photos"], result["dense_masked_photos"]), (0, 0))
+        self.assertEqual(self.calls_to("fusion-masks"), [])
+
+    def test_shard_filter_can_be_switched_off(self):
+        with unittest.mock.patch.dict(os.environ, {"FAKE_SHARD": "1"}):
+            result = self.build(self.make_run(), drop_shards_filter=False)
+        self.assertEqual(result["faces_shards_removed"], 0)
+        self.assertEqual(result["raw_faces"], 3261)
+
+    def test_without_a_splat_the_meshes_stay_in_the_photos_frame(self):
+        result = self.build(None)
+        self.assertTrue(result["scene_transform_is_identity"])
+        self.assertEqual(result["mesh_components_kept"], 1)
+        self.assertGreater(mp.validate_glb(result["mesh"])["faces"], 900)
 
     def test_cancel_stops_the_tool(self):
         cancel = self.tmp / "cancel"
@@ -1350,30 +1496,38 @@ class PipelineTests(TempDirCase):
 
     def test_bad_arguments(self):
         run = self.make_run()
+        none = self.tmp / "no_dense"             # never read: the checks come first
         with self.assertRaisesRegex(mp.MeshError, "colmap"):
-            self.build(run, tools={"spirula": self.tools["spirula"]})
+            self.build(run, dense=none, tools={"spirula": self.tools["spirula"]})
         with self.assertRaisesRegex(mp.MeshError, "colmap"):
-            self.build(run, tools={"colmap": str(self.tmp / "nope.exe")})
+            self.build(run, dense=none, tools={"colmap": str(self.tmp / "nope.exe")})
         with self.assertRaisesRegex(mp.MeshError, "config.json"):
-            self.build(self.tmp / "no_such_run")
+            self.build(self.tmp / "no_such_run", dense=none)
         empty = self.tmp / "empty_run"
         empty.mkdir()
         (empty / "config.json").write_text("{}")
         with self.assertRaisesRegex(mp.MeshError, "splat.ply"):
-            self.build(empty)
+            self.build(empty, dense=none)
         with self.assertRaisesRegex(mp.MeshError, "images/"):
-            self.build(run, dataset_dir=self.tmp)
+            self.build(run, dense=none, dataset_dir=self.tmp)
         bare = self.tmp / "bare"
         (bare / "images").mkdir(parents=True)
         (bare / "sparse").mkdir()
         with self.assertRaisesRegex(mp.MeshError, "camera model"):
-            self.build(run, dataset_dir=bare)
+            self.build(run, dense=none, dataset_dir=bare)
         with self.assertRaisesRegex(mp.MeshError, "visual_faces"):
-            self.build(run, visual_faces=3)
+            self.build(run, dense=none, visual_faces=3)
         with self.assertRaisesRegex(mp.MeshError, "collision_faces"):
-            self.build(run, collision_faces=20.5)
+            self.build(run, dense=none, collision_faces=20.5)
         with self.assertRaisesRegex(mp.MeshError, "texture_size"):
-            self.build(run, texture_size=10)
+            self.build(run, dense=none, texture_size=10)
+        with self.assertRaisesRegex(mp.MeshError, "dense reconstruction"):
+            self.build(run, dense=none)
+        for tools in ({"spirula": self.tools["spirula"]}, {"colmap": str(self.tmp / "nope.exe")}):
+            with self.assertRaisesRegex(mp.MeshError, "colmap"):
+                self.build_dense(tools=tools)
+        with self.assertRaisesRegex(mp.MeshError, "images/"):
+            self.build_dense(dataset_dir=self.tmp)
         self.assertFalse(self.calls.exists())                 # nothing was started
 
 

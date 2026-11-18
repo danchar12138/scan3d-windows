@@ -18,9 +18,6 @@ TOOL_PATHS = {
     "colmap": TOOLS / "colmap" / "bin" / "colmap.exe",
 }
 
-QUALITIES = ("preview", "standard", "high")
-STAGES = ("ingest", "sfm", "dataset", "train", "mesh", "export")
-
 # What Spirula decodes. Other image types are reported to the user and skipped.
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".bmp"}
 UNSUPPORTED_IMAGE_EXT = {".webp", ".heic", ".heif", ".tif", ".tiff"}
@@ -28,12 +25,13 @@ VIDEO_EXT = {".mp4", ".mov", ".m4v", ".mkv", ".avi", ".webm"}
 
 
 def load_settings() -> dict:
-    """Read settings.json. Every tunable lives there so behaviour is changed by editing one
-    file, not by code paths that guess."""
+    """Read settings.json: what is not a simple switch (limits, timeouts, model file names, the
+    pose estimation's attempts). Everything a person chooses per scan (the stages, their
+    parameters, the template) is the workflow; see workflow.py."""
     with open(APP / "settings.json", encoding="utf-8") as f:
         return json.load(f)
 
 
-def missing_tools() -> list[str]:
+def missing_tools() -> list:
     """Names of the programs that are not installed."""
     return [name for name, path in TOOL_PATHS.items() if not path.exists()]

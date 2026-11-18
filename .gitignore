@@ -7,3 +7,6 @@ runs/
 
 __pycache__/
 *.pyc
+
+# The user's own templates and default template (saved from the page)
+user-settings.json

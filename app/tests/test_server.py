@@ -3,9 +3,11 @@
     python -m unittest discover -s app/tests          (from the project root)
 
 Every test runs a real server on an ephemeral loopback port with a temporary runs folder, and
-a stub (stub_pipeline.py) in place of the real pipeline. Nothing touches the project's runs/.
-The network weights and licences are a stand-in too (FakeModels, in a temp folder): nothing
-reads or writes the project's tools/, and nothing is ever downloaded.
+a stub (stub_pipeline.py) in place of the real pipeline: the stub command plans and runs stages
+with the real workflow module, and its file helpers stand in for pipeline.job_view,
+write_workflow and reset_stage. Nothing touches the project's runs/. The network weights are a
+stand-in too (FakeModels, in a temp folder) and so is the user's settings file (in memory):
+nothing reads or writes the project's tools/ or user-settings.json, and nothing is downloaded.
 """
 from __future__ import annotations
 
@@ -33,7 +35,12 @@ APP_DIR = Path(__file__).resolve().parent.parent
 if str(APP_DIR) not in sys.path:
     sys.path.insert(0, str(APP_DIR))
 
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+
 import server  # noqa: E402
+import stub_pipeline  # noqa: E402
+import workflow  # noqa: E402
 
 STUB = Path(__file__).with_name("stub_pipeline.py")
 TOKEN = "pairme234567"
@@ -53,8 +60,10 @@ def wait_until(predicate, timeout=20.0, interval=0.03, message="condition"):
         time.sleep(interval)
 
 
-MODEL_HOOKS = ("models_status", "models_accept", "models_dir", "models_file_mb",
+MODEL_HOOKS = ("models_features", "models_default_features", "workflow_needs", "models_dir",
                "build_models_command")
+PIPELINE_HOOKS = ("pipeline_job_view", "pipeline_write_workflow", "pipeline_reset_stage",
+                  "load_user_settings", "save_user_settings")
 
 # Stands in for `scan3d.py models --download`: fetches the files named into <folder>/_part and
 # moves each into <folder> when it is complete, as models.download_missing does.
@@ -93,30 +102,27 @@ sys.exit(code)
 
 class FakeModels:
     """What the server asks models.py and config.py for, without either: a small catalogue,
-    a temp folder for the weights, the accepted licences in memory. `status` answers in the
-    shape of models.status(). Sizes are a few MB so that tests can write real partial files."""
+    a temp folder for the weights, the recorded licences in memory. `features_table` answers
+    in the shape of models.features_table(), `needs` in the shape of models.needs(). Sizes are
+    a few MB so that tests can write real partial files."""
 
     LICENCES = {
-        "sam3": {"name": "SAM License (Meta)", "url": "https://example.invalid/sam3",
-                 "used_for": "抠除移动物体"},
-        "birefnet": {"name": "MIT License (BiRefNet)", "url": "https://example.invalid/birefnet",
-                     "used_for": "只保留主体"},
-        "dinov3": {"name": "DINOv3 License (Meta)", "url": "https://example.invalid/dinov3",
-                   "used_for": "稠密点云初始化"},
+        "sam3": {"label": "SAM License (Meta)", "url": "https://example.invalid/sam3"},
+        "dinov3": {"label": "DINOv3 License (Meta)", "url": "https://example.invalid/dinov3"},
     }
-    FILES = {   # name -> (size in MB, licence)
-        "sam3.bin": (6, "sam3"), "birefnet.bin": (2, "birefnet"), "moge.bin": (4, None),
-        "roma.bin": (3, "dinov3"), "aliked.bin": (1, None), "lightglue.bin": (1, None)}
-    FEATURES = {   # key -> (files, enabled)
-        "masks": (["sam3.bin"], True), "subject_only": (["birefnet.bin"], False),
-        "normals": (["moge.bin"], True), "dense_seed": (["roma.bin"], False),
-        "sfm": (["aliked.bin", "lightglue.bin"], True)}
+    FILES = {"sam3.bin": 6, "moge.bin": 4, "roma.bin": 3, "aliked.bin": 1, "lightglue.bin": 1}
+    FEATURES = [    # id, label, stage, files, licence
+        ("masks", "抠图（SAM 3）", "masks", ["sam3.bin"], "sam3"),
+        ("normals", "法线先验", "normals", ["moge.bin"], None),
+        ("dense_seed", "稠密点云种子", "dense_seed", ["roma.bin"], "dinov3"),
+        ("sfm", "位姿备用特征", "sfm", ["aliked.bin", "lightglue.bin"], None),
+    ]
 
     def __init__(self, folder: Path) -> None:
         self.folder = folder
-        self.accepted = set()
+        self.recorded = set()     # licences the pipeline has recorded (a fact about the file)
         self.mode = "ok"          # how the stand-in download behaves
-        self.exit_code = 1        # like the real command while any enabled feature lacks a file
+        self.exit_code = 0
         self.commands = []        # what the server asked build_models_command for
 
     def install(self, *names) -> None:
@@ -127,46 +133,53 @@ class FakeModels:
     def installed(self, name) -> bool:
         return (self.folder / name).exists()
 
-    def status(self) -> dict:
-        features, pending, missing = {}, set(), []
-        for key, (files, enabled) in self.FEATURES.items():
-            needs = sorted({self.FILES[f][1] for f in files if self.FILES[f][1]} - self.accepted)
-            absent = [f for f in files if not self.installed(f)
-                      and (self.FILES[f][1] is None or self.FILES[f][1] in self.accepted)]
-            features[key] = {
-                "files": list(files), "enabled": enabled, "ready": not needs and not absent,
-                "licences_needed": needs, "files_missing": absent,
-                "download_mb": sum(self.FILES[f][0] for f in files if not self.installed(f))}
-            if enabled:
-                pending.update(needs)
-                missing.extend(f for f in absent if f not in missing)
-        return {"features": features,
-                "licences": {k: dict(v, accepted=k in self.accepted, needed=k in pending)
-                             for k, v in self.LICENCES.items()},
-                "files_missing": missing,
-                "download_mb": sum(self.FILES[f][0] for f in missing)}
+    def features_table(self) -> dict:
+        table = []
+        for fid, label, stage, files, licence in self.FEATURES:
+            lic = None
+            if licence:
+                lic = dict(self.LICENCES[licence], id=licence, accepted=licence in self.recorded)
+            table.append({"id": fid, "label": label, "stage": stage,
+                          "files": [{"name": f, "mb": self.FILES[f],
+                                     "installed": self.installed(f)} for f in files],
+                          "licence": lic, "ready": all(self.installed(f) for f in files)})
+        return {"features": table,
+                "disk_mb": sum(self.FILES[f] for f in self.FILES if self.installed(f))}
 
-    def accept(self, ids) -> None:
-        unknown = [i for i in ids if i not in self.LICENCES]
-        if unknown:
-            raise ValueError("unknown licence id(s): %s" % unknown)
-        self.accepted.update(ids)
+    def default_features(self) -> list:
+        """What the default template (standard) uses."""
+        return ["masks", "normals", "sfm"]
+
+    def needs(self, workflow) -> dict:
+        import workflow as wf
+        on = wf.effective_enabled(workflow)
+        licences, files = [], []
+        for fid, label, stage, names, licence in self.FEATURES:
+            if stage not in on:
+                continue
+            if stage == "sfm" and not workflow["stages"]["sfm"]["params"]["learned_fallback"]:
+                continue
+            if licence:
+                licences.append(dict(self.LICENCES[licence], id=licence, stage=stage))
+            files.extend({"file": f, "mb": self.FILES[f], "stage": stage}
+                         for f in names if not self.installed(f))
+        return {"licences": licences, "models_needed": files}
 
     def command(self, features):
         self.commands.append(None if features is None else list(features))
-        state = self.status()["features"]
-        keys = features or [k for k, v in state.items() if v["enabled"]]
+        table = {f["id"]: f for f in self.features_table()["features"]}
+        keys = features or list(table)
         files = []
         for key in keys:
-            files.extend(f for f in state[key]["files_missing"] if f not in files)
+            files.extend(f["name"] for f in table[key]["files"]
+                         if not f["installed"] and f["name"] not in files)
         return [sys.executable, "-c", FAKE_DOWNLOAD, str(self.folder), self.mode,
-                str(self.exit_code)] + ["%s=%d" % (f, self.FILES[f][0]) for f in files]
+                str(self.exit_code)] + ["%s=%d" % (f, self.FILES[f]) for f in files]
 
     def hooks(self) -> dict:
-        return {"models_status": self.status, "models_accept": self.accept,
-                "models_dir": lambda: self.folder,
-                "models_file_mb": lambda name: self.FILES.get(name, (0, None))[0],
-                "build_models_command": self.command}
+        return {"models_features": self.features_table,
+                "models_default_features": self.default_features, "workflow_needs": self.needs,
+                "models_dir": lambda: self.folder, "build_models_command": self.command}
 
 
 class ServerCase(unittest.TestCase):
@@ -181,14 +194,20 @@ class ServerCase(unittest.TestCase):
         self.runs.mkdir()
         self.stub_args = {}      # job -> extra stub arguments
         self.launched = []       # commands the server wanted to start detached
+        self.user = {}           # the user's settings file (templates, default), in memory
         self._real_build = server.build_run_command
         server.build_run_command = self._stub_command
-        # No test may reach the real tools/ folder: every call into models.py and config.py
-        # goes to a stand-in with its own temp folder.
+        # No test may reach the real tools/ folder or the user's settings: every call into
+        # models.py, config.py, the pipeline and user-settings.json goes to a stand-in.
         self.models = FakeModels(self.tmp / "models")
-        self._real_hooks = {name: getattr(server, name) for name in MODEL_HOOKS}
+        self._real_hooks = {name: getattr(server, name) for name in MODEL_HOOKS + PIPELINE_HOOKS}
         for name, hook in self.models.hooks().items():
             setattr(server, name, hook)
+        server.pipeline_job_view = stub_pipeline.job_view
+        server.pipeline_write_workflow = stub_pipeline.write_workflow
+        server.pipeline_reset_stage = stub_pipeline.reset_stage
+        server.load_user_settings = lambda: json.loads(json.dumps(self.user))
+        server.save_user_settings = self._save_user
         self.addCleanup(self._cleanup)
         self.prepare()
 
@@ -203,6 +222,9 @@ class ServerCase(unittest.TestCase):
                                        kwargs={"poll_interval": 0.05}, daemon=True)
         self.thread.start()
 
+    def _save_user(self, data):
+        self.user = json.loads(json.dumps(data))
+
     def _cleanup(self) -> None:
         try:
             if hasattr(self, "httpd"):
@@ -216,13 +238,13 @@ class ServerCase(unittest.TestCase):
                 setattr(server, name, hook)
             shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _stub_command(self, job, input_path, quality, options=None):
-        # The per-scan switches reach the stub exactly as the real command would carry them.
-        real = self._real_build(job, input_path, quality, options)
-        switches = real[real.index("--quality") + 2:]
+    def _stub_command(self, job, input_path, **request):
+        # The request of the run (to, only, force) reaches the stub exactly as the real
+        # command would carry it.
+        real = self._real_build(job, input_path, **request)
+        flags = real[real.index("--name") + 2:]
         return [sys.executable, str(STUB), "run", str(input_path), "--name", job,
-                "--quality", quality, "--runs", str(self.runs)] + switches \
-            + self.stub_args.get(job, [])
+                "--runs", str(self.runs)] + flags + self.stub_args.get(job, [])
 
     def stub_argv(self, job):
         return json.loads((self.runs / job / "stub_argv.json").read_text(encoding="utf-8"))
@@ -285,9 +307,9 @@ class ServerCase(unittest.TestCase):
         self.stub_args[job] = ["--mode", mode, "--step", str(step)] + list(extra)
         return job
 
-    def start(self, job, body=None):
-        status, view = self.api("POST", "/api/jobs/%s/start" % job, body or {})
-        self.assertEqual(status, 200, view)
+    def start(self, job, body=None, path="run"):
+        status, view = self.api("POST", "/api/jobs/%s/%s" % (job, path), body or {})
+        self.assertEqual(status, 202, view)
         return view
 
     def job(self, name):
@@ -314,6 +336,17 @@ class ServerCase(unittest.TestCase):
         wait_until(lambda: self.app.current is None and not self.app.queue, timeout,
                    message="the worker to become idle")
 
+    def run_to_done(self, job, body=None, timeout=40.0):
+        """Queue a run and wait for it to end well."""
+        self.start(job, body)
+        view = self.wait_state(job, ("done", "failed", "cancelled"), timeout)
+        self.assertEqual(view["state"], "done", view)
+        self.wait_idle()
+        return view
+
+    def stage_states(self, view):
+        return {sid: entry["state"] for sid, entry in view["stages"].items()}
+
     def disk_status(self, name):
         return json.loads((self.runs / name / "status.json").read_text(encoding="utf-8"))
 
@@ -328,9 +361,8 @@ class ServerCase(unittest.TestCase):
         write_splat_ply(out / "splat.ply", gaussians)
         files = {"splat": "output/splat.ply"}
         files.update(outputs)
-        status = {"job": name, "state": "done", "stage": "export", "stage_index": 6,
-                  "stage_count": 6, "stage_progress": 1.0, "message": "完成",
-                  "quality": "standard", "started_at": "2026-01-01T10:00:00+08:00",
+        status = {"job": name, "state": "done", "stage": None, "stage_progress": None,
+                  "message": "完成", "started_at": "2026-01-01T10:00:00+08:00",
                   "updated_at": "2026-01-01T10:30:00+08:00",
                   "finished_at": "2026-01-01T10:30:00+08:00", "error": None, "pid": None,
                   "outputs": files}
@@ -392,24 +424,41 @@ class StaticTests(ServerCase):
         self.assertIn("default-src 'self'", headers["content-security-policy"])
         self.assertEqual(headers["x-content-type-options"], "nosniff")
 
-        for path, kind, marker in (("/static/app.js", "javascript", "/api/jobs"),
-                                   ("/static/style.css", "text/css", "prefers-color-scheme"),
-                                   ("/static/favicon.svg", "image/svg+xml", "<svg")):
-            status, headers, body = self.request("GET", path)
+        # every script and style sheet the page names is served, with the right type
+        page = body.decode("utf-8")
+        assets = re.findall(r'<script[^>]*\bsrc="(/static/[^"]+)"', page) \
+            + re.findall(r'<link[^>]*\bhref="(/static/[^"]+\.css)"', page)
+        self.assertTrue(any(a.endswith(".js") for a in assets), assets)
+        self.assertTrue(any(a.endswith(".css") for a in assets), assets)
+        for path in assets:
+            status, headers, content = self.request("GET", path)
             self.assertEqual(status, 200, path)
-            self.assertIn(kind, headers["content-type"])
-            self.assertIn(marker, body.decode("utf-8"))
+            self.assertIn("css" if path.endswith(".css") else "javascript",
+                          headers["content-type"], path)
+            self.assertGreater(len(content), 200, path)
+        status, headers, content = self.request("GET", "/static/favicon.svg")
+        self.assertEqual(status, 200)
+        self.assertIn("image/svg+xml", headers["content-type"])
+        self.assertIn(b"<svg", content)
 
-        status, headers, body = self.request("HEAD", "/static/app.js")
+        status, headers, body = self.request("HEAD", assets[0])
         self.assertEqual((status, body), (200, b""))
-        self.assertGreater(int(headers["content-length"]), 1000)
+        self.assertGreater(int(headers["content-length"]), 200)
+
+    def own_web_files(self):
+        """The UI's own html, css and scripts (not the vendored libraries)."""
+        return sorted(p for p in server.WEB_DIR.rglob("*")
+                      if p.is_file() and "vendor" not in p.relative_to(server.WEB_DIR).parts
+                      and p.suffix in (".html", ".js", ".css", ".svg"))
 
     def test_ui_has_no_external_resources_or_agent_sniffing(self):
-        for name in ("index.html", "app.js", "jobview.js", "viewer3d.js", "style.css"):
-            text = (server.WEB_DIR / name).read_text(encoding="utf-8")
-            self.assertNotIn("http://", text.replace("http://www.w3.org/2000/svg", ""), name)
-            self.assertNotIn("https://", text, name)
-            self.assertNotIn("userAgent", text, name)
+        files = self.own_web_files()
+        self.assertGreaterEqual(len(files), 4)
+        for path in files:
+            text = path.read_text(encoding="utf-8")
+            self.assertNotIn("http://", text.replace("http://www.w3.org/2000/svg", ""), path.name)
+            self.assertNotIn("https://", text, path.name)
+            self.assertNotIn("userAgent", text, path.name)
 
     def test_unknown_paths_and_methods(self):
         self.assertEqual(self.request("GET", "/nope")[0], 404)
@@ -418,21 +467,24 @@ class StaticTests(ServerCase):
         status, headers, _ = self.request("DELETE", "/api/jobs")
         self.assertEqual(status, 405)
         self.assertIn("GET", headers["allow"])
-        self.assertEqual(self.request("POST", "/static/app.js", {})[0], 405)
+        self.assertEqual(self.request("POST", "/static/viewer3d.js", {})[0], 405)
 
     def test_info(self):
         status, info = self.api("GET", "/api/info")
         self.assertEqual(status, 200)
         self.assertTrue(info["loopback"])
         self.assertNotIn("lan", info)            # there is no LAN mode to report: one mode
-        self.assertEqual(info["qualities"], ["preview", "standard", "high"])
-        self.assertEqual(info["stages"], list(server.STAGES))
+        self.assertNotIn("qualities", info)      # presets are templates now
+        self.assertNotIn("default_quality", info)
+        self.assertEqual(info["stages"], list(workflow.STAGE_ORDER))
+        self.assertEqual(info["default_template"], "standard")
         self.assertIn("heic", info["extensions"])
         self.assertIsInstance(info["lan_urls"], list)
+        self.user = {"default_template": "preview"}
+        self.assertEqual(self.api("GET", "/api/info")[1]["default_template"], "preview")
 
     def test_viewer_files_and_vendored_libraries_are_served(self):
-        for path, marker in (("/static/jobview.js", "scan3dJobView"),
-                             ("/static/viewer3d.js", "SparkRenderer"),
+        for path, marker in (("/static/viewer3d.js", "SparkRenderer"),
                              ("/static/vendor/three/three.module.js", "WebGLRenderer"),
                              ("/static/vendor/three/three.core.js", "REVISION"),
                              ("/static/vendor/three/addons/controls/OrbitControls.js", "OrbitControls"),
@@ -493,8 +545,10 @@ class StaticTests(ServerCase):
                               "GLTFLoader.js", "BufferGeometryUtils.js", "SkeletonUtils.js",
                               "Pass.js", "spark.module.js"}, names)
         # our own code asks for nothing by absolute URL
-        for name in ("viewer3d.js", "jobview.js", "app.js"):
-            self.assertNotRegex((web / name).read_text(encoding="utf-8"), r"""['"](https?:)?//""")
+        for path in self.own_web_files():
+            if path.suffix == ".js":
+                text = path.read_text(encoding="utf-8").replace("http://www.w3.org/2000/svg", "")
+                self.assertNotRegex(text, r"""['"](https?:)?//""", path.name)
 
     def test_vendored_files_match_their_recorded_checksums(self):
         vendor = server.WEB_DIR / "vendor"
@@ -544,17 +598,21 @@ class StaticTests(ServerCase):
 
 class FlowTests(ServerCase):
     def test_create_upload_start_progress_done_download(self):
-        status, created = self.api("POST", "/api/jobs", {"quality": "high"})
+        status, created = self.api("POST", "/api/jobs", {"template": "preview"})
         self.assertEqual(status, 201)
         job = created["job"]
         self.assertRegex(job, r"^scan-\d{8}-\d{6}$")
         self.assertEqual(created["state"], "created")
-        self.assertEqual(created["quality"], "high")
+        self.assertEqual(created["template"], "preview")
+        self.assertNotIn("quality", created)
         self.assertIn("start", created["actions"])
+        self.assertIn("run", created["actions"])
         self.assertTrue((self.runs / job / "upload").is_dir())
+        self.assertEqual(json.loads((self.runs / job / "workflow.json").read_text(encoding="utf-8")),
+                         workflow.resolve("preview", user={}))
 
         # starting with nothing uploaded is refused
-        status, error = self.api("POST", "/api/jobs/%s/start" % job, {})
+        status, error = self.api("POST", "/api/jobs/%s/run" % job, {})
         self.assertEqual((status, error["error"]), (400, "no_input"))
 
         photo = os.urandom(5000)
@@ -577,11 +635,12 @@ class FlowTests(ServerCase):
 
         view = self.job(job)
         self.assertEqual(view["uploads"], {"count": 2, "bytes": 5010})
+        self.assertEqual(self.stage_states(view)["train"], "pending")
 
-        self.stub_args[job] = ["--step", "0.08"]
-        view = self.start(job, {"quality": "preview"})
+        self.stub_args[job] = ["--step", "0.15"]
+        view = self.start(job)
         self.assertIn(view["state"], ("queued", "running"))
-        self.assertEqual(view["quality"], "preview")
+        self.assertEqual(view["run"]["plan"], ["ingest", "sfm", "train", "export"])
 
         seen_stages, seen_progress = [], []
 
@@ -594,6 +653,7 @@ class FlowTests(ServerCase):
                     seen_progress.append(view["stage_progress"])
                 self.assertIn("cancel", view["actions"])
                 self.assertNotIn("delete", view["actions"])
+                self.assertNotIn("edit", view["actions"])
                 self.assertIsInstance(view["elapsed_seconds"], float)
             return view["state"] == "done"
 
@@ -604,18 +664,24 @@ class FlowTests(ServerCase):
 
         view = self.job(job)
         self.assertEqual(view["message"], "完成")
-        self.assertEqual(view["quality"], "preview")
+        self.assertIsNone(view["stage"])
+        self.assertNotIn("quality", view)
         self.assertIn("delete", view["actions"])
         self.assertNotIn("cancel", view["actions"])
+        self.assertEqual(self.stage_states(view), {
+            "ingest": "done", "masks": "disabled", "sfm": "done", "normals": "disabled",
+            "dense_seed": "disabled", "train": "done", "dense": "disabled", "mesh": "disabled",
+            "coverage": "disabled", "export": "done"})
+        self.assertEqual(view["stages"]["train"]["summary"], {"gaussians": 1999962})
         files = {f["key"]: f for f in view["output_files"]}
-        self.assertEqual(set(files), {"splat", "mesh", "collision", "report"})
+        self.assertEqual(set(files), {"splat", "report"})
         self.assertEqual(files["splat"], {"key": "splat", "path": "output/splat.ply",
                                           "name": "splat.ply", "size": 4096})
 
         # the stub was started with the contract's arguments
-        argv = json.loads((self.runs / job / "stub_argv.json").read_text(encoding="utf-8"))
+        argv = self.stub_argv(job)
         self.assertEqual(Path(argv["input"]), self.runs / job / "upload")
-        self.assertEqual(argv["quality"], "preview")
+        self.assertEqual((argv["to"], argv["only"], argv["force"]), (None, [], []))
         self.assertFalse((self.runs / job / "upload.part").exists())
 
         # ---- downloads, whole and by Range
@@ -660,7 +726,7 @@ class FlowTests(ServerCase):
 
         status, headers, body = self.request("GET", "/api/jobs/%s/download/output/report.json" % job)
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["job"], job)
+        self.assertEqual(json.loads(body)["stub"], "export")
 
         # ---- log tail
         status, chunk = self.api("GET", "/api/jobs/%s/log" % job)
@@ -677,8 +743,11 @@ class FlowTests(ServerCase):
         status, part = self.api("GET", "/api/jobs/%s/log?offset=0&max=64" % job)
         self.assertEqual(part["offset"], 0)
         self.assertTrue(chunk["text"].startswith(part["text"]))
-        self.assertIn("launcher.log", view["logs"])
-        self.assertEqual(view["logs"][0], "pipeline.log")
+        self.assertEqual(view["logs"], ["pipeline.log", "ingest.log", "sfm.log", "train.log",
+                                        "export.log", "launcher.log"])
+        status, stage_log = self.api("GET", "/api/jobs/%s/log?file=train.log" % job)
+        self.assertEqual(status, 200)
+        self.assertIn("stage train tick", stage_log["text"])
         status, launcher = self.api("GET", "/api/jobs/%s/log?file=launcher.log" % job)
         self.assertIn("stub 启动", launcher["text"])
 
@@ -687,7 +756,11 @@ class FlowTests(ServerCase):
         status, listing = self.api("GET", "/api/jobs")
         self.assertEqual([j["job"] for j in listing["jobs"]], [job])
         self.assertEqual((listing["queue"], listing["current"]), ([], None))
-        self.assertEqual(self.api("POST", "/api/jobs/%s/start" % job, {})[0], 409)
+        status, error = self.api("POST", "/api/jobs/%s/start" % job, {})
+        self.assertEqual((status, error["error"]), (400, "nothing_to_do"))      # everything is done
+        self.assertEqual(self.api("POST", "/api/jobs/%s/run" % job, {"force": ["export"]})[0], 202)
+        self.wait_state(job, "done")
+        self.wait_idle()
         self.assertEqual(self.upload(job, "late.jpg", b"x")[0], 409)
         self.assertEqual(self.api("POST", "/api/jobs/%s/cancel" % job, {})[0], 409)
 
@@ -810,11 +883,18 @@ class FlowTests(ServerCase):
             conn.close()
 
     def test_bad_requests(self):
-        for body, code in (({"quality": "ultra"}, "bad_quality"),
-                           ({"name": "has space"}, "bad_name"),
-                           ({"name": 5}, "bad_name")):
+        for body, code in (({"name": "has space"}, "bad_name"),
+                           ({"name": 5}, "bad_name"),
+                           ({"quality": "high"}, "bad_request"),
+                           ({"options": {"masks": True}}, "bad_request"),
+                           ({"template": "nope"}, "bad_workflow"),
+                           ({"template": 5}, "bad_workflow"),
+                           ({"workflow": [1]}, "bad_workflow"),
+                           ({"to": "train"}, "bad_request"),
+                           ({"only": ["train"]}, "bad_request")):
             status, error = self.api("POST", "/api/jobs", body)
             self.assertEqual((status, error["error"]), (400, code), body)
+        self.assertEqual(list(self.runs.iterdir()), [])        # a refused request makes no job
         status, error = self.api("POST", "/api/jobs", b"{not json",
                                  {"Content-Type": "application/json"})
         self.assertEqual((status, error["error"]), (400, "bad_json"))
@@ -831,13 +911,18 @@ class FlowTests(ServerCase):
         self.assertEqual(status, 409 if os.name == "nt" else 201)
 
         for method, path in (("GET", "/api/jobs/nope"), ("DELETE", "/api/jobs/nope"),
-                             ("POST", "/api/jobs/nope/start"), ("POST", "/api/jobs/nope/cancel"),
+                             ("POST", "/api/jobs/nope/start"), ("POST", "/api/jobs/nope/run"),
+                             ("POST", "/api/jobs/nope/plan"), ("PUT", "/api/jobs/nope/workflow"),
+                             ("POST", "/api/jobs/nope/stages/train/reset"),
+                             ("POST", "/api/jobs/nope/cancel"),
                              ("GET", "/api/jobs/nope/log"), ("PUT", "/api/jobs/nope/files/a.jpg"),
                              ("GET", "/api/jobs/nope/download/output/splat.ply")):
-            status, error = self.api(method, path, b"x" if method == "PUT" else None)
+            status, error = self.api(method, path, b"x" if method == "PUT" else {} if
+                                     method in ("POST",) else None)
             self.assertEqual((status, error["error"]), (404, "not_found"), path)
-        status, error = self.api("POST", "/api/jobs/%s/start" % job, {"quality": "best"})
-        self.assertEqual((status, error["error"]), (400, "bad_quality"))
+        for path in ("start", "run"):
+            status, error = self.api("POST", "/api/jobs/%s/%s" % (job, path), {"quality": "best"})
+            self.assertEqual((status, error["error"]), (400, "bad_request"))
         status, error = self.api("GET", "/api/jobs/%s/log?offset=abc" % job)
         self.assertEqual(status, 400)
         status, chunk = self.api("GET", "/api/jobs/%s/log" % job)
@@ -895,6 +980,7 @@ class QueueTests(ServerCase):
         status, error = self.api("DELETE", "/api/jobs/" + job)
         self.assertEqual((status, error["error"]), (409, "running"))
         self.assertEqual(self.api("POST", "/api/jobs/%s/start" % job, {})[0], 409)
+        self.assertEqual(self.api("POST", "/api/jobs/%s/run" % job, {})[0], 409)
 
         began = time.monotonic()
         status, view = self.api("POST", "/api/jobs/%s/cancel" % job, {})
@@ -995,14 +1081,14 @@ class QueueTests(ServerCase):
     def test_missing_pipeline_script_fails_the_job(self):
         job = self.create_with_photo()
         missing = str(self.tmp / "no-such-script.py")
-        server.build_run_command = lambda j, i, q, o=None: [sys.executable, missing, "run", i]
+        server.build_run_command = lambda j, i, **request: [sys.executable, missing, "run", i]
         self.start(job)
         view = self.wait_state(job, ("failed", "done", "cancelled"))
         self.assertEqual(view["state"], "failed")
         self.assertEqual(view["exit_code"], 2)
         self.assertIn("no-such-script.py", view["error"])
 
-        server.build_run_command = lambda j, i, q, o=None: [str(self.tmp / "no-such-program.exe")]
+        server.build_run_command = lambda j, i, **request: [str(self.tmp / "no-such-program.exe")]
         other = self.create_with_photo()
         self.start(other)
         view = self.wait_state(other, ("failed", "done", "cancelled"))
@@ -1060,12 +1146,13 @@ class QueueTests(ServerCase):
         (photos / "a.jpg").write_bytes(b"x")
         self.stub_args["from-disk"] = ["--step", "0.01"]
         status, view = self.api("POST", "/api/jobs", {"name": "from-disk", "path": str(photos),
-                                                      "quality": "preview", "start": True})
+                                                      "template": "preview", "start": True})
         self.assertEqual(status, 201, view)
         self.assertEqual((view["source"], view["input_path"]), ("path", str(photos)))
         self.assertEqual(self.wait_state("from-disk", ("done", "failed"))["state"], "done")
         argv = json.loads((self.runs / "from-disk" / "stub_argv.json").read_text(encoding="utf-8"))
-        self.assertEqual((argv["input"], argv["quality"]), (str(photos), "preview"))
+        self.assertEqual(argv["input"], str(photos))
+        self.assertEqual(self.job("from-disk")["template"], "preview")
         self.assertFalse((self.runs / "from-disk" / "upload").exists())
         self.assertEqual(self.upload("from-disk", "a.jpg", b"x")[0], 409)
         self.assertEqual(sorted(p.name for p in photos.iterdir()), ["a.jpg"])   # untouched
@@ -1206,7 +1293,7 @@ class TraversalTests(ServerCase):
                      "/static/..%5cserver.py", "/static/..%5c..%5cproc.py", "/../server.py",
                      "/..%2f..%2f..%2fWindows/win.ini", "/static/C:%5CWindows%5Cwin.ini",
                      "/static/index.html%00.js", "/static//app.js", "/static/.", "/static/..",
-                     "//127.0.0.1/static/app.js", "/static/app.js/..%2f..%2fserver.py",
+                     "//127.0.0.1/static/viewer3d.js", "/static/viewer3d.js/..%2f..%2fserver.py",
                      "/static/nul", "/server.py", "/static/%ff", "/%2e%2e/%2e%2e/secret.txt"):
             status, _headers, data = self.request("GET", path)
             self.assertIn(status, (400, 404), path)
@@ -1252,11 +1339,32 @@ class TraversalTests(ServerCase):
         state = self.api("GET", "/api/jobs/victim/coverage")[1]
         self.assertEqual((state["state"], state["reason"]), ("unavailable", "no_splat"))
         self.assertEqual(self.api("POST", "/api/jobs/victim/coverage")[0], 409)
-        self.assertIsNone(self.app.coverage._thread)
+        self.assertEqual(list(self.app.queue), [])
         for name in ("..", "%2e%2e", "..%2fvictim", "CON", ".server-token", "victim%00", "a%2fb"):
-            for rest in ("preview", "preview/full", "cameras", "coverage", "coverage/data"):
+            for rest in ("preview", "preview/full", "cameras", "coverage", "coverage/data",
+                         "run", "plan", "workflow", "stages/train/reset"):
                 self.assert_refused("GET", "/api/jobs/%s/%s" % (name, rest))
                 self.assert_refused("POST", "/api/jobs/%s/%s" % (name, rest), b"{}")
+                self.assert_refused("PUT", "/api/jobs/%s/%s" % (name, rest), b"{}")
+        # stage names and template names are never used as paths, but are checked anyway
+        for stage in ("..", "%2e%2e", "..%2f..%2fsecret.txt", "..%5cstatus.json", "train%00",
+                      "nul", "train/x", "C:%5Cx", "%ff", "TRAIN", "stage.json", ""):
+            self.assert_refused("POST", "/api/jobs/victim/stages/%s/reset" % stage, b"{}")
+        for tid in ("..", "%2e%2e", "..%2fx", "a%2fb", "x" * 65, "%00", "C:%5Cx", "%ff"):
+            for method in ("PUT", "DELETE"):
+                self.assert_refused(method, "/api/templates/" + tid,
+                                    b'{"label": "x", "stages": {}}' if method == "PUT" else None)
+        self.assertEqual(self.user, {})
+        for stage in ("..", "../..", "x", "C:\\x", "train\x00"):
+            for field in ("to", "only", "force"):
+                value = [stage] if field != "to" else stage
+                status, error = self.api("POST", "/api/jobs/victim/plan", {field: value})
+                self.assertEqual((status, error["error"]), (400, "unknown_stage"), (field, stage))
+        self.assertEqual(list(self.app.queue), [])
+        # a log name with a stage in it is not a way out of logs/
+        for name in ("..%2ftrain.log", "..%5ctrain.log", "train.log%00", "stages%2ftrain.json",
+                     "../stages/train.json", "train.log:stream", "nul.log"):
+            self.assert_refused("GET", "/api/jobs/victim/log?file=" + name)
 
         for path in ("/static/vendor/..%2f..%2fserver.py", "/static/vendor/../../server.py",
                      "/static/vendor/three/..%2f..%2f..%2fserver.py",
@@ -1303,14 +1411,7 @@ class TraversalTests(ServerCase):
         self.assertEqual((outside / "preview.spz").read_bytes(), b"private preview")
         self.assertEqual(sorted(p.name for p in outside.iterdir()),
                          ["images.bin", "preview.spz", "preview.spz.json"])
-        self.assertIsNone(self.app.coverage._thread)
         self.assertEqual(self.api("GET", "/api/jobs/victim/cameras")[1], {"count": 0, "cameras": []})
-        write_cameras_bin(outside / "cameras.bin")
-        state = self.api("GET", "/api/jobs/victim/coverage")[1]
-        self.assertEqual((state["state"], state["reason"]), ("unavailable", "no_cameras"))
-        self.assertEqual(self.api("POST", "/api/jobs/victim/coverage")[0], 409)
-        self.assertEqual(self.request("GET", "/api/jobs/victim/coverage/data")[0], 404)
-        self.assertFalse((outside / "coverage.json").exists())
 
     def test_junction_inside_a_job_is_not_followed(self):
         if os.name != "nt":
@@ -1333,6 +1434,31 @@ class TraversalTests(ServerCase):
         self.assertEqual(self.api("DELETE", "/api/jobs/victim")[0], 200)
         self.assertFalse((self.runs / "victim").exists())
         self.assertEqual((outside / "private.ply").read_bytes(), b"private")
+
+    def test_a_coverage_map_behind_a_junction_is_not_served(self):
+        if os.name != "nt":
+            self.skipTest("junctions are a Windows feature")
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "coverage.json").write_text('{"private": true}', encoding="utf-8")
+        (outside / "splat.ply").write_bytes(b"private")
+        self.expected_top_level = ("runs", "secret.txt", "outside")
+        status = self.disk_status("victim")
+        status.update(state="done", outputs={"splat": "output/splat.ply"})
+        (self.runs / "victim" / "status.json").write_text(json.dumps(status), encoding="utf-8")
+        made = subprocess.run(["cmd", "/c", "mklink", "/J", str(self.runs / "victim" / "output"),
+                               str(outside)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                              timeout=20)
+        if made.returncode != 0:
+            self.skipTest("could not create a junction")
+        wait_until(lambda: self.job("victim")["state"] == "done")
+        status_code, _headers, data = self.request("GET", "/api/jobs/victim/coverage/data")
+        self.assertEqual(status_code, 404)
+        self.assertNotIn(b"private", data)
+        self.assertNotEqual(self.api("GET", "/api/jobs/victim/coverage")[1]["state"], "ready")
+        self.assertEqual(self.api("GET", "/api/jobs/victim/preview")[1]["variants"]["full"]["state"],
+                         "no_splat")
+        self.assertEqual(self.request("GET", "/api/jobs/victim/download/output/coverage.json")[0], 400)
 
     def test_cross_site_and_rebinding_requests_are_refused(self):
         origin = "http://127.0.0.1:%d" % self.port
@@ -1397,6 +1523,43 @@ class TraversalTests(ServerCase):
 # =========================================================================== LAN mode and tokens
 
 class TokenTests(ServerCase):
+    def test_every_workflow_endpoint_needs_the_token_from_a_phone(self):
+        job = self.create(name="mine")
+        self.remote()
+        body = {"label": "x", "stages": {}}
+        calls = [("GET", "/api/workflow/schema", None), ("GET", "/api/templates", None),
+                 ("PUT", "/api/templates/x", body), ("DELETE", "/api/templates/x", None),
+                 ("PUT", "/api/templates/default", {"id": "standard"}),
+                 ("PUT", "/api/jobs/%s/workflow" % job, {}), ("POST", "/api/jobs/%s/run" % job, {}),
+                 ("POST", "/api/jobs/%s/plan" % job, {}),
+                 ("POST", "/api/jobs/%s/stages/train/reset" % job, {}),
+                 ("GET", "/api/jobs/%s/log?file=train.log" % job, None),
+                 ("GET", "/api/models", None), ("POST", "/api/models/download", {})]
+        for method, path, payload in calls:
+            self.assertEqual(self.api(method, path, payload)[0], 401, "%s %s" % (method, path))
+        self.assertEqual(self.api("PUT", "/api/templates/x", body,
+                                  {"X-Scan3D-Token": "wrong-token"})[0], 401)
+        self.assertEqual(self.user, {})
+        self.assertEqual(list(self.app.queue), [])
+        # with the token the job's own endpoints work for a phone ...
+        header = {"X-Scan3D-Token": TOKEN}
+        self.assertEqual(self.api("PUT", "/api/jobs/%s/workflow" % job,
+                                  {"train": {"params": {"iterations": 5000}}}, header)[0], 200)
+        self.assertEqual(self.api("POST", "/api/jobs/%s/plan" % job, {}, header)[0], 200)
+        self.assertEqual(self.api("POST", "/api/jobs/%s/stages/train/reset" % job, {}, header)[0], 200)
+        # ... and the ones that change this PC's settings or fetch files do not
+        for method, path, payload in (("PUT", "/api/templates/x", body),
+                                      ("DELETE", "/api/templates/x", None),
+                                      ("PUT", "/api/templates/default", {"id": "standard"}),
+                                      ("POST", "/api/models/download", {})):
+            self.assertEqual(self.api(method, path, payload, header)[1]["error"], "loopback_only")
+        # a page of another site cannot use the phone's cookie for any of them
+        cookie = {"Cookie": "scan3d_token=" + TOKEN, "Origin": "http://evil.example"}
+        for method, path, payload in calls:
+            if method != "GET":
+                self.assertEqual(self.api(method, path, payload, cookie)[1]["error"], "bad_origin",
+                                 "%s %s" % (method, path))
+
     def test_loopback_needs_no_token(self):
         real = server.lan_addresses
         server.lan_addresses = lambda: ["192.168.1.20", "10.0.0.7"]
@@ -1417,9 +1580,9 @@ class TokenTests(ServerCase):
         for method, path in (("GET", "/api/jobs"), ("GET", "/api/info"), ("POST", "/api/jobs"),
                              ("GET", "/api/jobs/" + job), ("DELETE", "/api/jobs/" + job),
                              ("PUT", "/api/jobs/%s/files/a.jpg" % job),
-                             ("GET", "/static/app.js"), ("GET", "/static/style.css"),
+                             ("GET", "/static/viewer3d.js"), ("GET", "/static/favicon.svg"),
                              ("POST", "/"), ("GET", "/api/jobs?token=wrong"),
-                             ("GET", "/api/jobs?token="), ("GET", "/static/app.js?token=nope")):
+                             ("GET", "/api/jobs?token="), ("GET", "/static/viewer3d.js?token=nope")):
             status, _headers, data = self.request(method, path, b"x" if method == "PUT" else None)
             self.assertEqual(status, 401, "%s %s" % (method, path))
             self.assertNotIn(TOKEN.encode(), data)
@@ -1456,8 +1619,8 @@ class TokenTests(ServerCase):
         status, headers, body = self.request("GET", "/", None, cookie_header)
         self.assertEqual(status, 200)
         self.assertIn("三维扫描", body.decode("utf-8"))
-        self.assertEqual(self.request("GET", "/static/app.js", None, cookie_header)[0], 200)
-        self.assertEqual(self.request("GET", "/static/app.js", None,
+        self.assertEqual(self.request("GET", "/static/viewer3d.js", None, cookie_header)[0], 200)
+        self.assertEqual(self.request("GET", "/static/viewer3d.js", None,
                                       {"Cookie": "other=1; scan3d_token=%s; x=y" % TOKEN})[0], 200)
 
         status, info = self.api("GET", "/api/info", None, cookie_header)
@@ -1468,7 +1631,7 @@ class TokenTests(ServerCase):
         real = server.lan_addresses
         server.lan_addresses = lambda: ["192.168.1.20"]
         self.addCleanup(setattr, server, "lan_addresses", real)
-        for path in ("/api/info", "/api/jobs", "/", "/static/app.js", "/static/jobview.js"):
+        for path in ("/api/info", "/api/jobs", "/", "/static/viewer3d.js", "/static/favicon.svg"):
             status, _headers, body = self.request("GET", path, None, cookie_header)
             self.assertEqual(status, 200, path)
             self.assertNotIn(TOKEN.encode(), body, path)
@@ -1545,7 +1708,7 @@ class SingleModeTests(ServerCase):
 
     def test_a_remote_client_is_asked_for_the_token_not_refused_outright(self):
         self.remote()
-        for path in ("/", "/api/jobs", "/static/app.js", "/api/jobs?token=", "/?token=None"):
+        for path in ("/", "/api/jobs", "/static/viewer3d.js", "/api/jobs?token=", "/?token=None"):
             self.assertEqual(self.request("GET", path)[0], 401, path)
         self.assertEqual(self.api("POST", "/api/jobs", {}, {"X-Scan3D-Token": ""})[0], 401)
         self.assertEqual(self.api("POST", "/api/jobs", {}, {"X-Scan3D-Token": TOKEN})[0], 201)
@@ -1908,6 +2071,23 @@ class PreviewTests(ServerCase):
             self.assertEqual(status, 405, "%s %s" % (method, path))
         self.assertIsNone(self.app.previews._thread)
 
+    def test_a_splat_can_be_viewed_unless_the_job_is_working_on_it(self):
+        out = self.make_done_job("partly")
+        status = self.disk_status("partly")
+        status.update(state="failed", error="stub: mesh failed")      # the splat came first
+        (self.runs / "partly" / "status.json").write_text(json.dumps(status), encoding="utf-8")
+        self.assertEqual(self.preview("partly", "lite")["state"], "missing")
+        self.assertIsNotNone(self.api("GET", "/api/jobs/partly/preview")[1]["source"])
+        self.assertIn(self.api("POST", "/api/jobs/partly/preview/lite")[0], (200, 202))
+        self.wait_preview("partly", "lite")
+        status.update(state="running", error=None, pid=os.getpid())
+        (self.runs / "partly" / "status.json").write_text(json.dumps(status), encoding="utf-8")
+        wait_until(lambda: self.preview("partly", "full")["state"] == "no_splat", 10,
+                   message="a running job to show no splat")
+        status_code, error = self.api("POST", "/api/jobs/partly/preview/full")
+        self.assertEqual((status_code, error["error"]), (409, "not_done"))
+        self.assertTrue((out / "splat.ply").is_file())
+
     def test_phone_needs_the_token_and_then_may_view(self):
         self.make_done_job("shared")
         self.remote()
@@ -1915,7 +2095,7 @@ class PreviewTests(ServerCase):
                              ("GET", "/api/jobs/shared/preview/lite"), ("GET", "/api/jobs/shared/cameras"),
                              ("GET", "/api/jobs/shared/coverage"), ("POST", "/api/jobs/shared/coverage"),
                              ("GET", "/api/jobs/shared/coverage/data"),
-                             ("GET", "/static/viewer3d.js"), ("GET", "/static/jobview.js"),
+                             ("GET", "/static/viewer3d.js"), ("GET", "/static/favicon.svg"),
                              ("GET", "/static/vendor/spark/spark.module.js"),
                              ("GET", "/static/vendor/three/three.module.js"),
                              ("GET", "/static/vendor/qrcode-generator/qrcode.js")):
@@ -1935,10 +2115,10 @@ class PreviewTests(ServerCase):
         self.assertEqual((status, error["error"]), (403, "bad_origin"))
         status, error = self.api("POST", "/api/jobs/shared/coverage", None, cookie)
         self.assertEqual((status, error["error"]), (403, "bad_origin"))
-        self.assertIsNone(self.app.coverage._thread)
+        self.assertEqual(list(self.app.queue), [])
         # with the token a phone may ask for the coverage map like for a preview
         state = self.api("GET", "/api/jobs/shared/coverage", None, header)[1]
-        self.assertEqual((state["state"], state["reason"]), ("unavailable", "no_cameras"))
+        self.assertEqual(state["state"], "missing")
 
 
 def write_images_bin(path: Path, poses) -> None:
@@ -2009,37 +2189,22 @@ class CameraTests(ServerCase):
 
 # =========================================================================== coverage map
 
-def write_cameras_bin(path: Path, width=640, height=480, focal=500.0) -> None:
-    """A COLMAP cameras.bin with one PINHOLE camera (id 1)."""
-    with open(path, "wb") as f:
-        f.write(struct.pack("<Q", 1))
-        f.write(struct.pack("<IiQQ", 1, 1, width, height))
-        f.write(struct.pack("<4d", focal, focal, width / 2, height / 2))
-
-
-SLOW_COVERAGE = ("import sys, time; open(sys.argv[2] + '.started', 'w').close(); "
-                 "time.sleep(float(sys.argv[1]))")
-
-
 class CoverageTests(ServerCase):
-    def make_scene(self, name, sparse=("dataset", "sparse")):
-        """A finished job with a splat and training cameras that see it."""
-        out = self.make_done_job(name, gaussians=60)
-        folder = self.runs / name
-        for part in sparse:
-            folder = folder / part
-        folder.mkdir(parents=True)
-        # looking along +Z from z = -5 and from a little to either side
-        write_images_bin(folder / "images.bin", [(1, 0, 0, 0, dx, 0, 5) for dx in (-1, 0, 1)])
-        write_cameras_bin(folder / "cameras.bin")
-        return out, folder
+    """The coverage map is the result of the `coverage` stage: output/coverage.json."""
+
+    def make_scene(self, name, template="standard", **extra):
+        """A job that has run to the end through the stub (so it has records, a splat and,
+        when the template switches the stage on, a coverage map)."""
+        job = self.create_with_photo(name=name, step=0.005, template=template, **extra)
+        self.run_to_done(job)
+        return job
 
     def coverage(self, job, headers=None):
         status, body = self.api("GET", "/api/jobs/%s/coverage" % job, None, headers)
         self.assertEqual(status, 200, body)
         return body
 
-    def wait_coverage(self, job, states=("ready",), timeout=60.0):
+    def wait_coverage(self, job, states=("ready",), timeout=30.0):
         box = {}
 
         def reached():
@@ -2051,209 +2216,157 @@ class CoverageTests(ServerCase):
             raise AssertionError("coverage of %s never became %s: %r" % (job, states, box.get("state")))
         return box["state"]
 
-    def record_commands(self, slow=None):
-        """Remember every coverage command; with `slow`, run a sleeper instead of coverage.py."""
-        real = server.build_coverage_command
-        seen = []
+    def reset(self, job, stage):
+        status, view = self.api("POST", "/api/jobs/%s/stages/%s/reset" % (job, stage), {})
+        self.assertEqual(status, 200, view)
+        return view
 
-        def fake(splat, images, cameras, out, transform=None, up=None):
-            seen.append({"splat": Path(splat), "images": Path(images), "cameras": Path(cameras),
-                         "out": Path(out), "transform": transform, "up": up})
-            if slow is not None:
-                return [sys.executable, "-c", SLOW_COVERAGE, str(slow), str(out)]
-            return real(splat, images, cameras, out, transform, up)
-        server.build_coverage_command = fake
-        self.addCleanup(setattr, server, "build_coverage_command", real)
-        return seen
-
-    def test_command(self):
-        cmd = server.build_coverage_command(Path("a") / "splat.ply", "i.bin", "c.bin", "out.json")
-        self.assertEqual(cmd, [sys.executable, str(APP_DIR / "coverage.py"), str(Path("a") / "splat.ply"),
-                               "i.bin", "c.bin", "out.json"])
-        cmd = server.build_coverage_command("s", "i", "c", "o", Path("t.json"), [0, 0, 1])
-        self.assertEqual(cmd[-4:], ["--transform", "t.json", "--up", "0.0,0.0,1.0"])
-
-    def test_computed_on_demand_and_cached_in_the_job_folder(self):
-        out, sparse = self.make_scene("scene")
-        seen = self.record_commands()
-        self.assertEqual(self.coverage("scene"), {"state": "missing"})
-        status, error = self.api("GET", "/api/jobs/scene/coverage/data")
-        self.assertEqual((status, error["error"]), (404, "coverage_missing"))
-        self.assertFalse((self.runs / "scene" / "web-preview").exists())     # asking computes nothing
-        began = time.monotonic()
-        status, state = self.api("POST", "/api/jobs/scene/coverage")
-        self.assertLess(time.monotonic() - began, 5)                         # answered at once
-        self.assertIn((status, state["state"]), ((202, "queued"), (202, "building"), (200, "ready")))
-        state = self.wait_coverage("scene")
-        cache = self.runs / "scene" / "web-preview"
-        self.assertEqual(sorted(p.name for p in cache.iterdir()), ["coverage.json", "coverage.source.json"])
-        self.assertEqual(sorted(p.name for p in out.iterdir()), ["splat.ply"])   # output/ untouched
-        self.assertEqual(state["size"], (cache / "coverage.json").stat().st_size)
-        self.assertEqual(len(seen), 1)
-        self.assertEqual((seen[0]["images"], seen[0]["cameras"]), (sparse / "images.bin", sparse / "cameras.bin"))
-        self.assertEqual((seen[0]["transform"], seen[0]["up"]), (None, None))   # neither file exists
-
-        url = "/api/jobs/scene/coverage/data"
+    def test_the_map_is_served_as_the_stage_wrote_it(self):
+        job = self.make_scene("scene")
+        out = self.runs / job / "output"
+        state = self.coverage(job)
+        self.assertEqual(state, {"state": "ready", "size": (out / "coverage.json").stat().st_size})
+        url = "/api/jobs/%s/coverage/data" % job
         status, headers, body = self.request("GET", url)
-        self.assertEqual((status, body), (200, (cache / "coverage.json").read_bytes()))
+        self.assertEqual((status, body), (200, (out / "coverage.json").read_bytes()))
         self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
-        data = json.loads(body.decode("utf-8"))
-        self.assertEqual(data["format"], "scan3d-coverage")
-        self.assertEqual(len(data["cameras"]), 3)
-        self.assertGreater(data["voxels"]["count"], 0)
+        self.assertEqual(json.loads(body.decode("utf-8")), {"stub": "coverage", "version": 1})
         status, _headers, nothing = self.request("GET", url, headers={"If-None-Match": headers["etag"]})
         self.assertEqual((status, nothing), (304, b""))
         status, headers, nothing = self.request("HEAD", url)
         self.assertEqual((status, nothing, int(headers["content-length"])), (200, b"", len(body)))
-        noted = json.loads((cache / "coverage.source.json").read_text(encoding="utf-8"))
-        self.assertEqual(noted["version"], server._coverage.FORMAT_VERSION)
+        # it is also an ordinary output file
+        self.assertIn("output/coverage.json", [f["path"] for f in self.job(job)["output_files"]])
+        self.assertEqual(self.request("GET", "/api/jobs/%s/download/output/coverage.json" % job)[2], body)
+        # nothing is kept in web-preview/ any more
+        self.assertFalse((self.runs / job / "web-preview").exists())
 
-        # asking again computes nothing new
-        mtime = (cache / "coverage.json").stat().st_mtime_ns
-        status, state = self.api("POST", "/api/jobs/scene/coverage")
+    def test_asking_computes_nothing_and_the_post_queues_only_that_stage(self):
+        job = self.make_scene("scene")
+        self.reset(job, "coverage")
+        out = self.runs / job / "output"
+        self.assertFalse((out / "coverage.json").exists())
+        self.assertEqual(self.coverage(job), {"state": "missing", "enabled": True})
+        status, error = self.api("GET", "/api/jobs/%s/coverage/data" % job)
+        self.assertEqual((status, error["error"]), (404, "coverage_missing"))
+        self.assertEqual(self.job(job)["state"], "done")          # asking changed nothing
+        self.assertEqual(list(self.app.queue), [])
+
+        began = time.monotonic()
+        status, state = self.api("POST", "/api/jobs/%s/coverage" % job, {})
+        self.assertLess(time.monotonic() - began, 5)                   # answered at once
+        self.assertIn((status, state["state"]), ((202, "queued"), (202, "building")))
+        state = self.wait_coverage(job)
+        self.assertEqual(state["size"], (out / "coverage.json").stat().st_size)
+        view = self.wait_state(job, "done")
+        self.wait_idle()
+        argv = self.stub_argv(job)
+        self.assertEqual((argv["to"], argv["only"], argv["force"]), (None, ["coverage"], []))
+        self.assertEqual(self.stage_states(self.job(job))["coverage"], "done")
+        self.assertEqual(view["run"], {"to": None, "only": ["coverage"], "force": [],
+                                       "plan": ["coverage"]})
+
+        # asking again when it is there queues nothing
+        mtime = (out / "coverage.json").stat().st_mtime_ns
+        status, state = self.api("POST", "/api/jobs/%s/coverage" % job, {})
         self.assertEqual((status, state["state"]), (200, "ready"))
-        time.sleep(0.3)
-        self.assertEqual(((cache / "coverage.json").stat().st_mtime_ns, len(seen)), (mtime, 1))
+        time.sleep(0.2)
+        self.assertEqual((out / "coverage.json").stat().st_mtime_ns, mtime)
+        self.assertEqual(list(self.app.queue), [])
 
-        # the job is run again: a new splat, cameras or frame make the cached map stale
-        transform = {"train_from_world": {"scale": 1, "translation": [0, 0, 0],
-                                          "rotation": {"matrix_3x3": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]}}}
-        report = {"orientation": {"up_in_file_coordinates": [0.0, -1.0, 0.0]}}
-        (out / "scene_transform.json").write_text(json.dumps(transform), encoding="utf-8")
-        (out / "report.json").write_text(json.dumps(report), encoding="utf-8")
-        self.assertEqual(self.coverage("scene")["state"], "missing")
-        self.assertEqual(self.request("GET", url)[0], 404)
-        self.api("POST", "/api/jobs/scene/coverage")
-        self.wait_coverage("scene")
-        self.assertEqual((seen[1]["transform"], seen[1]["up"]), (out / "scene_transform.json", [0.0, -1.0, 0.0]))
-        self.assertEqual(json.loads(self.request("GET", url)[2])["up"], [0.0, -1.0, 0.0])
-        write_splat_ply(out / "splat.ply", 50)
-        self.assertEqual(self.coverage("scene")["state"], "missing")
-        self.api("POST", "/api/jobs/scene/coverage")
-        self.wait_coverage("scene")
-        self.assertEqual(json.loads(self.request("GET", url)[2])["gaussians"], 50)
-        write_images_bin(sparse / "images.bin", [(1, 0, 0, 0, 0, 0, 5)])
-        self.assertEqual(self.coverage("scene")["state"], "missing")
+    def test_a_stage_that_is_switched_off_must_be_switched_on_first(self):
+        job = self.make_scene("plain", template="preview")
+        self.assertEqual(self.coverage(job), {"state": "missing", "enabled": False})
+        status, error = self.api("POST", "/api/jobs/%s/coverage" % job, {})
+        self.assertEqual((status, error["error"]), (400, "stage_disabled"))
+        self.assertEqual(list(self.app.queue), [])
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job,
+                                {"coverage": {"enabled": True}})
+        self.assertEqual(status, 200, view)
+        self.assertEqual(self.coverage(job), {"state": "missing", "enabled": True})
+        self.assertEqual(self.api("POST", "/api/jobs/%s/coverage" % job, {})[0], 202)
+        self.wait_coverage(job)
 
-    def test_the_newer_dataset_layout_and_the_report_named_in_the_status(self):
-        out, sparse = self.make_scene("newer", sparse=("dataset", "sparse", "0"))
-        seen = self.record_commands()
-        (self.runs / "newer" / "train" / "run").mkdir(parents=True)
-        transform = {"train_from_world": {"scale": 2, "translation": [0, 0, 0],
-                                          "rotation": {"matrix_3x3": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]}}}
-        (self.runs / "newer" / "train" / "run" / "scene_transform.json").write_text(json.dumps(transform))
-        status = self.disk_status("newer")
-        status["outputs"]["report"] = "output/r.json"
-        (self.runs / "newer" / "status.json").write_text(json.dumps(status), encoding="utf-8")
-        (out / "r.json").write_text(json.dumps({"orientation": {"up_in_file_coordinates": [0, 0, 1]}}))
-        (out / "report.json").write_text(json.dumps({"orientation": {"up_in_file_coordinates": [1, 0, 0]}}))
-        wait_until(lambda: self.app.read_status("newer", fresh=True)["outputs"].get("report") == "output/r.json")
-        self.api("POST", "/api/jobs/newer/coverage")
-        self.wait_coverage("newer")
-        self.assertEqual(seen[0]["images"], sparse / "images.bin")
-        self.assertEqual(seen[0]["transform"], self.runs / "newer" / "train" / "run" / "scene_transform.json")
-        self.assertEqual(seen[0]["up"], [0.0, 0.0, 1.0])
-        # a report outside the job, or an unusable up direction, is not used (and without
-        # output/report.json to fall back on there is none)
-        (out / "report.json").unlink()
-        for rel, up in (("../../secret.json", [0, 0, 1]), ("output/r.json", [0, 0, 0]),
-                        ("output/r.json", ["x", 0, 1]), ("output/r.json", [float("1e300"), 0, 1])):
-            (self.tmp / "secret.json").write_text(json.dumps({"orientation": {"up_in_file_coordinates": [0, 1, 0]}}))
-            (out / "r.json").write_text(json.dumps({"orientation": {"up_in_file_coordinates": up}}))
-            status["outputs"]["report"] = rel
-            (self.runs / "newer" / "status.json").write_text(json.dumps(status), encoding="utf-8")
-            wait_until(lambda: self.app.read_status("newer", fresh=True)["outputs"].get("report") == rel)
-            inputs, _missing = self.app.coverage.inputs("newer", self.app.read_status("newer", fresh=True))
-            self.assertIsNone(inputs["up"], (rel, up))
-            (self.tmp / "secret.json").unlink()
+    def test_a_map_made_before_a_parameter_changed_is_still_served_and_marked_stale(self):
+        job = self.make_scene("scene")
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job,
+                                {"train": {"params": {"iterations": 5000}}})
+        self.assertEqual(status, 200, view)
+        self.assertEqual(self.stage_states(view)["train"], "stale")
+        self.assertEqual(self.stage_states(view)["coverage"], "stale")
+        state = self.coverage(job)
+        self.assertEqual((state["state"], state["stale"]), ("ready", True))
+        self.assertEqual(self.request("GET", "/api/jobs/%s/coverage/data" % job)[0], 200)
+        # computing it again needs the splat to be current first: the plan says so
+        status, error = self.api("POST", "/api/jobs/%s/coverage" % job, {})
+        self.assertEqual((status, error["error"]), (400, "needs_upstream"))
 
-    def test_unavailable_without_a_finished_job_a_splat_or_cameras(self):
+    def test_unavailable_without_a_splat(self):
         self.create(name="fresh")
         state = self.coverage("fresh")
-        self.assertEqual((state["state"], state["reason"]), ("unavailable", "not_done"))
-        self.assertIn("任务完成之后", state["message"])
+        self.assertEqual((state["state"], state["reason"]), ("unavailable", "no_splat"))
+        self.assertIn("高斯点云", state["message"])
         status, error = self.api("POST", "/api/jobs/fresh/coverage")
-        self.assertEqual((status, error["error"]), (409, "not_done"))
-        self.make_done_job("nocams")
-        state = self.coverage("nocams")
-        self.assertEqual((state["state"], state["reason"]), ("unavailable", "no_cameras"))
-        status, error = self.api("POST", "/api/jobs/nocams/coverage")
-        self.assertEqual((status, error["error"]), (409, "no_cameras"))
-        # images.bin alone is not enough (the camera intrinsics are in cameras.bin)
-        (self.runs / "nocams" / "dataset" / "sparse").mkdir(parents=True)
-        write_images_bin(self.runs / "nocams" / "dataset" / "sparse" / "images.bin", [(1, 0, 0, 0, 0, 0, 5)])
-        self.assertEqual(self.coverage("nocams")["reason"], "no_cameras")
-        out, _sparse = self.make_scene("nosplat")
-        (out / "splat.ply").unlink()
-        self.assertEqual(self.coverage("nosplat")["reason"], "no_splat")
-        self.assertEqual(self.api("POST", "/api/jobs/nosplat/coverage")[1]["error"], "no_splat")
-        for job in ("fresh", "nocams", "nosplat"):
-            self.assertEqual(self.api("GET", "/api/jobs/%s/coverage/data" % job)[1]["error"], "coverage_missing")
+        self.assertEqual((status, error["error"]), (409, "no_splat"))
+        self.assertEqual(self.api("GET", "/api/jobs/fresh/coverage/data")[1]["error"], "coverage_missing")
         for path in ("/api/jobs/nobody/coverage", "/api/jobs/nobody/coverage/data"):
             self.assertEqual(self.api("GET", path)[0], 404)
         self.assertEqual(self.api("POST", "/api/jobs/nobody/coverage")[0], 404)
-        for method, path in (("DELETE", "/api/jobs/nosplat/coverage"), ("PUT", "/api/jobs/nosplat/coverage"),
-                             ("POST", "/api/jobs/nosplat/coverage/data"),
-                             ("DELETE", "/api/jobs/nosplat/coverage/data")):
+        for method, path in (("DELETE", "/api/jobs/fresh/coverage"), ("PUT", "/api/jobs/fresh/coverage"),
+                             ("POST", "/api/jobs/fresh/coverage/data"),
+                             ("DELETE", "/api/jobs/fresh/coverage/data")):
             status, _headers, _ = self.request(method, path, b"x" if method == "PUT" else None)
             self.assertEqual(status, 405, "%s %s" % (method, path))
-        self.assertIsNone(self.app.coverage._thread)
+        self.assertEqual(list(self.app.queue), [])
 
     def test_a_failed_computation_is_reported_and_can_be_retried(self):
-        out, _sparse = self.make_scene("broken")
-        (out / "splat.ply").write_bytes(b"this is not a ply file at all")
-        self.assertEqual(self.api("POST", "/api/jobs/broken/coverage")[0], 202)
-        state = self.wait_coverage("broken", ("failed",))
-        self.assertIn("无法计算拍摄覆盖", state["error"])
-        self.assertIn("PLY", state["error"])
-        self.assertEqual(self.api("GET", "/api/jobs/broken/coverage/data")[0], 404)
-        self.assertEqual(list((self.runs / "broken" / "web-preview").iterdir()), [])
-        write_splat_ply(out / "splat.ply", 30)
-        self.assertEqual(self.api("POST", "/api/jobs/broken/coverage")[0], 202)
-        self.wait_coverage("broken")
+        job = self.make_scene("broken")
+        self.reset(job, "coverage")
+        self.stub_args[job] = ["--mode", "fail", "--fail-stage", "coverage", "--step", "0.01"]
+        self.assertEqual(self.api("POST", "/api/jobs/%s/coverage" % job)[0], 202)
+        state = self.wait_coverage(job, ("failed",))
+        self.assertEqual(state["error"], "stub: coverage failed")
+        self.assertEqual(self.api("GET", "/api/jobs/%s/coverage/data" % job)[0], 404)
+        self.wait_idle()
+        self.stub_args[job] = ["--step", "0.01"]
+        self.assertEqual(self.api("POST", "/api/jobs/%s/coverage" % job)[0], 202)
+        self.wait_coverage(job)
 
-    def test_one_at_a_time_never_waited_for_and_stopped_by_delete_time_limit_and_shutdown(self):
-        self.record_commands(slow=600)
-        self.make_scene("job-a")
-        self.make_scene("job-b")
-        self.assertEqual(self.api("POST", "/api/jobs/job-a/coverage")[0], 202)
-        started = self.runs / "job-a" / "web-preview" / "coverage.json.started"
-        wait_until(started.exists, 20, message="the first computation to start")
-        self.assertEqual(self.coverage("job-a")["state"], "building")
-        status, state = self.api("POST", "/api/jobs/job-b/coverage")
+    def test_it_waits_in_the_normal_queue_behind_a_running_job(self):
+        job = self.make_scene("scene")
+        self.reset(job, "coverage")
+        blocker = self.create_with_photo(name="blocker", step=5)
+        self.start(blocker)
+        self.wait_state(blocker, "running")
+        status, state = self.api("POST", "/api/jobs/%s/coverage" % job)
         self.assertEqual((status, state["state"]), (202, "queued"))
-        self.assertEqual(self.api("POST", "/api/jobs/job-a/coverage")[1]["state"], "building")
-        self.assertEqual(list(self.app.coverage.pending), [("job-b", "coverage")])
-        # previews have their own queue: not held up by the coverage map
-        self.assertEqual(self.api("POST", "/api/jobs/job-b/preview/lite")[0], 202)
-        self.wait_preview("job-b", "lite")
-        child = self.app.coverage.child
-        self.assertTrue(server.pid_alive(child.pid))
-        # deleting the job stops its computation; the next one starts
-        self.assertEqual(self.api("DELETE", "/api/jobs/job-a")[0], 200)
-        self.assertFalse((self.runs / "job-a").exists())
-        wait_until(lambda: not server.pid_alive(child.pid), 10, message="the computation to die")
-        wait_until((self.runs / "job-b" / "web-preview" / "coverage.json.started").exists, 20,
-                   message="the next computation to start")
-        # the time limit
-        self.app.coverage.time_limit = 1.0
-        state = self.wait_coverage("job-b", ("failed",), timeout=30)
-        self.assertIn("已被停止", state["error"])
-        wait_until(lambda: self.app.coverage.child is None, 10, message="the child to be reaped")
-        # shutting down kills a running computation
-        self.app.coverage.time_limit = 600.0
-        self.api("POST", "/api/jobs/job-b/coverage")
-        wait_until(lambda: self.app.coverage.child is not None, 20, message="the computation to start")
-        pid = self.app.coverage.child.pid
-        began = time.monotonic()
-        self.httpd.shutdown()
-        self.app.shutdown()
-        self.assertLess(time.monotonic() - began, 20)
-        wait_until(lambda: not server.pid_alive(pid), 10, message="the computation to die")
-        self.assertFalse(self.app.coverage._thread.is_alive())
+        self.assertEqual(self.coverage(job), {"state": "queued"})
+        self.assertEqual(self.api("POST", "/api/jobs/%s/coverage" % job)[1]["state"], "queued")
+        self.assertEqual(list(self.app.queue), [job])
+        view = self.job(job)
+        self.assertEqual((view["state"], view["queue_position"]), ("queued", 1))
+        self.assertEqual(view["stages"]["coverage"]["state"], "queued")
+        self.api("POST", "/api/jobs/%s/cancel" % blocker, {})
+        self.wait_coverage(job)
+
+    def test_phone_needs_the_token_and_may_ask(self):
+        job = self.make_scene("scene")
+        self.reset(job, "coverage")
+        self.remote()
+        header = {"X-Scan3D-Token": TOKEN}
+        for method, path in (("GET", "/api/jobs/%s/coverage" % job), ("POST", "/api/jobs/%s/coverage" % job),
+                             ("GET", "/api/jobs/%s/coverage/data" % job)):
+            self.assertEqual(self.request(method, path)[0], 401)
+        self.assertEqual(list(self.app.queue), [])
+        cookie = {"Cookie": "scan3d_token=" + TOKEN, "Origin": "http://evil.example"}
+        status, error = self.api("POST", "/api/jobs/%s/coverage" % job, None, cookie)
+        self.assertEqual((status, error["error"]), (403, "bad_origin"))
+        self.assertEqual(self.api("POST", "/api/jobs/%s/coverage" % job, None, header)[0], 202)
+        wait_until(lambda: self.api("GET", "/api/jobs/%s/coverage" % job, None, header)[1]["state"]
+                   == "ready", 30, message="the map")
 
 
-# =========================================================================== models and licences
+# =========================================================================== models
 
 class ModelsTests(ServerCase):
     PHONE = {"X-Scan3D-Token": TOKEN}
@@ -2261,110 +2374,62 @@ class ModelsTests(ServerCase):
     def download(self, body=None, headers=None):
         return self.api("POST", "/api/models/download", {} if body is None else body, headers)
 
-    def accept(self, ids, headers=None):
-        return self.api("POST", "/api/models/accept", {"licences": ids}, headers)
-
     def test_overview(self):
         self.models.install("moge.bin")
         view = self.models_view()
-        self.assertEqual(set(view), {"features", "licences", "files_missing", "download_mb",
-                                     "download", "can_manage"})
+        self.assertEqual(set(view), {"features", "disk_mb", "download_mb", "free_mb", "download",
+                                     "can_manage"})
         self.assertTrue(view["can_manage"])
-        self.assertEqual(list(view["features"]),
-                         ["masks", "subject_only", "normals", "dense_seed", "sfm"])
-        self.assertEqual({k: v["label"] for k, v in view["features"].items()}, {
-            "masks": "抠除移动物体", "subject_only": "物体扫描：只保留主体",
-            "normals": "表面法线先验", "dense_seed": "稠密点云初始化",
-            "sfm": "位姿计算的备用特征"})
-        self.assertEqual(view["features"]["masks"], {
-            "label": "抠除移动物体", "files": ["sam3.bin"], "enabled": True, "ready": False,
-            "licences_needed": ["sam3"], "files_missing": [], "download_mb": 6})
-        self.assertEqual(view["features"]["normals"]["ready"], True)
-        self.assertEqual(view["features"]["sfm"], {
-            "label": "位姿计算的备用特征", "files": ["aliked.bin", "lightglue.bin"],
-            "enabled": True, "ready": False, "licences_needed": [],
-            "files_missing": ["aliked.bin", "lightglue.bin"], "download_mb": 2})
-        self.assertEqual(view["features"]["dense_seed"]["enabled"], False)
-        self.assertEqual(view["licences"]["sam3"], {
-            "name": "SAM License (Meta)", "url": "https://example.invalid/sam3",
-            "used_for": "抠除移动物体", "accepted": False, "needed": True})
-        self.assertEqual(view["licences"]["dinov3"]["needed"], False)   # its feature is off
-        self.assertEqual((view["files_missing"], view["download_mb"]),
-                         (["aliked.bin", "lightglue.bin"], 2))
+        self.assertEqual([f["id"] for f in view["features"]],
+                         ["masks", "normals", "dense_seed", "sfm"])
+        masks, normals, sfm = view["features"][0], view["features"][1], view["features"][3]
+        self.assertEqual(masks, {
+            "id": "masks", "label": "抠图（SAM 3）", "stage": "masks",
+            "files": [{"name": "sam3.bin", "mb": 6, "installed": False}],
+            "licence": {"id": "sam3", "label": "SAM License (Meta)",
+                        "url": "https://example.invalid/sam3", "accepted": False},
+            "ready": False})
+        self.assertEqual((normals["ready"], normals["licence"]), (True, None))
+        self.assertEqual([f["installed"] for f in sfm["files"]], [False, False])
+        self.assertEqual((view["disk_mb"], view["download_mb"]), (4, 11))
+        self.assertIsInstance(view["free_mb"], int)
         self.assertEqual(view["download"], {"state": "idle", "features": [], "error": None,
                                             "downloaded_mb": 0, "total_mb": 0, "files": []})
         self.assertEqual(self.request("HEAD", "/api/models")[0], 200)
         self.assertEqual(self.request("DELETE", "/api/models")[0], 405)
-        self.assertEqual(self.request("GET", "/api/models/accept")[0], 405)
         self.assertEqual(self.request("GET", "/api/models/download")[0], 405)
         self.assertEqual(self.request("GET", "/api/models/nope")[0], 404)
+        # there is no consent step to call
+        for path in ("/api/models/accept", "/api/models/consent"):
+            self.assertEqual(self.api("POST", path, {"ids": ["sam3"]})[0], 404, path)
 
         # a phone sees the same states, and that it cannot manage them
         self.remote()
         self.assertEqual(self.api("GET", "/api/models")[0], 401)
         phone = self.models_view(self.PHONE)
         self.assertFalse(phone["can_manage"])
-        self.assertEqual({k: v for k, v in phone.items() if k != "can_manage"},
-                         {k: v for k, v in view.items() if k != "can_manage"})
-        # looking never accepts anything
-        self.assertEqual(self.models.accepted, set())
+        left = {k: v for k, v in phone.items() if k not in ("can_manage", "free_mb")}
+        right = {k: v for k, v in view.items() if k not in ("can_manage", "free_mb")}
+        self.assertEqual(left, right)
 
-    def test_a_feature_the_server_has_no_name_for_keeps_its_key(self):
-        real = server.models_status
+    def test_the_licence_is_a_fact_about_the_record_not_a_choice_made_here(self):
+        self.models.recorded.add("sam3")
+        view = self.models_view()
+        self.assertTrue(view["features"][0]["licence"]["accepted"])
+        self.assertFalse(view["features"][2]["licence"]["accepted"])
+        # a feature that was never asked about is simply fetched: no licence step
+        status, view = self.download({"features": ["dense_seed"]})
+        self.assertEqual(status, 202, view)
+        self.assertEqual(self.models.commands, [["dense_seed"]])
+        self.wait_download()
 
-        def with_new_feature():
-            status = real()
-            status["features"]["depth"] = dict(status["features"]["normals"])
-            return status
-
-        server.models_status = with_new_feature
-        self.assertEqual(self.models_view()["features"]["depth"]["label"], "depth")
-
-    def test_accepting_a_licence_is_an_explicit_request_from_this_pc(self):
-        # a phone may not, token or not
-        self.remote()
-        status, error = self.accept(["sam3"], self.PHONE)
-        self.assertEqual((status, error["error"]), (403, "loopback_only"))
-        self.assertEqual(self.models.accepted, set())
-        self.app.loopback_check = server.is_loopback_address
-
-        # a page of another site may not either
-        status, error = self.accept(["sam3"], {"Origin": "http://evil.example"})
-        self.assertEqual((status, error["error"]), (403, "bad_origin"))
-
-        # an unknown id: nothing is recorded, the known one beside it included
-        for bad in (["nope"], ["birefnet", "nope"], ["../x"]):
-            status, error = self.accept(bad)
-            self.assertEqual((status, error["error"]), (400, "bad_licence"), bad)
-        for bad in ({}, {"licences": []}, {"licences": "sam3"}, {"licences": [1]},
-                    {"licences": [["sam3"]]}, {"licences": None}, {"licence": ["sam3"]}):
-            status, error = self.api("POST", "/api/models/accept", bad)
-            self.assertEqual((status, error["error"]), (400, "bad_licence"), bad)
-        self.assertEqual(self.models.accepted, set())
-
-        status, view = self.accept(["sam3"])
-        self.assertEqual(status, 200, view)
-        self.assertEqual(self.models.accepted, {"sam3"})
-        self.assertTrue(view["can_manage"])
-        self.assertEqual((view["licences"]["sam3"]["accepted"], view["licences"]["sam3"]["needed"]),
-                         (True, False))
-        self.assertFalse(view["licences"]["birefnet"]["accepted"])
-        masks = view["features"]["masks"]
-        self.assertEqual((masks["licences_needed"], masks["files_missing"], masks["ready"]),
-                         ([], ["sam3.bin"], False))
-        # accepting starts no download by itself
-        self.assertEqual(view["download"]["state"], "idle")
-        self.assertEqual(self.models.commands, [])
-
-        status, view = self.accept(["birefnet", "dinov3"])
-        self.assertEqual(status, 200)
-        self.assertEqual(self.models.accepted, {"sam3", "birefnet", "dinov3"})
-
-    def test_download_is_refused_for_phones_unknown_features_and_open_licences(self):
+    def test_download_is_refused_for_phones_and_unknown_features(self):
         self.remote()
         status, error = self.download({"features": ["normals"]}, self.PHONE)
         self.assertEqual((status, error["error"]), (403, "loopback_only"))
         self.app.loopback_check = server.is_loopback_address
+        status, error = self.download({"features": ["normals"]}, {"Origin": "http://evil.example"})
+        self.assertEqual((status, error["error"]), (403, "bad_origin"))
 
         for bad in (["nope"], ["normals", "nope"], ["../normals"]):
             status, error = self.download({"features": bad})
@@ -2372,27 +2437,11 @@ class ModelsTests(ServerCase):
         for bad in ("normals", [1], [["normals"]], {"normals": True}, 7):
             status, error = self.download({"features": bad})
             self.assertEqual((status, error["error"]), (400, "bad_feature"), bad)
-
-        # a feature whose licence nobody accepted: said clearly, nothing fetched, nothing accepted
-        for names in (["masks"], ["normals", "masks"], ["dense_seed", "subject_only"]):
-            status, error = self.download({"features": names})
-            self.assertEqual((status, error["error"]), (409, "licence_needed"), names)
-        self.assertEqual(error["licences"], ["birefnet", "dinov3"])
-        self.assertIn("同意许可", error["message"])
-        self.assertIn("稠密点云初始化", error["message"])
-        self.assertIn("物体扫描：只保留主体", error["message"])
-        status, error = self.download({"features": ["normals", "masks"]})
-        self.assertEqual(error["licences"], ["sam3"])
-        self.assertIn("抠除移动物体", error["message"])
-        self.assertNotIn("表面法线先验", error["message"])
-
         self.assertEqual(self.models.commands, [])
-        self.assertEqual(self.models.accepted, set())
         self.assertEqual(self.models_view()["download"]["state"], "idle")
         self.assertFalse(self.models.folder.exists())
 
     def test_download_with_progress_and_one_at_a_time(self):
-        self.models.accepted.add("sam3")
         self.models.folder.mkdir()
         gate = self.models.folder / "gate"
         gate.write_bytes(b"")
@@ -2412,7 +2461,7 @@ class ModelsTests(ServerCase):
         self.assertEqual(view["download"]["files"],
                          [{"name": "sam3.bin", "size_mb": 6, "downloaded_mb": 3}])
         self.assertEqual((self.models.folder / "_part" / "sam3.bin").stat().st_size, 3 * MIB)
-        self.assertFalse(view["features"]["masks"]["ready"])
+        self.assertFalse(view["features"][0]["ready"])
 
         # one download at a time, whatever is asked for
         for body in ({"features": ["normals"]}, {"features": ["masks"]}, {}):
@@ -2429,12 +2478,10 @@ class ModelsTests(ServerCase):
 
         gate.unlink()
         view = self.wait_download()
-        # The stand-in exits with 1, as the real command does while another enabled feature
-        # (here: normals, sfm) still lacks files. The download counts as done all the same.
         self.assertEqual(view["download"], {
             "state": "done", "features": ["masks"], "error": None, "downloaded_mb": 6,
             "total_mb": 6, "files": [{"name": "sam3.bin", "size_mb": 6, "downloaded_mb": 6}]})
-        self.assertTrue(view["features"]["masks"]["ready"])
+        self.assertTrue(view["features"][0]["ready"])
         self.assertEqual((self.models.folder / "sam3.bin").stat().st_size, 6 * MIB)
         self.assertFalse((self.models.folder / "_part" / "sam3.bin").exists())
         wait_until(lambda: self.app.models.child is None, 10, message="the child to be reaped")
@@ -2444,41 +2491,38 @@ class ModelsTests(ServerCase):
         self.assertEqual((status, view["download"]["state"]), (200, "done"))
         self.assertEqual(self.models.commands, [["masks"]])
 
-    def test_download_without_names_fetches_what_the_enabled_features_may_have(self):
-        self.models.exit_code = 0
+    def test_download_without_names_fetches_what_the_default_template_uses(self):
+        self.models.install("moge.bin")
         for body in ({}, {"features": []}, {"features": None}):
-            for name in ("moge.bin", "aliked.bin", "lightglue.bin"):
+            for name in ("sam3.bin", "aliked.bin", "lightglue.bin"):
                 (self.models.folder / name).unlink(missing_ok=True)
             status, view = self.download(body)
             self.assertEqual(status, 202, (body, view))
-            # masks is enabled too, but its licence is open: left alone, and not accepted
-            self.assertEqual(view["download"]["features"], ["normals", "sfm"])
-            self.assertEqual(view["download"]["total_mb"], 6)
+            self.assertEqual(view["download"]["features"], ["masks", "sfm"])
+            self.assertEqual(view["download"]["total_mb"], 8)
             view = self.wait_download()
             self.assertEqual((view["download"]["state"], view["download"]["downloaded_mb"]),
-                             ("done", 6), body)
-        self.assertEqual(self.models.commands, [None, None, None])
+                             ("done", 8), body)
+        self.assertEqual(self.models.commands, [["masks", "sfm"]] * 3)
         self.assertEqual(sorted(p.name for p in self.models.folder.iterdir() if p.is_file()),
-                         ["aliked.bin", "lightglue.bin", "moge.bin"])
-        self.assertEqual(self.models.accepted, set())
-        self.assertEqual(view["features"]["masks"]["licences_needed"], ["sam3"])
-        self.assertEqual(view["files_missing"], [])
+                         ["aliked.bin", "lightglue.bin", "moge.bin", "sam3.bin"])
+        # what the default template does not use (RoMa) is left alone
+        self.assertEqual((view["disk_mb"], view["download_mb"]), (12, 3))
 
         # nothing more to fetch: said with 200, and no process is started
         status, view = self.download({})
         self.assertEqual((status, view["download"]["state"]), (200, "done"))
         self.assertEqual(len(self.models.commands), 3)
-
-        # features that are off by default can be prepared by name
-        self.models.accepted.add("dinov3")
+        # features that the default template does not use can be prepared by name
         status, view = self.download({"features": ["dense_seed", "normals"]})
         self.assertEqual(status, 202)
         self.assertEqual(view["download"]["features"], ["dense_seed"])   # normals has its file
-        self.assertTrue(self.wait_download()["features"]["dense_seed"]["ready"])
+        self.assertTrue(self.wait_download()["features"][2]["ready"])
         self.assertEqual(self.models.commands[-1], ["dense_seed"])
 
     def test_a_download_that_fails_says_why_and_can_be_retried(self):
         self.models.mode = "fail"
+        self.models.exit_code = 1
         status, view = self.download({"features": ["normals", "sfm"]})
         self.assertEqual(status, 202, view)
         view = self.wait_download()
@@ -2489,15 +2533,17 @@ class ModelsTests(ServerCase):
         # what arrived is kept and counted
         self.assertEqual((download["downloaded_mb"], download["total_mb"]), (2, 6))
         self.assertEqual(download["files"][0], {"name": "moge.bin", "size_mb": 4, "downloaded_mb": 2})
-        self.assertFalse(view["features"]["normals"]["ready"])
+        self.assertFalse(view["features"][1]["ready"])
         wait_until(lambda: self.app.models.child is None, 10, message="the child to be reaped")
 
         # exit code 0 with the files still missing is a failure as well
         self.models.exit_code = 0
+        self.models.mode = "fail"
         self.assertEqual(self.download({"features": ["normals"]})[0], 202)
         download = self.wait_download()["download"]
         self.assertEqual(download["state"], "failed")
         self.assertIn("退出码 0", download["error"])
+        wait_until(lambda: self.app.models.child is None, 10, message="the child to be reaped")
 
         # the retry goes on from the partial file and clears the error
         self.models.mode = "ok"
@@ -2507,7 +2553,7 @@ class ModelsTests(ServerCase):
         view = self.wait_download()
         self.assertEqual((view["download"]["state"], view["download"]["error"],
                           view["download"]["downloaded_mb"]), ("done", None, 6))
-        self.assertTrue(view["features"]["normals"]["ready"] and view["features"]["sfm"]["ready"])
+        self.assertTrue(view["features"][1]["ready"] and view["features"][3]["ready"])
 
     def test_a_download_command_that_cannot_start_is_a_failure_not_a_hang(self):
         server.build_models_command = lambda features: [str(self.tmp / "no-such-program.exe")]
@@ -2559,17 +2605,19 @@ class ModelsTests(ServerCase):
         def broken():
             raise ValueError("settings.json names a model file this version does not know: x.bin")
 
-        server.models_status = broken
+        server.models_features = broken
         status, error = self.api("GET", "/api/models")
         self.assertEqual((status, error["error"]), (500, "models_unavailable"))
         self.assertIn("x.bin", error["message"])
-        for path, body in (("/api/models/accept", {"licences": ["sam3"]}),
-                           ("/api/models/download", {})):
-            status, error = self.api("POST", path, body)
-            self.assertEqual((status, error["error"]), (500, "models_unavailable"), path)
-        self.assertEqual(self.models.accepted, set())
+        status, error = self.api("POST", "/api/models/download", {})
+        self.assertEqual((status, error["error"]), (500, "models_unavailable"))
         self.assertEqual(self.api("GET", "/api/jobs")[0], 200)
         self.assertEqual(self.api("GET", "/api/info")[0], 200)
+        # the workflow editor does not depend on it
+        status, schema = self.api("GET", "/api/workflow/schema")
+        self.assertEqual(status, 200)
+        self.assertEqual(schema["features"], [])
+        self.assertIn("x.bin", schema["features_error"])
 
     def test_download_is_refused_when_the_disk_is_too_full(self):
         real = server.shutil.disk_usage
@@ -2581,116 +2629,733 @@ class ModelsTests(ServerCase):
         self.assertEqual(self.models.commands, [])
 
 
-# =========================================================================== per-scan switches
+# =========================================================================== workflows
 
-class OptionsTests(ServerCase):
-    def test_only_the_known_switches_with_true_or_false(self):
-        job = self.create_with_photo()
-        for bad in ({"masks": 1}, {"masks": 0}, {"masks": "true"}, {"masks": None},
-                    {"subject_only": "yes"}, {"other": True}, {"masks": True, "iterations": 5},
-                    {"train_args": ["--x"]}, [], ["masks"], "masks", 5, True, False):
-            status, error = self.api("POST", "/api/jobs", {"options": bad})
-            self.assertEqual((status, error["error"]), (400, "bad_options"), bad)
-            status, error = self.api("POST", "/api/jobs/%s/start" % job, {"options": bad})
-            self.assertEqual((status, error["error"]), (400, "bad_options"), bad)
-        # nothing was created and nothing was started
-        self.assertEqual([p.name for p in self.runs.iterdir() if p.is_dir()], [job])
-        self.assertEqual(self.job(job)["state"], "created")
-        self.assertEqual(self.job(job)["options"], {})
+class TemplateTests(ServerCase):
+    PHONE = {"X-Scan3D-Token": TOKEN}
 
-    def test_switches_are_stored_shown_and_passed_to_the_pipeline(self):
-        job = self.create_with_photo(step=0.01, options={"subject_only": True})
-        self.assertEqual(self.job(job)["options"], {"subject_only": True})
+    def save(self, tid, body, headers=None):
+        return self.api("PUT", "/api/templates/" + tid, body, headers)
+
+    def ids(self, view):
+        return [t["id"] for t in view["templates"]]
+
+    def test_schema_templates_and_features(self):
+        status, schema = self.api("GET", "/api/workflow/schema")
+        self.assertEqual(status, 200)
+        self.assertEqual([s["id"] for s in schema["stages"]], list(workflow.STAGE_ORDER))
+        for stage, want in zip(schema["stages"], workflow.schema()["stages"]):
+            self.assertEqual(stage, want)       # exactly workflow.schema(): no list of our own
+        self.assertEqual(schema["default_template"], "standard")
+        self.assertEqual(self.ids(schema), ["preview", "standard", "high", "full", "mesh_only"])
+        standard = schema["templates"][1]
+        self.assertEqual((standard["label"], standard["builtin"]), ("标准（高斯）", True))
+        self.assertEqual(standard["enabled"], ["ingest", "masks", "sfm", "normals", "train",
+                                               "coverage", "export"])
+        self.assertEqual(schema["templates"][4]["enabled"],
+                         ["ingest", "masks", "sfm", "dense", "mesh", "export"])
+        self.assertEqual([f["id"] for f in schema["features"]],
+                         ["masks", "normals", "dense_seed", "sfm"])
+        self.assertNotIn("features_error", schema)
+        self.assertEqual(self.request("HEAD", "/api/workflow/schema")[0], 200)
+        for method in ("POST", "PUT", "DELETE"):
+            self.assertEqual(self.request(method, "/api/workflow/schema", b"{}")[0], 405)
+        # a phone may read it, with the token
+        self.remote()
+        self.assertEqual(self.api("GET", "/api/workflow/schema")[0], 401)
+        self.assertEqual(self.api("GET", "/api/workflow/schema", None, self.PHONE)[0], 200)
+
+    def test_saving_listing_using_and_deleting_a_user_template(self):
+        body = {"label": "我的物体", "desc": "只要高斯，快一点",
+                "stages": {"train": {"params": {"iterations": 9000}}, "masks": {"enabled": False}}}
+        status, view = self.save("mine", body)
+        self.assertEqual(status, 200, view)
+        self.assertEqual(self.ids(view), ["preview", "standard", "high", "full", "mesh_only", "mine"])
+        self.assertEqual(view["default_template"], "standard")
+        mine = view["templates"][-1]
+        self.assertEqual({k: mine[k] for k in ("id", "label", "desc", "builtin", "base")},
+                         {"id": "mine", "label": "我的物体", "desc": "只要高斯，快一点",
+                          "builtin": False, "base": "standard"})
+        self.assertEqual(mine["enabled"], ["ingest", "sfm", "normals", "train", "coverage", "export"])
+        # what is stored in user-settings.json (workflow.save_user is the writer)
+        self.assertEqual(self.user, {"templates": {"mine": {
+            "label": "我的物体", "desc": "只要高斯，快一点", "base": "standard",
+            "stages": {"train": {"params": {"iterations": 9000}}, "masks": {"enabled": False}}}}})
+        self.assertEqual(self.api("GET", "/api/templates")[1], view)
+
+        # a job made from it
+        job = self.create(template="mine")
+        view = self.job(job)
+        self.assertEqual(view["template"], "mine")
+        self.assertEqual(view["workflow"]["stages"]["train"]["params"]["iterations"], 9000)
+        self.assertFalse(view["workflow"]["stages"]["masks"]["enabled"])
+        self.assertTrue(view["workflow"]["stages"]["normals"]["enabled"])   # from its base
+        self.assertEqual(view["changes"], {})
+
+        # the default
+        status, view = self.api("PUT", "/api/templates/default", {"id": "mine"})
+        self.assertEqual((status, view["default_template"]), (200, "mine"))
+        self.assertEqual(self.user["default_template"], "mine")
+        self.assertEqual(self.job(self.create())["template"], "mine")
+        self.assertEqual(self.api("GET", "/api/info")[1]["default_template"], "mine")
+        status, error = self.api("PUT", "/api/templates/default", {"id": "nope"})
+        self.assertEqual((status, error["error"]), (400, "bad_template"))
+        for bad in ({}, {"id": 5}, {"id": None}, {"id": ["mine"]}):
+            self.assertEqual(self.api("PUT", "/api/templates/default", bad)[1]["error"], "bad_template")
+        self.assertEqual(self.user["default_template"], "mine")
+
+        # deleting it: jobs made from it keep their workflow, the default goes back
+        status, view = self.api("DELETE", "/api/templates/mine")
+        self.assertEqual(status, 200, view)
+        self.assertEqual(self.ids(view), ["preview", "standard", "high", "full", "mesh_only"])
+        self.assertEqual(view["default_template"], "standard")
+        self.assertNotIn("default_template", self.user)
+        view = self.job(job)
+        self.assertEqual((view["template"], view["changes"]), ("mine", {}))
+        self.assertEqual(view["workflow"]["stages"]["train"]["params"]["iterations"], 9000)
+        self.assertEqual(self.api("DELETE", "/api/templates/mine")[1]["error"], "not_found")
+
+    def test_a_user_template_can_replace_a_built_in_one_and_be_removed_again(self):
+        status, view = self.save("preview", {"label": "我的预览", "base": "preview", "stages": {
+            "train": {"params": {"iterations": 3000}}}})
+        self.assertEqual(status, 200, view)
+        preview = [t for t in view["templates"] if t["id"] == "preview"][0]
+        self.assertEqual((preview["label"], preview["builtin"]), ("我的预览", False))
+        self.assertEqual(self.ids(view).count("preview"), 1)
+        job = self.create(template="preview")
+        self.assertEqual(self.job(job)["workflow"]["stages"]["train"]["params"]["iterations"], 3000)
+        status, view = self.api("DELETE", "/api/templates/preview")
+        self.assertEqual(status, 200)
+        self.assertTrue([t for t in view["templates"] if t["id"] == "preview"][0]["builtin"])
+        # a built-in one that was never replaced cannot be deleted
+        status, error = self.api("DELETE", "/api/templates/standard")
+        self.assertEqual((status, error["error"]), (409, "builtin_template"))
+
+    def test_templates_are_checked_before_they_are_saved(self):
+        good = {"label": "x", "stages": {}}
+        cases = [
+            ({"stages": {}}, 400, "bad_request"),                              # no label
+            ({"label": "", "stages": {}}, 400, "bad_request"),
+            ({"label": "x" * 61, "stages": {}}, 400, "bad_request"),
+            ({"label": 5, "stages": {}}, 400, "bad_request"),
+            ({"label": "x", "desc": 5, "stages": {}}, 400, "bad_request"),
+            ({"label": "x", "stages": []}, 400, "bad_workflow"),
+            ({"label": "x", "stages": {"nope": {"enabled": True}}}, 400, "bad_workflow"),
+            ({"label": "x", "stages": {"train": {"params": {"nope": 1}}}}, 400, "bad_workflow"),
+            ({"label": "x", "stages": {"train": {"params": {"iterations": 1}}}}, 400, "bad_workflow"),
+            ({"label": "x", "stages": {"train": {"params": {"primitive": "gl"}}}}, 400, "bad_workflow"),
+            ({"label": "x", "stages": {"train": {"enabled": "yes"}}}, 400, "bad_workflow"),
+            ({"label": "x", "stages": {"sfm": {"enabled": False}}}, 400, "bad_workflow"),
+            ({"label": "x", "stages": {"train": {"bogus": 1}}}, 400, "bad_workflow"),
+            ({"label": "x", "stages": "train"}, 400, "bad_workflow"),
+            ({"label": "x", "base": "nope", "stages": {}}, 400, "bad_workflow"),
+            ({"label": "x", "base": 5, "stages": {}}, 400, "bad_workflow"),
+            ({"label": "x", "base": "mine", "stages": {}}, 400, "bad_workflow"),   # itself
+        ]
+        for body, want_status, code in cases:
+            status, error = self.save("mine", body)
+            self.assertEqual((status, error["error"]), (want_status, code), body)
+            if code == "bad_workflow":
+                self.assertTrue(error["problems"], body)
+                self.assertIsInstance(error["problems"][0], str)
+        for tid in ("default", "has%20space", "%E5%90%8D%E5%AD%97", "x" * 65, "-x", "a.b"):
+            status, error = self.save(tid, good)
+            self.assertEqual(status, 400, tid)
+        self.assertEqual(self.user, {})                    # nothing was written
+        for body in (b"{not json", b"[1]"):
+            self.assertEqual(self.save("mine", body, {"Content-Type": "application/json"})[1]["error"],
+                             "bad_json")
+        self.assertEqual(self.save("mine", good)[0], 200)
+
+    def test_a_template_that_others_are_built_on_stays_and_there_is_a_limit(self):
+        self.save("base-one", {"label": "a", "stages": {"train": {"params": {"iterations": 4000}}}})
+        status, view = self.save("derived", {"label": "b", "base": "base-one", "stages": {}})
+        self.assertEqual(status, 200, view)
+        job = self.create(template="derived")
+        self.assertEqual(self.job(job)["workflow"]["stages"]["train"]["params"]["iterations"], 4000)
+        status, error = self.api("DELETE", "/api/templates/base-one")
+        self.assertEqual((status, error["error"]), (409, "template_in_use"))
+        self.assertIn("derived", error["message"])
+        self.assertEqual(self.api("DELETE", "/api/templates/derived")[0], 200)
+        self.assertEqual(self.api("DELETE", "/api/templates/base-one")[0], 200)
+
+        for index in range(server.MAX_USER_TEMPLATES):
+            self.user.setdefault("templates", {})["t%d" % index] = {
+                "label": "t", "base": "standard", "stages": {}}
+        status, error = self.save("one-more", {"label": "x", "stages": {}})
+        self.assertEqual((status, error["error"]), (409, "too_many_templates"))
+        self.assertEqual(self.save("t3", {"label": "changed", "stages": {}})[0], 200)   # replacing is fine
+
+    def test_only_this_pc_may_change_templates(self):
+        self.save("mine", {"label": "x", "stages": {}})
+        before = json.dumps(self.user, sort_keys=True)
+        self.remote()
+        for method, path, body in (("PUT", "/api/templates/other", {"label": "x", "stages": {}}),
+                                   ("DELETE", "/api/templates/mine", None),
+                                   ("PUT", "/api/templates/default", {"id": "mine"})):
+            self.assertEqual(self.api(method, path, body)[0], 401)      # no token at all
+            status, error = self.api(method, path, body, self.PHONE)
+            self.assertEqual((status, error["error"]), (403, "loopback_only"), path)
+        self.assertEqual(self.api("GET", "/api/templates", None, self.PHONE)[0], 200)
+        self.assertEqual(json.dumps(self.user, sort_keys=True), before)
+        self.app.loopback_check = server.is_loopback_address
+        status, error = self.save("mine", {"label": "x", "stages": {}}, {"Origin": "http://evil.example"})
+        self.assertEqual((status, error["error"]), (403, "bad_origin"))
+        self.assertEqual(self.request("POST", "/api/templates", b"{}")[0], 405)
+        self.assertEqual(self.request("GET", "/api/templates/mine")[0], 405)
+        self.assertEqual(self.request("PUT", "/api/templates/a/b", b"{}")[0], 404)
+
+
+class WorkflowTests(ServerCase):
+    def test_create_with_a_template_and_an_override(self):
+        status, view = self.api("POST", "/api/jobs", {
+            "template": "full", "workflow": {"train": {"params": {"iterations": 5000}},
+                                             "coverage": {"enabled": False}}})
+        self.assertEqual(status, 201, view)
+        job = view["job"]
+        self.assertEqual(view["template"], "full")
+        stages = view["workflow"]["stages"]
+        self.assertEqual(stages["train"]["params"]["iterations"], 5000)
+        self.assertEqual(stages["train"]["params"]["cap_max"], 2000000)         # complete
+        self.assertEqual([s for s in workflow.STAGE_ORDER if stages[s]["enabled"]],
+                         ["ingest", "masks", "sfm", "normals", "train", "dense", "mesh", "export"])
+        self.assertEqual(view["changes"], {"train": {"params": {"iterations": 5000}},
+                                           "coverage": {"enabled": False}})
+        self.assertEqual(self.stage_states(view), {
+            "ingest": "pending", "masks": "pending", "sfm": "pending", "normals": "pending",
+            "dense_seed": "disabled", "train": "pending", "dense": "pending", "mesh": "pending",
+            "coverage": "disabled", "export": "pending"})
+        self.assertEqual(view["run"], {"to": None, "only": [], "force": [], "plan": []})
+        self.assertEqual(json.loads((self.runs / job / "workflow.json").read_text(encoding="utf-8")),
+                         view["workflow"])
         meta = json.loads((self.runs / job / "server-job.json").read_text(encoding="utf-8"))
-        self.assertEqual(meta["options"], {"subject_only": True})
-        status, listing = self.api("GET", "/api/jobs")
-        self.assertEqual(listing["jobs"][0]["options"], {"subject_only": True})
-        self.start(job)
-        view = self.wait_state(job, ("done", "failed"))
-        self.assertEqual((view["state"], view["options"]), ("done", {"subject_only": True}))
-        argv = self.stub_argv(job)
-        self.assertEqual(argv["overrides"], {"subject_only": True})
-        self.assertEqual(argv["argv"][argv["argv"].index("--set"):][:2],
-                         ["--set", "subject_only=true"])
-        self.assertEqual(argv["argv"].count("--set"), 1)
+        self.assertNotIn("quality", meta)
+        self.assertNotIn("options", meta)
+        self.assertIsNone(meta["run"])
+        # without a template: the user's default
+        self.user = {"default_template": "high"}
+        self.assertEqual(self.job(self.create())["template"], "high")
 
-        both = self.create_with_photo(step=0.01, options={"subject_only": False, "masks": False})
-        self.start(both)
-        self.wait_state(both, ("done", "failed"))
-        self.assertEqual(self.stub_argv(both)["overrides"], {"masks": False, "subject_only": False})
-        self.assertEqual(self.job(both)["options"], {"masks": False, "subject_only": False})
+    def test_an_invalid_workflow_is_refused_with_every_problem_and_creates_nothing(self):
+        for body in ({"template": "nope"},
+                     {"workflow": {"nope": {"enabled": True}}},
+                     {"workflow": {"train": {"params": {"iterations": "many"}}}},
+                     {"workflow": {"ingest": {"enabled": False}}},
+                     {"workflow": {"train": {"params": {"iterations": 10, "cap_max": 5}}}}):
+            status, error = self.api("POST", "/api/jobs", body)
+            self.assertEqual((status, error["error"]), (400, "bad_workflow"), body)
+            self.assertTrue(error["problems"] and all(isinstance(p, str) for p in error["problems"]))
+            self.assertIn(error["problems"][0], error["message"])
+        self.assertEqual(len(error["problems"]), 2)
+        self.assertEqual(list(self.runs.iterdir()), [])
 
-    def test_a_switch_that_was_not_given_is_not_passed(self):
-        for body in ({}, {"options": {}}, {"options": None}):
-            job = self.create_with_photo(step=0.01, quality="preview", **body)
-            self.assertEqual(self.job(job)["options"], {})
-            self.start(job)
-            self.assertEqual(self.wait_state(job, ("done", "failed"))["state"], "done")
-            argv = self.stub_argv(job)
-            self.assertEqual(argv["overrides"], {}, body)
-            self.assertNotIn("--set", argv["argv"])
-            self.assertFalse(any("masks" in a or "subject_only" in a for a in argv["argv"]))
+    def test_the_view_says_which_licences_apply_and_which_weights_will_come(self):
+        job = self.create()                                       # standard: masks, normals
+        view = self.job(job)
+        self.assertEqual(view["licences"], [{"label": "SAM License (Meta)",
+                                             "url": "https://example.invalid/sam3", "id": "sam3",
+                                             "stage": "masks"}])
+        self.assertEqual([(m["file"], m["mb"], m["stage"]) for m in view["models_needed"]],
+                         [("sam3.bin", 6, "masks"), ("moge.bin", 4, "normals"),
+                          ("aliked.bin", 1, "sfm"), ("lightglue.bin", 1, "sfm")])
+        self.models.install("sam3.bin", "moge.bin")
+        view = self.job(job)
+        self.assertEqual([m["file"] for m in view["models_needed"]], ["aliked.bin", "lightglue.bin"])
+        self.assertEqual([x["id"] for x in view["licences"]], ["sam3"])   # still applies
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job, {
+            "masks": {"enabled": False}, "sfm": {"params": {"learned_fallback": False}}})
+        self.assertEqual(status, 200, view)
+        self.assertEqual((view["licences"], view["models_needed"]), ([], []))
+        # nothing here records a licence or fetches a file
+        self.assertEqual(self.models.recorded, set())
+        self.assertEqual(self.models.commands, [])
 
-    def test_switches_given_on_start(self):
-        # given: they replace the stored ones as a whole
-        job = self.create_with_photo(step=0.01, options={"masks": False})
-        view = self.start(job, {"options": {"subject_only": True}, "quality": "high"})
-        self.assertEqual(view["options"], {"subject_only": True})
+    def test_a_broken_models_module_does_not_take_the_job_view_down(self):
+        job = self.create_with_photo(step=0.005)
+
+        def broken(workflow):
+            raise RuntimeError("no catalogue")
+
+        server.workflow_needs = broken
+        view = self.job(job)
+        self.assertEqual((view["licences"], view["models_needed"]), ([], []))
+        self.assertIn("no catalogue", view["needs_error"])
+        self.assertEqual(view["template"], "standard")
+        status, error = self.api("POST", "/api/jobs/%s/plan" % job, {})
+        self.assertEqual((status, error["error"]), (500, "models_unavailable"))
+        self.assertIn("no catalogue", error["message"])
+        self.start(job)             # running does not depend on it: the weights come by themselves
         self.wait_state(job, ("done", "failed"))
-        argv = self.stub_argv(job)
-        self.assertEqual((argv["overrides"], argv["quality"]), ({"subject_only": True}, "high"))
 
-        # not given: the stored ones are kept (a retry from the job page)
-        kept = self.create_with_photo(mode="fail", step=0.01, options={"masks": False})
-        self.start(kept)
-        self.wait_state(kept, "failed")
+    def test_editing_the_workflow(self):
+        job = self.create_with_photo(step=0.005, template="preview")
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job, {
+            "train": {"params": {"iterations": 8000}}, "coverage": {"enabled": True}})
+        self.assertEqual(status, 200, view)
+        self.assertEqual(view["template"], "preview")
+        self.assertEqual(view["workflow"]["stages"]["train"]["params"]["iterations"], 8000)
+        self.assertEqual(view["workflow"]["stages"]["train"]["params"]["max_image_size"], 1280)
+        self.assertTrue(view["workflow"]["stages"]["coverage"]["enabled"])
+        self.assertEqual(view["stages"]["coverage"]["state"], "pending")
+        self.assertEqual(view["changes"], {"train": {"params": {"iterations": 8000}},
+                                           "coverage": {"enabled": True}})
+        stored = json.loads((self.runs / job / "workflow.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored, view["workflow"])
+        # merged, not replaced
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job,
+                                {"train": {"params": {"cap_max": 400000}}})
+        train = view["workflow"]["stages"]["train"]
+        self.assertEqual((train["params"]["iterations"], train["params"]["cap_max"]), (8000, 400000))
+        self.assertTrue(view["workflow"]["stages"]["coverage"]["enabled"])
+        # an empty override changes nothing
+        self.assertEqual(self.api("PUT", "/api/jobs/%s/workflow" % job, {})[1]["workflow"],
+                         view["workflow"])
+
+        # a different template starts from that template's own settings
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job, {"template": "full"})
+        self.assertEqual(status, 200, view)
+        self.assertEqual(view["template"], "full")
+        self.assertEqual(view["workflow"], workflow.resolve("full", user={}))
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job, {
+            "template": "preview", "train": {"params": {"iterations": 2000}}})
+        self.assertEqual(view["workflow"]["stages"]["train"]["params"]["iterations"], 2000)
+        self.assertFalse(view["workflow"]["stages"]["mesh"]["enabled"])
+
+        # refused: nothing changes
+        before = (self.runs / job / "workflow.json").read_text(encoding="utf-8")
+        for body, count in (({"nope": {}}, 1), ({"train": {"params": {"iterations": "x"}}}, 1),
+                            ({"train": {"params": {"nope": 1}}}, 1), ({"export": {"enabled": False}}, 1),
+                            ({"template": "nope"}, 1), ({"train": 5}, 1),
+                            ({"train": {"params": {"iterations": 1}}, "nope": {}}, 2)):
+            status, error = self.api("PUT", "/api/jobs/%s/workflow" % job, body)
+            self.assertEqual((status, error["error"]), (400, "bad_workflow"), body)
+            self.assertEqual(len(error["problems"]), count, body)
+        self.assertEqual(self.api("PUT", "/api/jobs/%s/workflow" % job,
+                                  {"template": 5})[1]["error"], "bad_workflow")
+        self.assertEqual((self.runs / job / "workflow.json").read_text(encoding="utf-8"), before)
+        self.assertEqual(self.request("GET", "/api/jobs/%s/workflow" % job)[0], 405)
+
+    def test_changing_a_parameter_makes_that_stage_and_what_follows_stale(self):
+        job = self.create_with_photo(step=0.005)
+        self.run_to_done(job)
+        self.assertEqual(set(self.stage_states(self.job(job)).values()), {"done", "disabled"})
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job,
+                                {"train": {"params": {"iterations": 5000}}})
+        self.assertEqual(self.stage_states(view), {
+            "ingest": "done", "masks": "done", "sfm": "done", "normals": "done",
+            "dense_seed": "disabled", "train": "stale", "dense": "disabled", "mesh": "disabled",
+            "coverage": "stale", "export": "stale"})
+        self.assertEqual(view["state"], "done")           # the last run is still what it was
+        # a run now does exactly the stale stages
+        view = self.run_to_done(job)
+        self.assertEqual(view["run"]["plan"], ["train", "coverage", "export"])
+        self.assertEqual(self.stub_argv(job)["only"], [])
+        self.assertEqual(set(self.stage_states(view).values()), {"done", "disabled"})
+
+    def test_plan_says_what_a_click_would_do_and_queues_nothing(self):
+        job = self.create_with_photo(step=0.005)
+        status, plan = self.api("POST", "/api/jobs/%s/plan" % job, {})
+        self.assertEqual(status, 200, plan)
+        self.assertEqual([(s["stage"], s["reason"], s["label"]) for s in plan["steps"]], [
+            ("ingest", "requested", "整理素材"), ("masks", "requested", "抠图"),
+            ("sfm", "requested", "相机位姿"), ("normals", "requested", "法线先验"),
+            ("train", "requested", "高斯训练"), ("coverage", "requested", "拍摄覆盖"),
+            ("export", "requested", "导出")])
+        self.assertEqual([x["id"] for x in plan["licences"]], ["sam3"])
+        self.assertEqual(len(plan["models_needed"]), 4)
+
+        status, plan = self.api("POST", "/api/jobs/%s/plan" % job, {"to": "sfm"})
+        self.assertEqual([(s["stage"], s["reason"]) for s in plan["steps"]], [
+            ("ingest", "needed"), ("masks", "needed"), ("sfm", "requested"), ("export", "needed")])
+        # only the weights of the stages that would run are listed
+        self.assertEqual([x["id"] for x in plan["licences"]], ["sam3"])
+        self.assertEqual([m["file"] for m in plan["models_needed"]], ["sam3.bin", "aliked.bin", "lightglue.bin"])
+        status, plan = self.api("POST", "/api/jobs/%s/plan" % job, {"to": "ingest"})
+        self.assertEqual([s["stage"] for s in plan["steps"]], ["ingest", "export"])
+        self.assertEqual((plan["licences"], plan["models_needed"]), ([], []))
+
+        # nothing was queued, started or changed
+        self.assertEqual(list(self.app.queue), [])
+        self.assertEqual(self.job(job)["state"], "created")
+        self.assertFalse((self.runs / job / "stub_argv.json").exists())
+        self.assertEqual(self.job(job)["run"]["plan"], [])
+
+        # it answers like /run would
+        for body, code in (({"to": "dense"}, "stage_disabled"), ({"only": ["mesh"]}, "stage_disabled"),
+                           ({"force": ["mesh"]}, "stage_disabled"), ({"to": "nope"}, "unknown_stage"),
+                           ({"only": ["nope"]}, "unknown_stage"), ({"only": ["train"]}, "needs_upstream")):
+            status, error = self.api("POST", "/api/jobs/%s/plan" % job, body)
+            self.assertEqual((status, error["error"]), (400, code), body)
+            self.assertTrue(error["message"])
+            status, error = self.api("POST", "/api/jobs/%s/run" % job, body)
+            self.assertEqual((status, error["error"]), (400, code), body)
+        for body in ({"to": 5}, {"to": ["train"]}, {"only": "train"}, {"only": [1]}, {"force": "x"}):
+            self.assertEqual(self.api("POST", "/api/jobs/%s/plan" % job, body)[1]["error"],
+                             "bad_request", body)
+        self.assertEqual(list(self.app.queue), [])
+        self.assertEqual(self.job(job)["state"], "created")
+
+        # once everything is done there is nothing to do, unless something is forced
+        self.run_to_done(job)
+        status, error = self.api("POST", "/api/jobs/%s/plan" % job, {})
+        self.assertEqual((status, error["error"]), (400, "nothing_to_do"))
+        status, error = self.api("POST", "/api/jobs/%s/run" % job, {})
+        self.assertEqual((status, error["error"]), (400, "nothing_to_do"))
+        self.assertEqual(self.job(job)["state"], "done")
+        status, plan = self.api("POST", "/api/jobs/%s/plan" % job, {"force": ["train"]})
+        self.assertEqual([(s["stage"], s["reason"]) for s in plan["steps"]],
+                         [("train", "forced"), ("coverage", "downstream"), ("export", "downstream")])
+        status, plan = self.api("POST", "/api/jobs/%s/plan" % job, {"only": ["normals"]})
+        self.assertEqual([(s["stage"], s["reason"]) for s in plan["steps"]], [("normals", "requested")])
+
+    def test_run_to_only_and_force_reach_the_pipeline_and_are_remembered_by_the_queue(self):
+        job = self.create_with_photo(step=0.005, extra=["--startup-delay", "0.8"])
+        view = self.start(job, {"to": "sfm"})
+        self.assertEqual(view["run"], {"to": "sfm", "only": [], "force": [],
+                                       "plan": ["ingest", "masks", "sfm", "export"]})
+        self.assertEqual(view["state"], "queued")       # the server's own status, until it starts
+        self.assertEqual([view["stages"][s]["state"] for s in ("ingest", "masks", "sfm", "normals", "export")],
+                         ["queued", "queued", "queued", "pending", "queued"])
+        meta = json.loads((self.runs / job / "server-job.json").read_text(encoding="utf-8"))
+        self.assertEqual(meta["run"], {"to": "sfm", "only": [], "force": []})
+        view = self.wait_state(job, "done")
         self.wait_idle()
-        self.assertEqual(self.stub_argv(kept)["overrides"], {"masks": False})
-        (self.runs / kept / "stub_argv.json").unlink()
-        self.stub_args[kept] = ["--step", "0.01"]
-        self.start(kept, {})
-        self.assertEqual(self.wait_state(kept, ("done", "failed"))["state"], "done")
-        self.assertEqual(self.stub_argv(kept)["overrides"], {"masks": False})
-        self.assertEqual(self.job(kept)["options"], {"masks": False})
+        argv = self.stub_argv(job)
+        self.assertEqual((argv["to"], argv["only"], argv["force"]), ("sfm", [], []))
+        self.assertEqual(argv["argv"][argv["argv"].index("--to") + 1], "sfm")
+        self.assertNotIn("--only", argv["argv"])
+        states = self.stage_states(view)
+        self.assertEqual([states[s] for s in ("ingest", "masks", "sfm", "normals", "train", "export")],
+                         ["done", "done", "done", "pending", "pending", "done"])
+        self.assertEqual(view["state"], "done")         # the run reached its target
+        self.assertEqual(view["run"]["plan"], ["ingest", "masks", "sfm", "export"])
+        self.assertEqual(sorted(view["outputs"]), ["report"])
 
-        # an empty set clears them
-        cleared = self.create_with_photo(step=0.01, options={"masks": False})
-        self.assertEqual(self.start(cleared, {"options": {}})["options"], {})
-        self.wait_state(cleared, ("done", "failed"))
-        self.assertEqual(self.stub_argv(cleared)["overrides"], {})
+        # the next run asks for something else: that is what the queue runs
+        view = self.run_to_done(job, {"only": ["normals"]})
+        argv = self.stub_argv(job)
+        self.assertEqual((argv["to"], argv["only"]), (None, ["normals"]))
+        self.assertEqual(view["run"], {"to": None, "only": ["normals"], "force": [],
+                                       "plan": ["normals"]})
+        self.assertEqual(self.stage_states(view)["normals"], "done")
+        self.assertEqual(self.stage_states(view)["train"], "pending")
 
-    def test_switches_for_a_job_from_a_local_path(self):
+        view = self.run_to_done(job, {"to": "train"})
+        self.assertEqual(view["run"]["plan"], ["train", "export"])
+        self.assertEqual(self.stage_states(view)["train"], "done")
+        self.assertEqual(self.stage_states(view)["coverage"], "pending")    # not asked for
+
+        view = self.run_to_done(job, {"force": ["sfm"]})
+        self.assertEqual(view["run"]["plan"], ["sfm", "normals", "train", "coverage", "export"])
+        self.assertEqual(self.stub_argv(job)["force"], ["sfm"])
+        self.assertEqual(set(self.stage_states(view).values()), {"done", "disabled"})
+        # the stage that was run again deleted its record first and wrote a new one
+        record = json.loads((self.runs / job / "stages" / "sfm.json").read_text(encoding="utf-8"))
+        self.assertIn("fingerprint", record)
+
+        # `start` is the old name of `run`
+        view = self.start(job, {"force": ["export"]}, path="start")
+        self.assertEqual(view["run"]["plan"], ["export"])
+        self.wait_state(job, "done")
+
+    def test_a_run_that_fails_keeps_what_finished_before_it_and_can_be_repeated(self):
+        job = self.create_with_photo(mode="fail", step=0.005, extra=["--fail-stage", "train"])
+        self.start(job)
+        view = self.wait_state(job, ("failed", "done", "cancelled"))
+        self.assertEqual((view["state"], view["error"]), ("failed", "stub: train failed"))
+        self.wait_idle()
+        states = self.stage_states(view)
+        self.assertEqual([states[s] for s in ("ingest", "masks", "sfm", "normals", "train", "coverage", "export")],
+                         ["done", "done", "done", "done", "failed", "pending", "pending"])
+        self.assertEqual(view["stages"]["train"]["error"], "stub: train failed")
+        self.assertIsNone(view["stages"]["train"]["progress"])
+        self.assertIn("run", view["actions"])
+        # asking again: only what is left (the finished ones are not run again)
+        self.stub_args[job] = ["--step", "0.005"]
+        view = self.start(job)
+        self.assertEqual(view["run"]["plan"], ["train", "coverage", "export"])
+        self.wait_state(job, "done")
+        self.assertEqual(set(self.stage_states(self.job(job)).values()), {"done", "disabled"})
+
+    def test_cancelling_leaves_no_stage_marked_running(self):
+        job = self.create_with_photo(step=0.5)
+        self.start(job)
+        wait_until(lambda: (self.job(job)["stages"]["ingest"]["state"] == "running"), 20,
+                   message="the first stage to run")
+        self.assertEqual(self.job(job)["stages"]["sfm"]["state"], "queued")
+        self.api("POST", "/api/jobs/%s/cancel" % job, {})
+        view = self.wait_state(job, "cancelled", 20)
+        self.wait_idle()
+        self.assertEqual(set(self.stage_states(view).values()), {"pending", "disabled"})
+        self.assertIsNone(view["stages"]["ingest"]["progress"])
+
+        # a queued job that is cancelled before it starts: nothing is left queued
+        blocker = self.create_with_photo(name="blocker", step=5)
+        waiting = self.create_with_photo(name="waiting")
+        self.start(blocker)
+        self.start(waiting)
+        self.wait_state(blocker, "running")
+        view = self.job(waiting)
+        self.assertEqual(view["stages"]["train"]["state"], "queued")
+        self.api("POST", "/api/jobs/%s/cancel" % waiting, {})
+        view = self.job(waiting)
+        self.assertEqual(view["state"], "cancelled")
+        self.assertNotIn("queued", self.stage_states(view).values())
+        self.api("POST", "/api/jobs/%s/cancel" % blocker, {})
+        self.wait_state(blocker, "cancelled", 20)
+
+    def test_a_job_that_is_queued_or_running_cannot_be_edited(self):
+        running = self.create_with_photo(name="running", step=5)
+        waiting = self.create_with_photo(name="waiting")
+        idle = self.create_with_photo(name="idle")
+        self.start(running)
+        self.start(waiting)
+        self.wait_state(running, "running")
+        for job in (running, waiting):
+            status, error = self.api("PUT", "/api/jobs/%s/workflow" % job,
+                                     {"train": {"params": {"iterations": 5000}}})
+            self.assertEqual((status, error["error"]), (409, "job_busy"), job)
+            status, error = self.api("POST", "/api/jobs/%s/stages/ingest/reset" % job, {})
+            self.assertEqual((status, error["error"]), (409, "job_busy"), job)
+            status, error = self.api("POST", "/api/jobs/%s/run" % job, {})
+            self.assertEqual((status, error["error"]), (409, "already_active"), job)
+            self.assertNotIn("edit", self.job(job)["actions"])
+            self.assertNotIn("run", self.job(job)["actions"])
+        self.assertEqual(self.job(running)["workflow"]["stages"]["train"]["params"]["iterations"], 30000)
+        # a job that is not busy can, while another one runs
+        self.assertEqual(self.api("PUT", "/api/jobs/%s/workflow" % idle,
+                                  {"train": {"params": {"iterations": 5000}}})[0], 200)
+        self.assertIn("edit", self.job(idle)["actions"])
+        # and a second job can be queued with its own request while the first one runs
+        view = self.start(idle, {"to": "sfm"})
+        self.assertEqual(view["queue_position"], 2)
+        self.api("POST", "/api/jobs/%s/cancel" % running, {})
+        self.wait_state(running, "cancelled", 20)
+        self.api("POST", "/api/jobs/%s/cancel" % waiting, {})
+        self.wait_state(idle, "done", 30)
+        self.assertEqual(self.stub_argv(idle)["to"], "sfm")
+
+    def test_uploads_and_input_checks_come_before_the_plan(self):
+        job = self.create(name="empty")
+        status, error = self.api("POST", "/api/jobs/empty/run", {"to": "nope"})
+        self.assertEqual((status, error["error"]), (400, "no_input"))
+        self.upload(job, "a.jpg", b"x")
+        status, error = self.api("POST", "/api/jobs/empty/run", {"to": "nope"})
+        self.assertEqual((status, error["error"]), (400, "unknown_stage"))
+        self.assertEqual(self.job(job)["state"], "created")
+
+    def test_path_jobs_with_start_check_the_run_before_creating_anything(self):
         photos = self.tmp / "photos"
         photos.mkdir()
         (photos / "a.jpg").write_bytes(b"x")
-        self.stub_args["object"] = ["--step", "0.01"]
+        for body, code in (({"only": ["train"]}, "needs_upstream"), ({"to": "mesh"}, "stage_disabled"),
+                           ({"force": ["nope"]}, "unknown_stage")):
+            status, error = self.api("POST", "/api/jobs", dict(body, name="nothing", path=str(photos),
+                                                              start=True))
+            self.assertEqual((status, error["error"]), (400, code), body)
+            self.assertFalse((self.runs / "nothing").exists(), body)
+        self.stub_args["quick"] = ["--step", "0.005"]
         status, view = self.api("POST", "/api/jobs", {
-            "name": "object", "path": str(photos), "start": True,
-            "options": {"subject_only": True}})
-        self.assertEqual((status, view["options"]), (201, {"subject_only": True}))
-        self.assertEqual(self.wait_state("object", ("done", "failed"))["state"], "done")
-        self.assertEqual(self.stub_argv("object")["overrides"], {"subject_only": True})
-        # refused switches leave no job behind, also on this path
-        status, error = self.api("POST", "/api/jobs", {
-            "name": "bad", "path": str(photos), "start": True, "options": {"masks": "no"}})
-        self.assertEqual((status, error["error"]), (400, "bad_options"))
-        self.assertFalse((self.runs / "bad").exists())
+            "name": "quick", "path": str(photos), "start": True, "to": "sfm", "template": "preview",
+            "workflow": {"sfm": {"params": {"quality": "medium"}}}})
+        self.assertEqual(status, 201, view)
+        self.assertEqual(view["workflow"]["stages"]["sfm"]["params"]["quality"], "medium")
+        self.wait_state("quick", "done")
+        self.assertEqual(self.stub_argv("quick")["to"], "sfm")
+        # a phone cannot make a job that reads this PC's disk
+        self.remote()
+        status, error = self.api("POST", "/api/jobs", {"path": str(photos), "start": True},
+                                 {"X-Scan3D-Token": TOKEN})
+        self.assertEqual((status, error["error"]), (403, "loopback_only"))
 
-    def test_a_job_file_edited_by_hand_cannot_smuggle_other_overrides(self):
-        job = self.create_with_photo(step=0.01)
-        path = self.runs / job / "server-job.json"
-        meta = json.loads(path.read_text(encoding="utf-8"))
-        meta["options"] = {"masks": "yes", "iterations": 1, "train_args": ["--x"],
-                           "subject_only": True}
-        path.write_text(json.dumps(meta), encoding="utf-8")
-        self.assertEqual(self.job(job)["options"], {"subject_only": True})
+    def test_reset_deletes_that_result_and_makes_what_follows_stale(self):
+        job = self.create_with_photo(step=0.005)
+        self.run_to_done(job)
+        out = self.runs / job / "output"
+        self.assertTrue((out / "splat.ply").is_file() and (out / "coverage.json").is_file())
+        status, view = self.api("POST", "/api/jobs/%s/stages/train/reset" % job, {})
+        self.assertEqual(status, 200, view)
+        self.assertEqual([self.stage_states(view)[s] for s in ("sfm", "normals", "train", "coverage", "export")],
+                         ["done", "done", "pending", "stale", "stale"])
+        self.assertFalse((out / "splat.ply").exists())
+        self.assertFalse((self.runs / job / "stages" / "train.json").exists())
+        self.assertTrue((self.runs / job / "stages" / "sfm.json").exists())     # only that stage
+        self.assertNotIn("splat", [f["key"] for f in view["output_files"]])
+        self.assertEqual(self.preview(job, "full")["state"], "no_splat")
+        # the plan after it: the stage again, and what depends on it
+        status, plan = self.api("POST", "/api/jobs/%s/plan" % job, {})
+        self.assertEqual([s["stage"] for s in plan["steps"]], ["train", "coverage", "export"])
+        # resetting what is not there is fine
+        self.assertEqual(self.api("POST", "/api/jobs/%s/stages/train/reset" % job, {})[0], 200)
+        self.assertEqual(self.api("POST", "/api/jobs/%s/stages/dense/reset" % job, {})[0], 200)
+        # errors
+        for stage in ("nope", "TRAIN", "stages"):
+            status, error = self.api("POST", "/api/jobs/%s/stages/%s/reset" % (job, stage), {})
+            self.assertEqual((status, error["error"]), (400, "unknown_stage"), stage)
+        for method in ("GET", "PUT", "DELETE"):
+            self.assertEqual(self.request(method, "/api/jobs/%s/stages/train/reset" % job)[0], 405)
+        self.assertEqual(self.request("POST", "/api/jobs/%s/stages/train" % job, b"{}")[0], 404)
+        # what the pipeline refuses is a 400 with its words
+        def refuse(job_dir, stage):
+            raise ValueError("这个阶段的结果还在被使用")
+        server.pipeline_reset_stage = refuse
+        status, error = self.api("POST", "/api/jobs/%s/stages/sfm/reset" % job, {})
+        self.assertEqual((status, error["error"]), (400, "cannot_reset"))
+        self.assertIn("还在被使用", error["message"])
+
+    def test_old_jobs_without_a_workflow_are_shown_with_the_default_template(self):
+        # made before workflows existed: quality and options in both files, no workflow.json
+        name = "old-job"
+        (self.runs / name / "upload").mkdir(parents=True)
+        (self.runs / name / "upload" / "a.jpg").write_bytes(b"x")
+        (self.runs / name / "server-job.json").write_text(json.dumps({
+            "job": name, "source": "upload", "input_path": str(self.runs / name / "upload"),
+            "quality": "high", "options": {"masks": False, "subject_only": True},
+            "created_at": "2026-01-01T09:00:00+08:00"}), encoding="utf-8")
+        (self.runs / name / "status.json").write_text(json.dumps({
+            "job": name, "state": "failed", "stage": "sfm", "stage_index": 2, "stage_count": 6,
+            "stage_progress": None, "message": "失败", "quality": "high",
+            "started_at": "2026-01-01T10:00:00+08:00", "finished_at": "2026-01-01T10:10:00+08:00",
+            "error": "old failure", "pid": None, "outputs": {}}), encoding="utf-8")
+        view = self.job(name)
+        for gone in ("quality", "options", "stage_index", "stage_count"):
+            self.assertNotIn(gone, view)
+        self.assertEqual((view["state"], view["error"], view["stage"]), ("failed", "old failure", "sfm"))
+        self.assertEqual(view["template"], "standard")
+        self.assertEqual(view["workflow"], workflow.resolve("standard", user={}))
+        self.assertEqual(self.stage_states(view)["train"], "pending")
+        self.assertIn("run", view["actions"])
+        status, listing = self.api("GET", "/api/jobs")
+        entry = listing["jobs"][0]
+        self.assertEqual((entry["job"], entry["template"]), (name, "standard"))
+        self.assertNotIn("quality", entry)
+        self.assertEqual(entry["stages"]["train"], {"state": "pending", "progress": None})
+        # it can be run (the default template), and edited (which writes workflow.json)
+        self.stub_args[name] = ["--step", "0.005"]
+        self.assertFalse((self.runs / name / "workflow.json").exists())
+        self.run_to_done(name)
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % name,
+                                {"train": {"params": {"iterations": 4000}}})
+        self.assertEqual(status, 200, view)
+        self.assertTrue((self.runs / name / "workflow.json").is_file())
+        self.assertEqual(self.stage_states(view)["train"], "stale")
+
+    def test_a_workflow_file_that_cannot_be_read_does_not_hide_the_job(self):
+        job = self.create_with_photo(step=0.005)
+        (self.runs / job / "workflow.json").write_text("{ not json", encoding="utf-8")
+        view = self.job(job)
+        self.assertIn("workflow_error", view)
+        self.assertEqual((view["state"], view["workflow"], view["template"]), ("created", None, None))
+        self.assertEqual([j["job"] for j in self.api("GET", "/api/jobs")[1]["jobs"]], [job])
+        status, error = self.api("POST", "/api/jobs/%s/run" % job, {})
+        self.assertEqual((status, error["error"]), (409, "bad_workflow"))
+        status, error = self.api("PUT", "/api/jobs/%s/workflow" % job, {"train": {"params": {}}})
+        self.assertEqual((status, error["error"]), (409, "bad_workflow"))
+        # choosing a template writes a good file again
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job, {"template": "preview"})
+        self.assertEqual(status, 200, view)
+        self.assertNotIn("workflow_error", view)
+        self.assertEqual(view["template"], "preview")
+        self.run_to_done(job)
+
+    def test_the_old_fields_and_the_quality_endpoints_are_gone(self):
+        job = self.create_with_photo()
+        for path in ("run", "start"):
+            for body in ({"quality": "high"}, {"options": {}}):
+                status, error = self.api("POST", "/api/jobs/%s/%s" % (job, path), body)
+                self.assertEqual((status, error["error"]), (400, "bad_request"), body)
+        self.assertEqual(self.job(job)["state"], "created")
+        self.assertEqual(list(self.app.queue), [])
+        self.assertFalse(hasattr(server, "check_job_options"))
+        self.assertFalse(hasattr(server, "QUALITIES"))
+        self.assertFalse(hasattr(server, "build_coverage_command"))
+
+
+class RealPipelineHelperTests(ServerCase):
+    """The server with pipeline.py's own job_view, write_workflow and reset_stage (the other
+    tests use stand-ins for them): files are what the pipeline would read and write. Runs are
+    still the stub, so a finished run's stage records do not match the real fingerprints."""
+
+    def prepare(self):
+        import config
+        import pipeline
+        self._root = config.ROOT
+        config.ROOT = self.tmp          # workflow.resolve() reads <root>/user-settings.json
+        self.addCleanup(setattr, config, "ROOT", self._root)
+        server.pipeline_job_view = pipeline.job_view
+        server.pipeline_write_workflow = pipeline.write_workflow
+        server.pipeline_reset_stage = pipeline.reset_stage
+        server.load_user_settings = lambda: {}
+
+    def test_create_edit_plan_and_reset(self):
+        job = self.create_with_photo(template="high", step=0.005)
+        view = self.job(job)
+        self.assertEqual(view["template"], "high")
+        self.assertEqual(view["workflow"], workflow.resolve("high", user={}))
+        self.assertEqual(self.stage_states(view)["train"], "pending")
+        self.assertEqual(self.stage_states(view)["dense"], "disabled")
+        self.assertEqual(set(view["stages"]["train"]), {"state", "progress", "message", "seconds",
+                                                        "error", "summary"})
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job,
+                                {"dense": {"enabled": True}, "mesh": {"enabled": True}})
+        self.assertEqual(status, 200, view)
+        self.assertEqual(self.stage_states(view)["mesh"], "pending")
+        status, plan = self.api("POST", "/api/jobs/%s/plan" % job, {"to": "train"})
+        self.assertEqual(status, 200, plan)
+        self.assertEqual([s["stage"] for s in plan["steps"]],
+                         ["ingest", "masks", "sfm", "normals", "train", "export"])
+        status, error = self.api("POST", "/api/jobs/%s/plan" % job, {"only": ["mesh"]})
+        self.assertEqual((status, error["error"]), (400, "needs_upstream"))
+        status, view = self.api("PUT", "/api/jobs/%s/workflow" % job, {"train": {"params": {"iterations": 1}}})
+        self.assertEqual((status, view["error"]), (400, "bad_workflow"))
+        self.assertEqual(self.api("POST", "/api/jobs/%s/stages/train/reset" % job, {})[0], 200)
+        self.assertEqual(self.api("POST", "/api/jobs/%s/stages/dense/reset" % job, {})[0], 200)
+        # a stage with nothing to show has its own state, and the licences/weights come from models.py
+        view = self.job(job)
+        self.assertIsInstance(view["licences"], list)
+        self.assertIsInstance(view["models_needed"], list)
+
+    def test_queued_and_running_views(self):
+        job = self.create_with_photo(step=5, template="preview")
+        other = self.create_with_photo(name="other", step=5, template="preview")
         self.start(job)
-        self.wait_state(job, ("done", "failed"))
-        self.assertEqual(self.stub_argv(job)["overrides"], {"subject_only": True})
+        self.start(other, {"to": "sfm"})
+        self.wait_state(job, "running")
+        view = self.job(job)
+        wait_until(lambda: self.job(job)["stages"]["ingest"]["state"] == "running", 20,
+                   message="the stage to be running")
+        view = self.job(job)
+        self.assertEqual([view["stages"][s]["state"] for s in ("ingest", "sfm", "train", "export")],
+                         ["running", "queued", "queued", "queued"])
+        self.assertEqual(view["run"]["plan"], ["ingest", "sfm", "train", "export"])
+        view = self.job(other)
+        self.assertEqual(view["state"], "queued")
+        self.assertEqual([view["stages"][s]["state"] for s in ("ingest", "sfm", "train", "export")],
+                         ["queued", "queued", "pending", "queued"])
+        self.assertEqual(view["run"], {"to": "sfm", "only": [], "force": [],
+                                       "plan": ["ingest", "sfm", "export"]})
+        self.api("POST", "/api/jobs/%s/cancel" % other, {})
+        self.api("POST", "/api/jobs/%s/cancel" % job, {})
+        view = self.wait_state(job, "cancelled", 20)
+        self.assertNotIn("running", self.stage_states(view).values())
+        self.assertNotIn("queued", self.stage_states(view).values())
 
-    def test_jobs_the_server_did_not_create_have_no_switches(self):
-        self.make_done_job("by-hand")
-        self.assertEqual(self.job("by-hand")["options"], {})
+    def test_an_old_job_without_a_workflow_gets_the_default_template(self):
+        name = "old"
+        (self.runs / name).mkdir()
+        (self.runs / name / "status.json").write_text(json.dumps({
+            "job": name, "state": "done", "stage": "export", "stage_index": 6, "stage_count": 6,
+            "quality": "standard", "outputs": {"splat": "output/splat.ply"}}), encoding="utf-8")
+        view = self.job(name)
+        self.assertEqual((view["template"], view["state"]), ("standard", "done"))
+        self.assertEqual(view["workflow"], workflow.resolve("standard", user={}))
+        self.assertNotIn("quality", view)
+        self.assertEqual(self.api("GET", "/api/jobs")[1]["jobs"][0]["template"], "standard")
+        # editing writes workflow.json (what the pipeline reads from then on)
+        self.assertEqual(self.api("PUT", "/api/jobs/old/workflow", {"mesh": {"enabled": True},
+                                                                    "dense": {"enabled": True}})[0], 200)
+        self.assertTrue(json.loads((self.runs / name / "workflow.json").read_text(
+            encoding="utf-8"))["stages"]["mesh"]["enabled"])
 
 
 # =========================================================================== start and stop
@@ -2714,6 +3379,12 @@ class RecoveryTests(ServerCase):
         write_job(self.runs, "finished", state="done", finished_at="2026-01-01T10:30:00+08:00",
                   outputs={"splat": "output/splat.ply"})
         write_job(self.runs, "broken", state="failed", error="earlier failure")
+        # a run of the new kind that was cut off: the stage that was running did not finish
+        write_job(self.runs, "mid-run", stage="train", stages={
+            "ingest": {"state": "done", "progress": None, "seconds": 3.0, "summary": {}},
+            "train": {"state": "running", "progress": 0.4, "seconds": None, "summary": {}},
+            "export": {"state": "queued", "progress": None, "seconds": None, "summary": {}}},
+            run={"to": None, "only": [], "force": [], "plan": ["train", "export"]})
         (self.runs / "not-a-job").mkdir()
         (self.runs / "not-a-job" / "data.bin").write_bytes(b"keep me")
         (self.runs / "_meshlab").mkdir()
@@ -2743,7 +3414,17 @@ class RecoveryTests(ServerCase):
 
         status, listing = self.api("GET", "/api/jobs")
         self.assertEqual(sorted(j["job"] for j in listing["jobs"]),
-                         ["broken", "finished", "garbled", "live-pid", "was-queued", "was-running"])
+                         ["broken", "finished", "garbled", "live-pid", "mid-run", "was-queued",
+                          "was-running"])
+        status = self.disk_status("mid-run")
+        self.assertEqual((status["state"], status["error"]), ("failed", "interrupted"))
+        self.assertEqual({k: (v["state"], v["progress"]) for k, v in status["stages"].items()},
+                         {"ingest": ("done", None), "train": ("failed", None),
+                          "export": ("pending", None)})
+        self.assertEqual(status["stages"]["train"]["error"], "interrupted")
+        view = self.job("mid-run")
+        self.assertEqual(view["stages"]["train"]["state"], "failed")
+        self.assertNotIn("quality", view)
         self.assertEqual({j["job"]: j["state"] for j in listing["jobs"]}["garbled"], "failed")
         self.assertEqual((self.runs / "garbled" / "status.json").read_text(encoding="utf-8"),
                          "{ not json")
@@ -2952,24 +3633,23 @@ class StartupTests(unittest.TestCase):
 
 class UnitTests(unittest.TestCase):
     def test_build_run_command(self):
-        plain = [sys.executable, str(APP_DIR / "scan3d.py"), "run",
-                 r"C:\photos\room", "--name", "my-job", "--quality", "high"]
-        # no switch given: nothing is passed, the quality preset decides
-        self.assertEqual(server.build_run_command("my-job", r"C:\photos\room", "high"), plain)
-        for nothing in (None, {}):
-            self.assertEqual(
-                server.build_run_command("my-job", r"C:\photos\room", "high", nothing), plain)
-        # each given switch becomes one --set, false as well as true, in a fixed order
-        cmd = server.build_run_command("my-job", r"C:\photos\room", "high",
-                                       {"subject_only": True, "masks": False})
-        self.assertEqual(cmd, plain + ["--set", "masks=false", "--set", "subject_only=true"])
-        self.assertEqual(server.build_run_command("j", "p", "preview", {"masks": True}),
+        plain = [sys.executable, str(APP_DIR / "scan3d.py"), "run", r"C:\photos\room",
+                 "--name", "my-job"]
+        self.assertEqual(server.build_run_command("my-job", r"C:\photos\room"), plain)
+        for nothing in ({}, {"to": None}, {"only": []}, {"only": None, "force": ()}, {"to": ""}):
+            self.assertEqual(server.build_run_command("my-job", r"C:\photos\room", **nothing), plain)
+        self.assertEqual(server.build_run_command("j", "p", to="train"),
                          [sys.executable, str(APP_DIR / "scan3d.py"), "run", "p", "--name", "j",
-                          "--quality", "preview", "--set", "masks=true"])
-        # anything that is not a known switch with true/false never reaches the command line
-        cmd = server.build_run_command("my-job", r"C:\photos\room", "high", {
-            "masks": "false", "subject_only": 1, "iterations": 5, "train_args": ["--x"]})
-        self.assertEqual(cmd, plain)
+                          "--to", "train"])
+        cmd = server.build_run_command("j", "p", only=["mesh", "coverage"], force=["dense"])
+        self.assertEqual(cmd[-4:], ["--only", "mesh,coverage", "--force", "dense"])
+        cmd = server.build_run_command("j", "p", to="mesh", only=["a"], force=["b", "c"])
+        self.assertEqual(cmd[6:], ["--to", "mesh", "--only", "a", "--force", "b,c"])
+        # quality, options and --set are gone
+        with self.assertRaises(TypeError):
+            server.build_run_command("j", "p", "high")
+        with self.assertRaises(TypeError):
+            server.build_run_command("j", "p", quality="high")
 
     def test_build_models_command(self):
         base = [sys.executable, str(APP_DIR / "scan3d.py"), "models", "--download"]
@@ -2979,61 +3659,111 @@ class UnitTests(unittest.TestCase):
         self.assertEqual(server.build_models_command(["masks", "dense_seed"]),
                          base + ["masks,dense_seed"])
 
-    def test_job_options(self):
-        self.assertIsNone(server.check_job_options(None))
-        self.assertEqual(server.check_job_options({}), {})
-        self.assertEqual(list(server.check_job_options({"subject_only": False, "masks": True})),
-                         ["masks", "subject_only"])
-        for bad in ({"masks": 1}, {"masks": "true"}, {"masks": None}, {"other": True},
-                    {"masks": True, "iterations": 5}, [], "masks", 5, True, False):
+    def test_run_requests(self):
+        self.assertEqual(server.parse_run_request({}), (None, [], []))
+        self.assertEqual(server.parse_run_request({"to": "train", "only": ["a", "b", "a"],
+                                                   "force": ["c"], "start": True}),
+                         ("train", ["a", "b"], ["c"]))
+        self.assertEqual(server.parse_run_request({"to": None, "only": None, "force": None}),
+                         (None, [], []))
+        for bad in ({"to": 1}, {"to": ["a"]}, {"only": "a"}, {"only": [1]}, {"force": {"a": 1}},
+                    {"force": [None]}):
             with self.assertRaises(server.ApiError, msg=repr(bad)) as caught:
-                server.check_job_options(bad)
-            self.assertEqual((caught.exception.status, caught.exception.code),
-                             (400, "bad_options"))
-        self.assertEqual(server.stored_job_options(None), {})
-        self.assertEqual(server.stored_job_options({"options": "masks"}), {})
-        self.assertEqual(server.stored_job_options(
-            {"options": {"masks": "yes", "iterations": 1, "subject_only": True}}),
-            {"subject_only": True})
+                server.parse_run_request(bad)
+            self.assertEqual((caught.exception.status, caught.exception.code), (400, "bad_request"))
+        for field in ("quality", "options"):
+            with self.assertRaises(server.ApiError) as caught:
+                server.reject_removed_fields({field: 1})
+            self.assertEqual(caught.exception.code, "bad_request")
+        server.reject_removed_fields({"name": "x", "template": "y"})
+        self.assertIsNone(server.check_override(None))
+        self.assertEqual(server.check_override({}), {})
+        for bad in ([], "x", 5, True):
+            with self.assertRaises(server.ApiError) as caught:
+                server.check_override(bad)
+            self.assertEqual(caught.exception.code, "bad_workflow")
 
-    def test_the_real_models_module_gives_what_the_server_expects(self):
-        """The four functions tests replace everywhere else, against the real models.py and
-        settings.json, with the weights folder and the licence record in a temp folder."""
+    def test_template_ids(self):
+        for good in ("mine", "a", "A_1-b", "x" * 64, "0"):
+            self.assertTrue(server.valid_template_id(good), good)
+        for bad in ("", "default", "-a", "_a", "a b", "a.b", "a/b", "..", "x" * 65, "名字", None, 5):
+            self.assertFalse(server.valid_template_id(bad), repr(bad))
+
+    def test_changes_from_template(self):
+        user = {}
+        base = workflow.resolve("standard", user=user)
+        self.assertEqual(server.changes_from_template(base, user), {})
+        changed = workflow.resolve("standard", {"train": {"params": {"iterations": 5000}},
+                                                "mesh": {"enabled": True}}, user=user)
+        self.assertEqual(server.changes_from_template(changed, user),
+                         {"train": {"params": {"iterations": 5000}}, "mesh": {"enabled": True}})
+        gone = dict(base, template="no-longer-there")
+        self.assertEqual(server.changes_from_template(gone, user), {})
+        self.assertEqual(server.stage_overview(None), None)
+        self.assertEqual(server.stage_overview({"a": {"state": "done", "progress": 1.0, "x": 1},
+                                                "b": "junk"}),
+                         {"a": {"state": "done", "progress": 1.0}})
+
+    def test_the_real_pipeline_and_models_functions_have_the_shape_the_server_expects(self):
+        """The wrappers tests replace everywhere else, against the real modules, with the
+        weights folder and the licence record in a temp folder and the user's settings
+        replaced."""
         import config
         import models
-        saved = (config.MODELS, models._ACCEPTED_FILE)
+        import pipeline
+        needed = [(models, "features_table"), (models, "needs"), (pipeline, "job_view"),
+                  (pipeline, "write_workflow"), (pipeline, "reset_stage")]
+        missing = [name for module, name in needed if not hasattr(module, name)]
+        if missing:
+            self.skipTest("not in the real modules yet: %s" % ", ".join(missing))
+        saved = (config.MODELS, getattr(models, "_ACCEPTED_FILE", None), config.ROOT)
         with tempfile.TemporaryDirectory() as tmp:
             config.MODELS = Path(tmp) / "models"
-            models._ACCEPTED_FILE = Path(tmp) / "accepted-licences.json"
+            config.ROOT = Path(tmp)         # workflow.load_user reads <root>/user-settings.json
+            if saved[1] is not None:
+                models._ACCEPTED_FILE = Path(tmp) / "accepted-licences.json"
             try:
                 self.assertEqual(server.models_dir(), Path(tmp) / "models")
-                status = server.models_status()
-                self.assertLessEqual({"features", "licences", "files_missing", "download_mb"},
-                                     set(status))
-                for key, info in status["features"].items():
-                    self.assertIn(key, server.FEATURE_LABELS)
-                    self.assertLessEqual({"files", "enabled", "ready", "licences_needed",
-                                          "files_missing", "download_mb"}, set(info))
-                    self.assertFalse(info["ready"], key)        # nothing is installed here
-                    for name in info["files"]:
-                        self.assertGreater(server.models_file_mb(name), 0, name)
-                    for licence in info["licences_needed"]:
-                        self.assertIn(licence, status["licences"])
-                for licence in status["licences"].values():
-                    self.assertFalse(licence["accepted"])
-                    self.assertTrue(licence["name"] and licence["url"].startswith("https://"))
-                self.assertEqual(server.models_file_mb("no-such-file.bin"), 0)
-
-                first = sorted(status["licences"])[0]
-                with self.assertRaises(ValueError):
-                    server.models_accept([first, "no-such-licence"])
-                self.assertFalse(models._ACCEPTED_FILE.exists())
-                server.models_accept([first])
-                self.assertEqual(list(json.loads(models._ACCEPTED_FILE.read_text(
-                    encoding="utf-8"))["accepted"]), [first])
-                self.assertTrue(server.models_status()["licences"][first]["accepted"])
+                whole = server.models_features()
+                self.assertEqual(set(whole), {"features", "disk_mb"})
+                self.assertEqual(whole["disk_mb"], 0)           # nothing is installed here
+                table = whole["features"]
+                self.assertTrue(table)
+                self.assertTrue(server.models_default_features())
+                for feature in table:
+                    self.assertLessEqual({"id", "label", "stage", "files", "licence", "ready"},
+                                         set(feature))
+                    self.assertIn(feature["stage"], workflow.STAGE_ORDER)
+                    self.assertFalse(feature["ready"], feature["id"])     # nothing is installed here
+                    for f in feature["files"]:
+                        self.assertLessEqual({"name", "mb", "installed"}, set(f))
+                        self.assertGreater(f["mb"], 0, f["name"])
+                        self.assertFalse(f["installed"])
+                    if feature["licence"] is not None:
+                        self.assertTrue(feature["licence"]["label"])
+                        self.assertTrue(feature["licence"]["url"].startswith("https://"))
+                # an ordinary workflow, through the real needs()
+                needs = server.workflow_needs(workflow.resolve("standard", user={}))
+                self.assertLessEqual({"licences", "models_needed"}, set(needs))
+                for item in needs["models_needed"]:
+                    self.assertLessEqual({"file", "mb", "stage"}, set(item))
+                # a job without a workflow file is the default template
+                job_dir = Path(tmp) / "job"
+                job_dir.mkdir()
+                view = server.pipeline_job_view(job_dir)
+                self.assertEqual(view["template"], workflow.resolve(None)["template"])
+                self.assertEqual(set(view["stages"]), set(workflow.STAGE_ORDER))
+                self.assertEqual(set(view), {"workflow", "template", "stages", "run"})
+                self.assertEqual(view["workflow"]["stages"]["ingest"]["enabled"], True)
+                for sid, entry in view["stages"].items():
+                    self.assertIn(entry["state"], ("disabled", "pending"), sid)
+                server.pipeline_write_workflow(job_dir, workflow.resolve("preview", user={}))
+                self.assertEqual(server.pipeline_job_view(job_dir)["template"], "preview")
+                server.pipeline_reset_stage(job_dir, "train")       # nothing there: no error
             finally:
-                config.MODELS, models._ACCEPTED_FILE = saved
+                config.MODELS, config.ROOT = saved[0], saved[2]
+                if saved[1] is not None:
+                    models._ACCEPTED_FILE = saved[1]
 
     def test_job_names(self):
         for good in ("scan-20260101-120000", "a", "A1", "living_room-2", "x" * 64, "0"):

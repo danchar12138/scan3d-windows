@@ -1,4 +1,12 @@
-"""Game-engine meshes from a finished Spirula training run, textured from the photos.
+"""Game-engine meshes from the photos' dense reconstruction, textured from the photos.
+
+Two entry points, so that the slow half can be done once and the cheap half repeated:
+
+    build_dense(...)    COLMAP dense reconstruction -> `out_dir/dense_mesh.ply` (dataset frame) and
+                        the cameras it ran on (`out_dir/sparse/`), about half an hour
+    build_meshes(..., dense=...)   shard filter, simplification, texture, collision mesh, GLB
+                        files from that dense surface, about a minute; budgets, texture size and
+                        the shard filter can change without repeating `build_dense`
 
 `build_meshes` writes two files next to each other:
 
@@ -143,7 +151,7 @@ try:  # imported as part of the `app` package, or as a top-level module from ins
 except ImportError:  # pragma: no cover - depends on how the caller set up sys.path
     import proc
 
-__all__ = ["build_meshes", "validate_glb", "MeshError"]
+__all__ = ["build_dense", "load_dense", "build_meshes", "validate_glb", "MeshError"]
 
 # --- tuning, settled by experiment (see the module docstring) --------------------------------
 
@@ -158,8 +166,7 @@ COLLISION_MIN_AREA_FRACTION = 0.01
 MVS_MAX_IMAGES = 200
 MVS_IMAGE_SIZE = 1600
 MVS_SOURCE_IMAGES = 10
-PATCH_MATCH_OPTIONS = ("--PatchMatchStereo.geom_consistency", "1",
-                       "--PatchMatchStereo.num_iterations", "3")
+PATCH_MATCH_OPTIONS = ("--PatchMatchStereo.num_iterations", "3")   # geom_consistency is a parameter
 FUSION_OPTIONS = ()
 DELAUNAY_OPTIONS = ()
 # A face of the dense surface wider than this (longest edge, in pixels of the photos dense
@@ -1066,6 +1073,67 @@ def read_images_bin(path) -> list:
     return out
 
 
+def read_image_points(path) -> dict:
+    """{image name: [ids of the 3D points it observes]} from images.bin (the sparse model's
+    tracks; keypoints with no 3D point are left out)."""
+    data = Path(path).read_bytes()
+    n = struct.unpack_from("<Q", data, 0)[0]
+    pos = 8
+    out = {}
+    for _ in range(n):
+        pos += 64
+        end = data.index(b"\x00", pos)
+        name = data[pos:end].decode("utf-8")
+        pos = end + 1
+        m = struct.unpack_from("<Q", data, pos)[0]
+        pos += 8
+        ids = struct.unpack_from("<" + "ddq" * m, data, pos)[2::3] if m else ()
+        pos += 24 * m
+        out[name] = [i for i in ids if i >= 0]
+    return out
+
+
+MAX_OBSERVERS_PER_POINT = 50   # a point seen by more photos counts for an even sample of them
+
+
+def dense_view_plan(names, tracks: dict, source_images: int) -> tuple:
+    """Source photos for dense matching, from the 3D points the photos share.
+
+    COLMAP's `__auto__` selection leaves some photos with no source photo at all (forward-facing
+    captures especially) and `patch_match_stereo` then aborts. Instead each photo gets the
+    `source_images` photos that share the most 3D points with it (most first, ties by name).
+    A photo that shares points with no other photo of the run cannot be matched and is left out.
+    Returns (names kept, {name: [source names]}, [names dropped]).
+    """
+    kept = list(names)
+    index = {n: i for i, n in enumerate(kept)}
+    observers: dict = {}
+    for n in kept:
+        for pid in set(tracks.get(n, ())):
+            observers.setdefault(pid, []).append(index[n])
+    shared = [dict() for _ in kept]
+    for seen in observers.values():
+        if len(seen) < 2:
+            continue
+        if len(seen) > MAX_OBSERVERS_PER_POINT:
+            step = len(seen) / MAX_OBSERVERS_PER_POINT
+            seen = [seen[int(k * step)] for k in range(MAX_OBSERVERS_PER_POINT)]
+        for a in seen:
+            row = shared[a]
+            for b in seen:
+                if b != a:
+                    row[b] = row.get(b, 0) + 1
+    # A photo sharing nothing with the others shares nothing with the photos left, either.
+    dropped = [n for n in kept if not shared[index[n]]]
+    kept = [n for n in kept if shared[index[n]]]
+    sources = {}
+    for n in kept:
+        row = shared[index[n]]
+        best = sorted(row, key=lambda b: (-row[b], names[b]))[:source_images]
+        sources[n] = [names[b] for b in best]
+    return kept, sources, dropped
+
+
 def distort(model: int, p, x: float, y: float):
     """Normalised undistorted (x, y) -> pixel (u, v) in the distorted image."""
     if model == 0:
@@ -1820,12 +1888,13 @@ def _write_list(path: Path, names) -> Path:
 
 
 def _mvs_workspace(*, colmap, dataset_dir: Path, sparse: Path, out: Path, names: list,
-                   all_names: list, log_path, cancel_file) -> None:
-    """An undistorted workspace holding only `names`, at MVS_IMAGE_SIZE, with its own stereo
-    configuration (MVS_SOURCE_IMAGES source photos per photo, chosen by COLMAP)."""
+                   all_names: list, log_path, cancel_file, image_size: int,
+                   sources: dict) -> None:
+    """An undistorted workspace holding only `names`, at most `image_size` px on the long side,
+    with its own stereo configuration (`sources`: the source photos of each photo)."""
     listing = _write_list(out.parent / (out.name + "_images.txt"), names)
     _undistort(colmap=colmap, dataset_dir=dataset_dir, sparse=sparse, out=out,
-               max_image_size=MVS_IMAGE_SIZE, log_path=log_path, cancel_file=cancel_file,
+               max_image_size=image_size, log_path=log_path, cancel_file=cancel_file,
                image_list=listing)
     dropped = sorted(set(all_names) - set(names))
     if dropped:
@@ -1847,7 +1916,7 @@ def _mvs_workspace(*, colmap, dataset_dir: Path, sparse: Path, out: Path, names:
     stereo = out / "stereo"
     stereo.mkdir(exist_ok=True)
     (stereo / "patch-match.cfg").write_text(
-        "".join(f"{name}\n__auto__, {MVS_SOURCE_IMAGES}\n" for name in names), encoding="utf-8")
+        "".join(f"{name}\n{', '.join(sources[name])}\n" for name in names), encoding="utf-8")
     _write_list(stereo / "fusion.cfg", names)
 
 
@@ -1858,14 +1927,14 @@ _DELAUNAY_PHASES = (("Triangulating points", 0.79), ("Initializing ray tracer", 
                     ("Extracting surface", 0.95), ("Writing surface mesh", 0.97))
 
 
-def _fusion_masks(dataset_dir: Path, names, out: Path) -> int:
+def _fusion_masks(dataset_dir: Path, names, out: Path, use_masks: bool = True) -> int:
     """Copy the masks of the photos dense matching used to where `stereo_fusion` looks for them:
     `<out>/<photo name>.png`. In fusion a pixel whose mask value is 0 (black) is left out of the
     points, so the people and, in a scan of an object, the whole background never become
     surface. Returns how many photos have a mask."""
     masks_dir = dataset_dir / "masks"
     count = 0
-    if not masks_dir.is_dir():
+    if not use_masks or not masks_dir.is_dir():
         return 0
     for name in names:
         src = (masks_dir / name).with_suffix(".png")
@@ -1878,31 +1947,46 @@ def _fusion_masks(dataset_dir: Path, names, out: Path) -> int:
 
 
 def _dense_geometry(*, colmap, dataset_dir: Path, work_dir: Path, log_path, cancel_file,
-                    progress) -> dict:
+                    progress, max_images: int, image_size: int, source_images: int,
+                    geom_consistency: bool, use_masks: bool) -> dict:
     """Dense matching, fusion and meshing with COLMAP. Returns {"path" (PLY, dataset frame),
-    "images", "points"}."""
+    "images", "points", "sparse" (the cameras it ran on), "masked_photos"}."""
     sparse = _sparse_dir(dataset_dir)
     images = read_images_bin(sparse / "images.bin")
     all_names = [name for _, name, _, _, _ in images]
-    names = mvs_images(images, MVS_MAX_IMAGES)
+    names = mvs_images(images, max_images)
+    names, sources, dropped = dense_view_plan(names, read_image_points(sparse / "images.bin"),
+                                              source_images)
+    if dropped:
+        _note(log_path, f"{len(dropped)} photo(s) share no 3D point with any other photo of the "
+                        f"dense run and are left out: {', '.join(dropped)}")
+    if len(names) < 2:
+        raise MeshError(f"Fewer than two photos of {dataset_dir} share 3D points, so dense "
+                        f"matching has nothing to match. Check that the photos overlap. "
+                        f"Log: {log_path}")
     workspace = work_dir / "dense"
     progress(0.0, "准备照片")
     _mvs_workspace(colmap=colmap, dataset_dir=dataset_dir, sparse=sparse, out=workspace,
-                   names=names, all_names=all_names, log_path=log_path, cancel_file=cancel_file)
+                   names=names, all_names=all_names, log_path=log_path, cancel_file=cancel_file,
+                   image_size=image_size, sources=sources)
 
     # 1. Depth and normal maps per photo (GPU), photometric pass then geometric pass.
     _check_cancel(cancel_file)
     progress(0.04, "计算深度图")
     done = {"views": 0}
-    total = 2 * len(names)
+    total = (2 if geom_consistency else 1) * len(names)
 
     def on_view(line: str) -> None:
         if "Processing view" in line:
             done["views"] += 1
             progress(0.04 + 0.66 * min(1.0, done["views"] / total), "计算深度图")
 
+    # The geometric pass needs the photometric one first; without it the fusion reads the
+    # photometric depth maps.
+    kind = "geometric" if geom_consistency else "photometric"
     cmd = _colmap_cmd(colmap, "patch_match_stereo", "--workspace_path", workspace,
-                      "--workspace_format", "COLMAP", *PATCH_MATCH_OPTIONS)
+                      "--workspace_format", "COLMAP", *PATCH_MATCH_OPTIONS,
+                      "--PatchMatchStereo.geom_consistency", "1" if geom_consistency else "0")
     try:
         proc.run(cmd, log_path=log_path, timeout=MVS_TIMEOUT, stall_timeout=COLMAP_STALL,
                  on_line=on_view, cancel_file=cancel_file)
@@ -1911,7 +1995,7 @@ def _dense_geometry(*, colmap, dataset_dir: Path, work_dir: Path, log_path, canc
             e, "Dense matching (colmap patch_match_stereo)", log_path,
             " (it needs an NVIDIA GPU with free memory; close other GPU programs and run the "
             "mesh step again)") from e
-    maps = list((workspace / "stereo" / "depth_maps").rglob("*.geometric.bin"))
+    maps = list((workspace / "stereo" / "depth_maps").rglob(f"*.{kind}.bin"))
     if len(maps) < len(names):
         raise MeshError(f"Dense matching produced depth maps for {len(maps)} of {len(names)} "
                         f"photos. Log: {log_path}")
@@ -1921,10 +2005,10 @@ def _dense_geometry(*, colmap, dataset_dir: Path, work_dir: Path, log_path, canc
     progress(0.70, "融合点云")
     fused = workspace / "fused.ply"
     fusion_masks = work_dir / "fusion_masks"
-    masked = _fusion_masks(dataset_dir, names, fusion_masks)
+    masked = _fusion_masks(dataset_dir, names, fusion_masks, use_masks)
     mask_args = ("--StereoFusion.mask_path", fusion_masks) if masked else ()
     cmd = _colmap_cmd(colmap, "stereo_fusion", "--workspace_path", workspace,
-                      "--workspace_format", "COLMAP", "--input_type", "geometric",
+                      "--workspace_format", "COLMAP", "--input_type", kind,
                       "--output_path", fused, *mask_args, *FUSION_OPTIONS)
     state = {"points": 0}
 
@@ -1969,7 +2053,7 @@ def _dense_geometry(*, colmap, dataset_dir: Path, work_dir: Path, log_path, canc
         raise MeshError(f"colmap delaunay_mesher wrote no mesh. Log: {log_path}")
     progress(1.0, "重建表面")
     return {"path": meshed, "images": len(names), "points": state["points"],
-            "sparse": workspace / "sparse", "masked_photos": masked}
+            "sparse": workspace / "sparse", "masked_photos": masked, "dropped": dropped}
 
 
 def face_pixel_sizes(mesh: Mesh, cameras: dict, images: list, settle: float = 0.0):
@@ -2098,7 +2182,7 @@ def simplify(*, colmap, mesh: Mesh, target_faces: int, work_dir: Path, name: str
 
 
 def texture_mesh(*, colmap, dataset_dir: Path, work_dir: Path, mesh: Mesh, world_from_train,
-                 edge: int, log_path, cancel_file, progress) -> dict:
+                 edge: int, log_path, cancel_file, progress, use_masks: bool = True) -> dict:
     """Texture `mesh` (training frame) from the dataset's photos with `colmap mesh_texturer`.
 
     Returns {"mesh": textured Mesh with uv (glTF convention), "image": PNG bytes (square),
@@ -2123,8 +2207,11 @@ def texture_mesh(*, colmap, dataset_dir: Path, work_dir: Path, mesh: Mesh, world
     xyz = mesh.xyz if world_from_train is None else transform_points(mesh.xyz, world_from_train)
     _check_cancel(cancel_file)
     progress(0.08, "处理遮罩")
-    occluders, masked = build_occluders(dataset_dir=dataset_dir, cameras=cameras, images=images,
-                                        xyz=xyz, log_path=log_path)
+    if use_masks:
+        occluders, masked = build_occluders(dataset_dir=dataset_dir, cameras=cameras,
+                                            images=images, xyz=xyz, log_path=log_path)
+    else:
+        occluders, masked = [], 0
     mesh_ply = work_dir / "texture_in.ply"
     write_ply(mesh_ply, xyz, mesh.tris, occluders)
 
@@ -2193,15 +2280,151 @@ def texture_mesh(*, colmap, dataset_dir: Path, work_dir: Path, mesh: Mesh, world
 # Entry point
 # =============================================================================================
 
-def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces=300_000,
+def _check_colmap(tools) -> Path:
+    if "colmap" not in tools or not Path(tools["colmap"]).is_file():
+        raise MeshError(f"tools['colmap'] must be the path to colmap.exe; got "
+                        f"{tools.get('colmap')!r}. Run setup to install the tools.")
+    return Path(tools["colmap"]).resolve()
+
+
+def _check_dataset(dataset_dir: Path) -> None:
+    if not (dataset_dir / "images").is_dir() or not (dataset_dir / "sparse").is_dir():
+        raise MeshError(
+            f"{dataset_dir} is not the dataset of this run: it needs an images/ folder and a "
+            f"sparse/ folder. Pass the dataset folder the splat was trained on.")
+    _sparse_dir(dataset_dir)
+
+
+def _progress_reporter(on_progress) -> Callable:
+    """`report(lo, hi)` -> a callback(fraction, message) that maps 0..1 onto lo..hi, never going
+    backwards, and never lets a broken display stop the work."""
+    last = [0.0]
+
+    def report(lo: float, hi: float) -> Callable[[float, str], None]:
+        def inner(fraction: float, message: str) -> None:
+            last[0] = value = max(last[0], lo + (hi - lo) * max(0.0, min(1.0, fraction)))
+            if on_progress is not None:
+                try:
+                    on_progress(value, message)
+                except Exception:
+                    pass  # a broken progress display must not stop the meshing
+        return inner
+    return report
+
+
+DENSE_MESH_NAME = "dense_mesh.ply"
+DENSE_INFO_NAME = "dense.json"
+
+
+def build_dense(*, dataset_dir, out_dir, work_dir, tools, log_path, cancel_file=None,
+                on_progress=None, max_images=None, image_size=None, source_images=None,
+                geom_consistency: bool = True, use_masks: bool = True) -> dict:
+    """COLMAP's dense reconstruction of a dataset (the half hour of the mesh), kept for
+    `build_meshes`.
+
+    dataset_dir   images/ and sparse/0 (or sparse/) of the camera poses; optionally masks/
+                  (black = leave out of the points) when `use_masks`.
+    out_dir       receives what `build_meshes` needs and nothing else: `dense_mesh.ply` (the
+                  surface, dataset frame), `sparse/cameras.bin` + `images.bin` (the cameras of
+                  the photos it ran on, at the size they were matched at) and `dense.json`.
+    work_dir      scratch folder (the undistorted photos, depth maps and fused points: several
+                  GB); wiped when the work starts, left in place at the end for the caller to
+                  delete.
+    tools         {"colmap": path to colmap.exe (the CUDA build)}.
+    max_images, image_size, source_images
+                  photos used (spread evenly), their long side in pixels, photos matched against
+                  each (module defaults MVS_MAX_IMAGES, MVS_IMAGE_SIZE, MVS_SOURCE_IMAGES).
+    geom_consistency
+                  also run the geometric pass (cleaner, about twice as slow).
+    Each photo is matched against explicit source photos (the ones sharing most 3D points with
+    it); photos that share none with any other are left out ("photos_dropped", "dropped").
+    Returns {"path", "sparse", "images", "points", "masked_photos", "faces", "photos_dropped",
+    "seconds"}; see
+    `load_dense`. Raises MeshError; proc.Cancelled when the cancel file appears.
+    """
+    started = time.monotonic()
+    dataset_dir = Path(dataset_dir).resolve()
+    out_dir = Path(out_dir).resolve()
+    work_dir = Path(work_dir).resolve()
+    log_path = Path(log_path).resolve()
+    colmap = _check_colmap(tools)
+    max_images = MVS_MAX_IMAGES if max_images is None else max_images
+    image_size = MVS_IMAGE_SIZE if image_size is None else image_size
+    source_images = MVS_SOURCE_IMAGES if source_images is None else source_images
+    for name, value, low in (("max_images", max_images, 1), ("image_size", image_size, 64),
+                             ("source_images", source_images, 1)):
+        if not isinstance(value, int) or isinstance(value, bool) or value < low:
+            raise MeshError(f"{name} must be a whole number of at least {low}, got {value!r}")
+    _check_dataset(dataset_dir)
+    if out_dir.exists():
+        shutil.rmtree(out_dir)   # a failed run must not leave last time's surface looking current
+    if work_dir.exists():
+        shutil.rmtree(work_dir)
+    work_dir.mkdir(parents=True)
+    _check_cancel(cancel_file)
+    report = _progress_reporter(on_progress)(0.0, 1.0)
+    dense = _dense_geometry(colmap=colmap, dataset_dir=dataset_dir, work_dir=work_dir,
+                            log_path=log_path, cancel_file=cancel_file, progress=report,
+                            max_images=max_images, image_size=image_size,
+                            source_images=source_images, geom_consistency=geom_consistency,
+                            use_masks=use_masks)
+    xyz, tris, _ = read_ply(dense["path"])
+    faces = len(tris) // 3
+    del xyz, tris
+    # Written beside the final names first: only a complete folder counts as a result.
+    staging = out_dir.with_name(out_dir.name + ".part")
+    if staging.exists():
+        shutil.rmtree(staging)
+    (staging / "sparse").mkdir(parents=True)
+    shutil.copyfile(dense["path"], staging / DENSE_MESH_NAME)
+    for name in ("cameras.bin", "images.bin"):
+        shutil.copyfile(dense["sparse"] / name, staging / "sparse" / name)
+    info = {"images": dense["images"], "points": dense["points"],
+            "masked_photos": dense["masked_photos"], "faces": faces,
+            "photos_dropped": len(dense["dropped"]), "dropped": dense["dropped"],
+            "image_size": image_size, "source_images": source_images,
+            "geom_consistency": geom_consistency,
+            "seconds": round(time.monotonic() - started, 1)}
+    (staging / DENSE_INFO_NAME).write_text(json.dumps(info), encoding="utf-8")
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    os.replace(staging, out_dir)
+    _note(log_path, f"dense reconstruction from {info['images']} photos: {info['points']} "
+                    f"points, {faces} faces, {info['seconds']} s")
+    return load_dense(out_dir)
+
+
+def load_dense(dense_dir) -> dict:
+    """The result of `build_dense` kept in `dense_dir`: {"path", "sparse", "images", "points",
+    "masked_photos", "faces", ...}. Raises MeshError when there is none."""
+    dense_dir = Path(dense_dir)
+    mesh = dense_dir / DENSE_MESH_NAME
+    sparse = dense_dir / "sparse"
+    if not mesh.is_file() or not (sparse / "cameras.bin").is_file() \
+            or not (sparse / "images.bin").is_file():
+        raise MeshError(f"{dense_dir} holds no dense reconstruction ({DENSE_MESH_NAME} and "
+                        f"sparse/). Run the dense reconstruction first.")
+    try:
+        info = json.loads((dense_dir / DENSE_INFO_NAME).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        info = {}
+    return {**info, "path": mesh, "sparse": sparse, "images": info.get("images", 0),
+            "points": info.get("points", 0), "masked_photos": info.get("masked_photos", 0),
+            "photos_dropped": info.get("photos_dropped", 0)}
+
+
+def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, dense, visual_faces=300_000,
                  collision_faces=20_000, texture_size=4096, log_path, cancel_file=None,
-                 on_progress=None) -> dict:
-    """Write `out_dir/mesh.glb` and `out_dir/collision.glb` for a Spirula training run.
+                 on_progress=None, drop_shards_filter: bool = True,
+                 use_masks: bool = True) -> dict:
+    """Write `out_dir/mesh.glb` and `out_dir/collision.glb` from a dense reconstruction.
 
     run_dir       Spirula run folder (config.json, scene_transform.json, step-*.ckpt/): the
-                  meshes are written in the frame of its splat.
-    dataset_dir   the dataset the run was trained on: images/, sparse/0 (or sparse/) with any
-                  COLMAP camera model, and optionally masks/ (black = leave out of the texture).
+                  meshes are written in the frame of its splat. None: there is no splat; the
+                  meshes are then written in the dataset frame (the photos' frame).
+    dataset_dir   the dataset the dense reconstruction was made from: images/, sparse/0 (or
+                  sparse/) with any COLMAP camera model, and optionally masks/ (black = leave
+                  out of the texture) when `use_masks`.
+    dense         what `build_dense` returned, or the folder it wrote (see `load_dense`).
     work_dir      scratch folder for intermediate files (several GB on large scans); safe to
                   delete afterwards.
     tools         {"colmap": path to colmap.exe (the CUDA build)}; other entries are ignored.
@@ -2214,31 +2437,32 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
     log_path      the tools' output and a summary of each step are appended here.
     cancel_file   if this path appears the work stops and proc.Cancelled is raised.
     on_progress   called as on_progress(fraction 0..1, message), never going backwards.
+    drop_shards_filter
+                  remove the graph cut's far shards (SHARD_MAX_PIXELS); False keeps every face.
 
     Raises MeshError with an actionable message when a step fails.
     """
     started = time.monotonic()
-    run_dir = Path(run_dir).resolve()
+    run_dir = None if run_dir is None else Path(run_dir).resolve()
     dataset_dir = Path(dataset_dir).resolve()
     out_dir = Path(out_dir).resolve()
     work_dir = Path(work_dir).resolve()
     log_path = Path(log_path).resolve()
-    if "colmap" not in tools or not Path(tools["colmap"]).is_file():
-        raise MeshError(f"tools['colmap'] must be the path to colmap.exe; got "
-                        f"{tools.get('colmap')!r}. Run setup to install the tools.")
-    colmap = Path(tools["colmap"]).resolve()
+    colmap = _check_colmap(tools)
     for name, value in (("visual_faces", visual_faces), ("collision_faces", collision_faces)):
         if not isinstance(value, int) or isinstance(value, bool) or value < 100:
             raise MeshError(f"{name} must be a whole number of at least 100, got {value!r}")
     if not isinstance(texture_size, int) or not 256 <= texture_size <= 16384:
         raise MeshError(f"texture_size must be between 256 and 16384, got {texture_size!r}")
-    _find_checkpoint(run_dir)
-    if not (dataset_dir / "images").is_dir() or not (dataset_dir / "sparse").is_dir():
-        raise MeshError(
-            f"{dataset_dir} is not the dataset of this run: it needs an images/ folder and a "
-            f"sparse/ folder. Pass the dataset folder the splat was trained on.")
-    _sparse_dir(dataset_dir)
-    frames = read_scene_transform(run_dir)
+    if run_dir is not None:
+        _find_checkpoint(run_dir)
+    _check_dataset(dataset_dir)
+    if not isinstance(dense, dict):
+        dense = load_dense(dense)
+    if run_dir is not None:
+        frames = read_scene_transform(run_dir)
+    else:
+        frames = {"train_from_world": IDENTITY, "world_from_train": IDENTITY, "identity": True}
     out_dir.mkdir(parents=True, exist_ok=True)
     if work_dir.exists():
         shutil.rmtree(work_dir)   # leftovers of an earlier run must not be mistaken for results
@@ -2249,17 +2473,7 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
         if old.exists():
             old.unlink()   # a failed run must not leave last time's files looking like its result
 
-    last = [0.0]
-
-    def report(lo: float, hi: float) -> Callable[[float, str], None]:
-        def inner(fraction: float, message: str) -> None:
-            last[0] = value = max(last[0], lo + (hi - lo) * max(0.0, min(1.0, fraction)))
-            if on_progress is not None:
-                try:
-                    on_progress(value, message)
-                except Exception:
-                    pass  # a broken progress display must not stop the meshing
-        return inner
+    report = _progress_reporter(on_progress)
 
     timings = {}
 
@@ -2267,16 +2481,12 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
         timings[key] = round(time.monotonic() - since, 2)
         return time.monotonic()
 
-    # 1. Dense geometry from the photos (GPU, then CPU), in the dataset frame.
+    # 1. The dense surface was made by build_dense, in the dataset frame. Into the splat's frame,
+    # without the fragments, down to the visual budget.
     _check_cancel(cancel_file)
     t = time.monotonic()
-    dense = _dense_geometry(colmap=colmap, dataset_dir=dataset_dir, work_dir=work_dir,
-                            log_path=log_path, cancel_file=cancel_file, progress=report(0.0, 0.70))
-    t = timed("dense", t)
-
-    # 2. Into the splat's frame, without the fragments, down to the visual budget.
-    _check_cancel(cancel_file)
-    report(0.70, 0.70)(0.0, "清除零散碎片")
+    timings["dense"] = dense.get("seconds", 0.0)
+    report(0.0, 0.0)(0.0, "清除零散碎片")
     xyz, tris, _ = read_ply(dense["path"])
     raw = drop_degenerate_faces(Mesh(xyz, tris), zero_area=True)
     del xyz, tris
@@ -2285,9 +2495,11 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
         raise MeshError(f"Dense reconstruction found no surface in the photos of {dataset_dir}. "
                         f"Check that the photos overlap and are sharp. Log: {log_path}")
     # Shards are judged in the dataset frame, with the cameras dense matching used.
-    raw, shards = drop_shards(raw, read_cameras_bin(dense["sparse"] / "cameras.bin"),
-                              read_images_bin(dense["sparse"] / "images.bin"), SHARD_MAX_PIXELS,
-                              SHARD_MIN_DEPTH)
+    shards = 0
+    if drop_shards_filter:
+        raw, shards = drop_shards(raw, read_cameras_bin(dense["sparse"] / "cameras.bin"),
+                                  read_images_bin(dense["sparse"] / "images.bin"),
+                                  SHARD_MAX_PIXELS, SHARD_MIN_DEPTH)
     if raw.face_count == 0:
         raise MeshError(f"Dense reconstruction found no surface in the photos of {dataset_dir} "
                         f"that the photos resolve. Log: {log_path}")
@@ -2297,7 +2509,7 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
     surface, cut = keep_large_components(raw, VISUAL_MIN_AREA_FRACTION)
     del raw
     _check_cancel(cancel_file)
-    report(0.72, 0.72)(0.0, "简化网格")
+    report(0.02, 0.02)(0.0, "简化网格")
     surface = simplify(colmap=colmap, mesh=surface, target_faces=visual_faces, work_dir=work_dir,
                        name="visual", log_path=log_path, cancel_file=cancel_file)
     # A collapse can cut a sliver loose; the fragment rule applies to those too.
@@ -2311,11 +2523,11 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
                             mesh=surface, world_from_train=None if frames["identity"]
                             else frames["world_from_train"], edge=_atlas_edge(texture_size),
                             log_path=log_path, cancel_file=cancel_file,
-                            progress=report(0.75, 0.92))
+                            progress=report(0.05, 0.90), use_masks=use_masks)
     t = timed("texture", t)
 
     _check_cancel(cancel_file)
-    report(0.92, 0.92)(0.0, "写出带贴图网格")
+    report(0.90, 0.90)(0.0, "写出带贴图网格")
     visual = textured["mesh"]
     frame_note = {"frame": "spirula-train (same numbers as splat.ply)", "source": "scan3d"}
     write_glb(mesh_path, positions=visual.xyz, indices=array.array("I", visual.tris),
@@ -2327,7 +2539,7 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
 
     # 4. Collision mesh: the same surface, larger pieces only, far fewer faces.
     _check_cancel(cancel_file)
-    report(0.94, 0.94)(0.0, "简化碰撞网格")
+    report(0.92, 0.92)(0.0, "简化碰撞网格")
     collision, first_cut = keep_large_components(weld(surface), COLLISION_MIN_AREA_FRACTION)
     del surface
     collision = drop_degenerate_faces(collision, zero_area=True)
@@ -2340,7 +2552,7 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
     t = timed("collision_simplify", t)
 
     _check_cancel(cancel_file)
-    report(0.96, 0.96)(0.0, "写出碰撞网格")
+    report(0.94, 0.94)(0.0, "写出碰撞网格")
     write_glb(collision_path, positions=collision.xyz, indices=array.array("I", collision.tris),
               normals=vertex_normals(collision), name="collision", extras=frame_note)
     del collision

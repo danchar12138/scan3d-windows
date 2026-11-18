@@ -10,11 +10,10 @@
 
   var TABS = ["report", "splat", "mesh", "collision", "overlay", "coverage"];
   var SPLAT_TABS = ["splat", "overlay", "coverage"];      // the tabs that show the splat
-  var STAGE_LABEL = {
-    ingest: "采集数据", sfm: "相机位姿", dataset: "几何先验",
-    train: "训练高斯", mesh: "生成网格", export: "导出"
-  };
-  var QUALITY_LABEL = { preview: "预览", standard: "标准", high: "高质量" };
+  function stageName(key) {      // the label the server's schema gives the stage
+    var label = window.S3 && window.S3.stageLabel ? window.S3.stageLabel(key) : "";
+    return label || key;
+  }
   var FILE_LABEL = { splat: "高斯点云", mesh: "网格模型", collision: "碰撞网格" };
   var PREVIEW_POLL_MS = 1000;
   var COVERAGE_POLL_MS = 1000;
@@ -159,7 +158,10 @@
     var ingest = stages.ingest || {}, sfm = stages.sfm || {}, dataset = stages.dataset || {};
     var train = stages.train || {}, mesh = stages.mesh || {};
 
-    addRow(list, "质量档位", QUALITY_LABEL[report.quality] || report.quality);
+    if (report.template) {
+      var tpl = window.S3 && window.S3.templatesInfo ? (window.S3.templatesInfo.templates || []).filter(function (x) { return x.id === report.template; })[0] : null;
+      addRow(list, "模板", tpl ? tpl.label : report.template);
+    }
     addRow(list, "完成时间", fmtDate(report.finished_at));
 
     if (isNum(ingest.images)) {
@@ -211,7 +213,7 @@
     var timings = [], sum = 0;
     Object.keys(stages).forEach(function (key) {
       var seconds = stages[key] && stages[key].stage_seconds;
-      if (isNum(seconds)) { timings.push((STAGE_LABEL[key] || key) + " " + fmtSeconds(seconds)); sum += seconds; }
+      if (isNum(seconds)) { timings.push(stageName(key) + " " + fmtSeconds(seconds)); sum += seconds; }
     });
     if (timings.length) { addRow(list, "各阶段用时", timings.join("，") + "；合计 " + fmtSeconds(sum)); }
 
@@ -528,6 +530,11 @@
           err.final = true;
           throw err;
         }
+        if (state.state === "missing" && state.enabled === false) {
+          var off = new Error("「拍摄覆盖」这一步没有打开：在上面的工作流里打开它，再点「运行」。");
+          off.final = true;
+          throw off;
+        }
         if (state.state === "failed" && asked) { throw new Error(state.error || "无法计算拍摄覆盖。"); }
         var seconds = Math.round((Date.now() - started) / 1000);
         setStatus("正在计算拍摄覆盖（每个任务只需一次，通常不到半分钟）…" + (seconds >= 3 ? " 已用 " + seconds + " 秒" : ""), 0, 0);
@@ -729,10 +736,10 @@
       report: !!(files.report || files["report.json"] || files["scene_transform.json"]),
       splat: !!files.splat, mesh: !!files.mesh, collision: !!files.collision,
       overlay: !!(files.splat && files.collision),
-      coverage: !!files.splat
+      coverage: !!files.splat && !!(files["coverage.json"] || (job.workflow && job.workflow.stages && job.workflow.stages.coverage && job.workflow.stages.coverage.enabled))
     };
     var any = TABS.some(function (tab) { return available[tab]; });
-    var visible = job.state === "done" && any;
+    var visible = any;      // whatever stages have finished, their files can be looked at
     $("d-viewer").hidden = !visible;
     if (!visible) { close(); return; }
 

@@ -4,27 +4,49 @@ Standard library only (runs on the embeddable Python). One process, one `Threadi
 one worker thread that owns the FIFO queue and the single running pipeline process (the GPU can
 serve only one job at a time). The UI is the static files in `app/web/`.
 
+A job is a workflow (app/workflow.py: stages, their parameters and switches) plus its input.
+The workflow is chosen when the job is created (a template and an override), kept in
+`runs/<job>/workflow.json`, edited with PUT /workflow, and run as often as the user likes:
+each run is a request ("everything switched on that is not done", "up to this stage", "only
+these stages", "these again") that the server turns into a plan with `workflow.plan()` and
+queues. Nothing here knows what a stage does.
+
 Entry points
     serve(port=8765, *, open_browser=True)        blocking, Ctrl+C stops
     create_server(port, *, root=None, runs_dir=None, web_dir=None, token=None, host="0.0.0.0")
-    build_run_command(job, input_path, quality, options=None)
-                                                  the one place the pipeline command is built
+    build_run_command(job, input_path, *, to=None, only=None, force=None)
+                                                  the one place the pipeline command is built:
+                                                  `scan3d.py run <input> --name <job>` plus
+                                                  `--to`, `--only`, `--force` when given. The
+                                                  workflow is not on the command line: the
+                                                  server has written workflow.json already.
     build_preview_command(source, out, max_gaussians)   the same for a browser preview
-    build_coverage_command(splat, images, cameras, out, transform, up)
-                                                  the same for the coverage map
     build_models_command(features)                the same for a download of network weights
-    models_status(), models_accept(ids), models_dir(), models_file_mb(name)
-                                                  the only calls into models.py and config.py;
-                                                  tests replace them, so the server can be
-                                                  imported and tested without the real install
+    pipeline_job_view(job_dir), pipeline_write_workflow(job_dir, workflow),
+    pipeline_reset_stage(job_dir, stage), models_features(), models_default_features(),
+    workflow_needs(workflow), models_dir(), load_user_settings(), save_user_settings(data)
+                                                  the only calls into pipeline.py, models.py,
+                                                  config.py and the user's settings file; tests
+                                                  replace them, so the server can be imported
+                                                  and tested with a stub pipeline
 
 Files the server keeps in `runs/<job>/`
-    status.json      the contract file. The server writes it only while no pipeline process of
-                     its own is running for the job: state `created` (job exists, not started;
-                     a server-only state), `queued`, and the final state when the pipeline did
-                     not leave one (failed with the exit code, cancelled, interrupted).
-    server-job.json  what the server needs to start the job: source, input path, quality,
-                     options (the per-scan switches, see POST /api/jobs).
+    status.json      the contract file (the pipeline owns it while it runs; see "Status" below).
+                     The server writes it only while no pipeline process of its own is running
+                     for the job: state `created` (job exists, not started; a server-only
+                     state), `queued` (with `run`, the request and its plan), and the final
+                     state when the pipeline did not leave one (failed with the exit code,
+                     cancelled, interrupted).
+    workflow.json    the job's resolved workflow. Written by the server when the job is created
+                     and by PUT /workflow (through pipeline.write_workflow); read by the
+                     pipeline. A job made before workflows existed has none: it is shown with
+                     the default template and gets the file at its first edit.
+    stages/<id>.json the record of a finished stage (the pipeline's; the server only reads them,
+                     through pipeline.job_view, and deletes them through pipeline.reset_stage).
+    server-job.json  what the server needs to start the job: source, input path, created_at and
+                     `run`, the {to, only, force} of the run last requested (that is what the
+                     queue runs). Older files with `quality` and `options` are read and the two
+                     fields ignored.
     upload/          uploaded files; this folder is the pipeline's input path.
     upload.part/     partially received uploads (resumable); removed when the job starts.
     launcher.log     stdout/stderr of the pipeline process itself (tracebacks at startup).
@@ -34,72 +56,145 @@ Files the server keeps in `runs/<job>/`
                      for the names and format).
                      Each has a small .json beside it that records which splat.ply it was made
                      from and what it holds; a preview whose splat has changed is rebuilt.
-                     Also coverage.json, the coverage map (see GET /coverage), with
-                     coverage.source.json beside it: the sizes and times of the files it was
-                     computed from and the format version; when any of them differs it is
-                     computed again.
 A folder in `runs/` is a job only if it has a status.json and a valid job name.
 `runs/.server-token` holds the pairing token (see "Network exposure").
+`<root>/user-settings.json` holds the user's templates and default template (workflow.py).
 
 Queue
-    Jobs run strictly one after another, first in first out. After spawning the pipeline the
-    server only reads status.json; if the process exits without a final state the job is marked
-    failed with the exit code. When the server starts, every job still marked queued or running
-    is marked failed with the message "interrupted" (nothing can be running them: the pipeline
-    process is tied to the server process and dies with it). Stopping the server kills the
-    running pipeline's process tree.
+    Jobs run strictly one after another, first in first out; a job is queued with the run it
+    asked for. After spawning the pipeline the server only reads status.json; if the process
+    exits without a final state the job is marked failed with the exit code. When the server
+    starts, every job still marked queued or running is marked failed with the message
+    "interrupted" (nothing can be running them: the pipeline process is tied to the server
+    process and dies with it). Stopping the server kills the running pipeline's process tree.
+    A job that is queued or running cannot be edited (409 `job_busy`).
 
-HTTP API (JSON, UTF-8). Errors are `{"error": "<code>", "message": "<Chinese text>"}`.
+Status (status.json as the clients see it)
+    state: created | queued | running | done | failed | cancelled (| interrupted is a failed
+    job with that message). `done` means the last run reached its target, not that every
+    optional stage ran. Besides the pipeline's own fields (message, error, warnings, outputs,
+    stage = the running stage or null, stage_progress, started_at, finished_at ...) the job's
+    view has:
+      stages  {id: {state, progress, message, seconds, error, summary}} for every stage id;
+              state is disabled | pending | queued | running | done | stale | failed
+      run     {to, only: [ids], force: [ids], plan: [ids]} of the current or last run
+    Fields of old jobs (`quality`, `stage_index`, `stage_count`) are dropped from the view.
+
+HTTP API (JSON, UTF-8). Errors are `{"error": "<code>", "message": "<Chinese text>"}` (plus
+the extra fields named below).
     GET    /                                   the UI (app/web/index.html)
     GET    /static/<path>                      UI assets from app/web/ (ETag, 304)
-    GET    /api/info                           client kind (loopback?), qualities, extensions,
-                                               stages; for loopback clients only: `lan_urls`,
-                                               the addresses a phone opens, token included
-    GET    /api/jobs                           all jobs, newest first, plus queue and current
-    POST   /api/jobs                           create. Body {"name"?, "quality"?, "path"?,
-                                               "start"?, "options"?}. Without `path`: an upload
+    GET    /api/info                           {app, loopback, stages [ids], default_template,
+                                               extensions, max_upload_bytes, server_time};
+                                               for loopback clients only: `lan_urls`, the
+                                               addresses a phone opens, token included
+    GET    /api/workflow/schema                workflow.schema() ({stages: [{id, label, desc,
+                                               optional, gpu, deps, soft, features, params:
+                                               [{key, label, type bool|int|float|choice|text,
+                                               default, help, advanced, min?, max?,
+                                               choices?}]}], default_template}) plus
+                                               `templates` (as GET /api/templates) and
+                                               `features` (as in GET /api/models)
+    GET    /api/templates                      {"templates": [{id, label, desc, builtin, base?,
+                                               enabled: [stage ids that really run] | null (and
+                                               `problems`) }], "default_template": id}
+    PUT    /api/templates/<id>                 loopback only. Body {"label", "desc"?, "base"?
+                                               (a template id, default "standard"), "stages":
+                                               {stage: {"enabled"?, "params"?}}}: save a user
+                                               template (it must resolve). A built-in id is
+                                               replaced. 400 `bad_workflow` (plus `problems`),
+                                               `bad_name`, `bad_request`; 409
+                                               `too_many_templates`. -> as GET /api/templates
+    DELETE /api/templates/<id>                 loopback only. A user template (a built-in one:
+                                               409 `builtin_template`; one that is the base of
+                                               another: 409 `template_in_use`; unknown: 404).
+                                               Was the default: the default is reset. -> as GET
+    PUT    /api/templates/default              loopback only. Body {"id"}: the template new jobs
+                                               start from (400 `bad_template`). -> as GET
+    GET    /api/jobs                           all jobs, newest first, plus queue and current;
+                                               each as the job view below without the large
+                                               parts (`stages` is {id: {state, progress}}, no
+                                               `workflow`)
+    POST   /api/jobs                           create. Body {"name"?, "template"? (default:
+                                               the user's default template), "workflow"? (an
+                                               override {stage: {"enabled"?, "params"?}} on top
+                                               of the template), "path"?, "start"?, "to"?,
+                                               "only"?, "force"?}. Without `path`: an upload
                                                job in state `created`. With `path` (loopback
                                                clients only): a job that reads an existing
                                                folder or video on this PC; "start": true queues
-                                               it at once.
-                                               Name missing -> scan-YYYYMMDD-HHMMSS. -> 201
-                                               `options` are per-scan switches that override the
-                                               quality preset: {"masks"?: bool, "subject_only"?:
-                                               bool}. Only these keys and only true/false, else
-                                               400 `bad_options`. A switch that is not given is
-                                               not passed on (the preset decides); each given
-                                               one reaches the pipeline as
-                                               `--set <key>=true|false`.
-    GET    /api/jobs/<job>                     every field of status.json (also ones this file
-                                               does not know, e.g. warnings) plus: source,
-                                               options (the switches given for this scan, {}
-                                               when none), created_at, queue_position,
-                                               elapsed_seconds,
-                                               actions (what this client may do now: start,
-                                               cancel, delete, open_folder, open_viewer),
-                                               cancelling, uploads {count, bytes}, output_files
-                                               [{key, path, name, size}], logs [names]. A browser
-                                               preview in output/ that the viewer does not use
-                                               (see /preview) also has `outdated: true`.
+                                               it at once, with the run `to`/`only`/`force`
+                                               describe (they need `start`). Name missing ->
+                                               scan-YYYYMMDD-HHMMSS. -> 201 with the job view.
+                                               400 `bad_workflow` (plus `problems` [str]) for
+                                               an unknown template or an invalid override; a
+                                               plan error (below) with `start`; 400 for the old
+                                               fields `quality` and `options`.
+    GET    /api/jobs/<job>                     the job view: every field of status.json (also
+                                               ones this file does not know, e.g. warnings)
+                                               plus: source, template, workflow (the resolved
+                                               one, every stage and parameter), changes (what
+                                               differs from the template), stages, run,
+                                               licences [{id, label, url, stage}] (the licences
+                                               that apply to the stages switched on; for
+                                               information, nothing is ticked), models_needed
+                                               [{file, mb, stage}] (weights that will be
+                                               downloaded when their stage starts),
+                                               created_at, queue_position, elapsed_seconds,
+                                               actions (what this client may do now: run [=
+                                               start], cancel, edit, delete, open_folder,
+                                               open_viewer), cancelling, uploads {count,
+                                               bytes}, output_files [{key, path, name, size}],
+                                               logs [names]. A browser preview in output/ that
+                                               the viewer does not use (see /preview) also has
+                                               `outdated: true`. A workflow file that cannot be
+                                               read gives `workflow_error` instead of a
+                                               workflow.
     DELETE /api/jobs/<job>                     delete the job directory (refused while running)
+    PUT    /api/jobs/<job>/workflow            body: an override {stage: {"enabled"?,
+                                               "params"?}} and optionally "template": merged
+                                               into the stored workflow, or, with a template,
+                                               applied on top of that template's own settings
+                                               (the switch of template keeps nothing of the old
+                                               settings). Validated, saved. -> the job view.
+                                               400 `bad_workflow` (plus `problems`); 409
+                                               `job_busy` while queued or running.
+    POST   /api/jobs/<job>/run                 queue a run. Body {"to"?: stage, "only"?:
+                                               [stages], "force"?: [stages]} (none: everything
+                                               switched on that is not done; see
+                                               workflow.plan). -> 202 with the job view (its
+                                               `run.plan` is what will run). 400 with the code
+                                               of the plan error (unknown_stage, stage_disabled,
+                                               needs_upstream, nothing_to_do); 400 `no_input`;
+                                               409 `already_active`, `uploading`. Weights that
+                                               are missing are not an error: they download at
+                                               the start of the stage that needs them.
+    POST   /api/jobs/<job>/start               the old name of /run
+    POST   /api/jobs/<job>/plan                the same body as /run: what it would do, nothing
+                                               is queued: {"steps": [{stage, reason (requested |
+                                               needed | forced | downstream), label}],
+                                               "licences": [...], "models_needed": [...]} for
+                                               the stages of the plan; the plan error as in /run
+    POST   /api/jobs/<job>/stages/<stage>/reset
+                                               delete that stage's record and what it alone
+                                               produced; stages after it show `stale`.
+                                               -> the job view. 400 `unknown_stage`; 409
+                                               `job_busy`
     PUT    /api/jobs/<job>/files/<name>        upload one file; the raw request body is the file
                                                (Content-Length required, streamed to disk).
                                                `?offset=N` appends to a partial upload of N bytes.
                                                POST is accepted as an alias. -> 201
     GET    /api/jobs/<job>/files/<name>        {"name","size","complete"} of an upload, so a
                                                client can resume after a dropped connection
-    POST   /api/jobs/<job>/start               queue the job (states created/failed/cancelled;
-                                               the pipeline resumes a job it has seen before).
-                                               Body {"quality"?, "options"?}: `quality`
-                                               overrides the stored quality; `options`, when
-                                               given, replaces the stored switches as a whole
-                                               ({} clears them); when missing they are kept.
     POST   /api/jobs/<job>/cancel              queued: dropped from the queue; running: the
                                                `cancel` file is created and the pipeline stops.
                                                A pipeline that ignores it is killed after
                                                CANCEL_GRACE_SECONDS.
     GET    /api/jobs/<job>/log                 log text. `?file=` one of the names in `logs`
-                                               (default pipeline.log), `?offset=N` to continue
+                                               (pipeline.log, then one log per stage that wrote
+                                               one in stage order: ingest.log, masks.log,
+                                               sfm.log, train.log ..., then launcher.log;
+                                               default pipeline.log), `?offset=N` to continue
                                                from a previous `next_offset`, else the tail;
                                                `?max=` bytes (default 65536)
     GET    /api/jobs/<job>/download/<path>     an output file (under output/ or listed in
@@ -130,7 +225,9 @@ HTTP API (JSON, UTF-8). Errors are `{"error": "<code>", "message": "<Chinese tex
                                                (202 while queued or building, else 200: ready,
                                                or failed again already).
                                                One conversion runs at a time, in a child process
-                                               with a time limit. The job must be done.
+                                               with a time limit. The job must not be queued
+                                               or running (a job that failed or was cancelled
+                                               after its splat was made still has one to see).
     GET    /api/jobs/<job>/preview/<variant>   the preview file (SPZ). Range / If-Range, HEAD.
                                                404 `preview_missing` until it is ready.
     GET    /api/jobs/<job>/cameras             up to 200 of the training camera poses, in the
@@ -138,65 +235,60 @@ HTTP API (JSON, UTF-8). Errors are `{"error": "<code>", "message": "<Chinese tex
                                                [{"position", "forward", "up"}]}. Empty when the
                                                job folder has no dataset/sparse/images.bin. The
                                                viewer starts from one of them.
-    GET    /api/jobs/<job>/coverage            how well the photos saw each part of the scene
-                                               (app/coverage.py has the method): {"state":
-                                               ready (plus size) | missing | queued | building
-                                               | failed (plus error) | unavailable (plus
-                                               reason not_done | no_splat | no_cameras, and
-                                               message)}. Nothing is computed by asking.
-    POST   /api/jobs/<job>/coverage            compute it in the background; answers at once
-                                               with the state (202 while queued or building,
-                                               200 when ready or failed again already; 409
-                                               with the reason as error code when
-                                               unavailable). One computation at a time, in a
-                                               child process with a time limit
-                                               (COVERAGE_TIME_LIMIT_SECONDS). Measured with
-                                               1,000,000 Gaussians: 3-6 s for 128-225 photos,
-                                               14 s for 300; up to 40 s while the PC is busy.
+    GET    /api/jobs/<job>/coverage            how well the photos saw each part of the scene;
+                                               the map is the result of the `coverage` stage,
+                                               output/coverage.json (app/coverage.py has the
+                                               method): {"state": ready (plus size, and
+                                               `stale: true` when the photos or settings
+                                               changed since it was made) | missing (plus
+                                               `enabled`, whether the stage is switched on) |
+                                               queued | building | failed (plus error) |
+                                               unavailable (plus reason no_splat and message)}.
+                                               Nothing is computed by asking.
+    POST   /api/jobs/<job>/coverage            queue `--only coverage` through the normal queue
+                                               (the same rules as /run: 400 `stage_disabled`
+                                               when the stage is switched off, `needs_upstream`
+                                               when there is no splat yet); answers at once with
+                                               the state (202 while queued or building, 200
+                                               when ready and current: nothing is queued; 409
+                                               with the reason as error code when unavailable).
     GET    /api/jobs/<job>/coverage/data       the coverage map (JSON, a few hundred KB; the
-                                               format is in app/coverage.py), cached in
-                                               web-preview/. ETag, HEAD. 404 coverage_missing
-                                               until it is ready.
-    GET    /api/models                         the network weights the features need, for any
-                                               authorised client: {"features": {<key>: {label,
-                                               files, enabled, ready, licences_needed,
-                                               files_missing, download_mb}}, "licences": {<id>:
-                                               {name, url, used_for, accepted, needed}},
-                                               "files_missing", "download_mb", "download",
-                                               "can_manage"}. Everything but `label` (the
-                                               Chinese name of the feature), `download` and
-                                               `can_manage` is models.status() as it is;
-                                               `enabled` means some quality preset turns the
-                                               feature on. `download` is the one download this
-                                               server runs or ran last: {state: idle | running |
-                                               done | failed, features (the ones being fetched),
-                                               error (null unless failed), downloaded_mb,
-                                               total_mb, files: [{name, size_mb,
-                                               downloaded_mb}]}; the numbers are read from the
-                                               files on disk, partial ones included, each time.
-                                               `can_manage` is true for loopback clients: only
-                                               they may use the two calls below.
-    POST   /api/models/accept                  loopback only. Body {"licences": [<id>, ...]}:
-                                               record that the person at this PC accepted these
-                                               third-party licences. 400 `bad_licence` for an
-                                               empty list or an unknown id (nothing is recorded
-                                               then). -> the new overview. Nothing else in this
-                                               server ever accepts a licence.
-    POST   /api/models/download                loopback only. Body {"features": [<key>, ...]}:
-                                               fetch the weights these features lack. Empty or
-                                               missing: what the enabled features lack and may
-                                               fetch (licence accepted). 400 `bad_feature` for
-                                               an unknown key; 409 `download_busy` while a
-                                               download runs; 409 `licence_needed` (plus
-                                               `licences`) when a named feature still waits for
-                                               its licence; 507 `disk_full`. -> 202 with the
-                                               overview when a download started, 200 with it
-                                               when nothing was missing. One download at a
-                                               time, in a child process with a time limit,
-                                               killed when the server stops (what was fetched
-                                               stays in tools/models/_part and the next download
+                                               format is in app/coverage.py): output/coverage.json
+                                               as it is. ETag, HEAD. 404 coverage_missing until
+                                               it exists.
+    GET    /api/models                         the network weights the stages need, for any
+                                               authorised client: {"features": [{id, label,
+                                               stage, files: [{name, mb, installed}], licence:
+                                               {id, label, url, accepted} | null, ready}],
+                                               "disk_mb" (installed weights), "download_mb"
+                                               (still to download), "free_mb" (free disk space),
+                                               "download", "can_manage"}. `licence` is the one
+                                               that applies to the weights, shown to the user;
+                                               there is no consent step (switching the stage on
+                                               is the choice, the pipeline records it).
+                                               `download` is the one download this server runs
+                                               or ran last: {state: idle | running | done |
+                                               failed, features (the ones being fetched), error
+                                               (null unless failed), downloaded_mb, total_mb,
+                                               files: [{name, size_mb, downloaded_mb}]}; the
+                                               numbers are read from the files on disk, partial
+                                               ones included, each time. `can_manage` is true
+                                               for loopback clients: only they may download.
+    POST   /api/models/download                loopback only. Body {"features": [<id>, ...]}:
+                                               fetch the weights these features lack (the same
+                                               download the stage would start by itself). Empty
+                                               or missing: the features the default template
+                                               uses. 400
+                                               `bad_feature` for an unknown id; 409
+                                               `download_busy` while a download runs; 507
+                                               `disk_full`. -> 202 with the overview when a
+                                               download started, 200 with it when nothing was
+                                               missing. One download at a time, in a child
+                                               process with a time limit, killed when the server
+                                               stops (what was fetched stays in
+                                               tools/models/_part and the next download
                                                continues from there). Whether it worked is
-                                               judged by reading the status again, not by the
+                                               judged by reading the table again, not by the
                                                exit code.
 
 Network exposure
@@ -209,14 +301,16 @@ Network exposure
     created at the first start and kept in `runs/.server-token`, so the address a phone has
     bookmarked keeps working after a restart; delete that file to pair all phones anew.
     The token and the phone addresses are shown only to loopback clients. "Loopback only"
-    actions stay loopback-only even with a valid token. Requests whose Host header is a DNS
-    name other than localhost, and state-changing requests whose Origin differs from Host, are
-    refused (DNS rebinding, CSRF).
+    actions (writing templates, downloading weights, opening a folder or the viewer, jobs
+    that read a path on this PC) stay loopback-only even with a valid token. Requests whose
+    Host header is a DNS name other than localhost, and state-changing requests whose Origin
+    differs from Host, are refused (DNS rebinding, CSRF).
 """
 from __future__ import annotations
 
 import base64
 import collections
+import copy
 import ctypes
 import datetime as _dt
 import hashlib
@@ -248,14 +342,14 @@ WEB_DIR = APP_DIR / "web"
 try:  # imported as part of a package
     from . import proc as _proc  # type: ignore[import-not-found]
     from . import splatconv as _splatconv  # type: ignore[import-not-found]
-    from . import coverage as _coverage  # type: ignore[import-not-found]
+    from . import workflow as _wf  # type: ignore[import-not-found]
 except ImportError:  # run as a plain script next to proc.py (the embeddable Python's
     # ._pth file can keep the script folder off sys.path, so add it explicitly)
     if str(APP_DIR) not in sys.path:
         sys.path.insert(0, str(APP_DIR))
     import proc as _proc  # type: ignore[no-redef]
     import splatconv as _splatconv  # type: ignore[no-redef]
-    import coverage as _coverage  # type: ignore[no-redef]
+    import workflow as _wf  # type: ignore[no-redef]
 
 log = logging.getLogger("scan3d.server")
 
@@ -265,9 +359,7 @@ IMAGE_EXTENSIONS = ("jpg", "jpeg", "png", "webp", "heic", "heif", "tif", "tiff",
 VIDEO_EXTENSIONS = ("mp4", "mov", "m4v", "mkv", "avi", "webm")
 ALLOWED_EXTENSIONS = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
 
-QUALITIES = ("preview", "standard", "high")
-DEFAULT_QUALITY = "standard"
-STAGES = ("ingest", "sfm", "dataset", "train", "mesh", "export")
+STAGES = tuple(_wf.STAGE_ORDER)     # the stage ids, in execution order (workflow.py owns them)
 
 STATE_CREATED = "created"  # server-only: the job exists but was never started
 ACTIVE_STATES = ("queued", "running")
@@ -303,22 +395,11 @@ PREVIEW_VARIANTS = {            # variant -> (file name, most Gaussians kept or 
 PREVIEW_CACHE_DIR = "web-preview"       # in the job folder: previews the server built itself
 PREVIEW_TIME_LIMIT_SECONDS = 600.0      # one conversion; 2,000,000 Gaussians take 15-30 s
 MAX_VIEWER_CAMERAS = 200
-COVERAGE_NAME = "coverage.json"                 # in web-preview/: the coverage map
-COVERAGE_SOURCE_NAME = "coverage.source.json"   # ... and what it was computed from
-COVERAGE_TIME_LIMIT_SECONDS = 600.0             # one computation; measured 3-40 s (see above)
+COVERAGE_FILE = ("output", "coverage.json")     # written by the coverage stage
 
-# Per-scan switches a client may set; each one overrides that key of the quality preset.
-JOB_OPTIONS = ("masks", "subject_only")
-
-# The features that need network weights (the keys of models.status()["features"]) by their
-# name in the UI. A key this table does not know is shown as it is.
-FEATURE_LABELS = {
-    "masks": "抠除移动物体",
-    "subject_only": "物体扫描：只保留主体",
-    "normals": "表面法线先验",
-    "dense_seed": "稠密点云初始化",
-    "sfm": "位姿计算的备用特征",
-}
+STATUS_DROPPED = ("quality", "stage_index", "stage_count", "stage_total")   # fields of old jobs
+MAX_USER_TEMPLATES = 50
+MAX_TEMPLATE_LABEL = 60
 MODELS_TIME_LIMIT_SECONDS = 12 * 3600.0  # one download of weights (all of them: about 5 GB)
 MODELS_PART_DIR = "_part"                # in the models folder: files still being fetched
 
@@ -378,18 +459,21 @@ class ApiError(Exception):
 
 # ---------------------------------------------------------------------------- the pipeline contract
 
-def build_run_command(job: str, input_path: str, quality: str,
-                      options: Optional[dict] = None) -> List[str]:
+def build_run_command(job: str, input_path: str, *, to: Optional[str] = None,
+                      only: Optional[Sequence[str]] = None,
+                      force: Optional[Sequence[str]] = None) -> List[str]:
     """The command that runs the pipeline for one job. Tests replace this with a stub.
 
-    `options` are the per-scan switches (JOB_OPTIONS). Only the ones given are passed on, as
-    overrides of the quality preset; for the others the preset decides."""
-    cmd = [sys.executable, str(APP_DIR / "scan3d.py"), "run", str(input_path),
-           "--name", job, "--quality", quality]
-    for key in JOB_OPTIONS:
-        value = (options or {}).get(key)
-        if isinstance(value, bool):
-            cmd += ["--set", "%s=%s" % (key, "true" if value else "false")]
+    The workflow itself is not on the command line: the server has already written
+    `runs/<job>/workflow.json`, which the pipeline reads. `to`, `only` and `force` are the
+    request of the run (see POST /api/jobs/<job>/run); each is passed only when given."""
+    cmd = [sys.executable, str(APP_DIR / "scan3d.py"), "run", str(input_path), "--name", job]
+    if to:
+        cmd += ["--to", to]
+    if only:
+        cmd += ["--only", ",".join(only)]
+    if force:
+        cmd += ["--force", ",".join(force)]
     return cmd
 
 
@@ -402,84 +486,71 @@ def build_preview_command(source: os.PathLike, out: os.PathLike,
     return cmd
 
 
-def build_coverage_command(splat: os.PathLike, images: os.PathLike, cameras: os.PathLike,
-                           out: os.PathLike, transform: Optional[os.PathLike] = None,
-                           up: Optional[Sequence[float]] = None) -> List[str]:
-    """The command that computes the coverage map of a job. Tests may replace this too."""
-    cmd = [sys.executable, str(APP_DIR / "coverage.py"), str(splat), str(images), str(cameras),
-           str(out)]
-    if transform is not None:
-        cmd += ["--transform", str(transform)]
-    if up is not None:
-        cmd += ["--up", ",".join(repr(float(v)) for v in up)]
-    return cmd
-
-
 def build_models_command(features: Optional[Sequence[str]]) -> List[str]:
     """The command that downloads network weights: those of the features named or, with no
-    names, what the enabled features still lack. Tests replace this as well."""
+    names, everything that is missing. Tests replace this as well."""
     cmd = [sys.executable, str(APP_DIR / "scan3d.py"), "models", "--download"]
     if features:
         cmd.append(",".join(features))
     return cmd
 
 
-# The server's only calls into models.py and config.py. The two modules are imported when
-# first needed and reached through these four functions, which tests replace.
+# The server's only calls into the pipeline, models.py, config.py and the user's settings file.
+# The modules are imported when first needed and reached through these functions, which tests
+# replace (so the server can be tested with a stub pipeline and without the real install).
 
-def _models_modules() -> Tuple[Any, Any]:
-    if str(APP_DIR) not in sys.path:    # both are plain modules next to this file
+def _app_module(name: str) -> Any:
+    if str(APP_DIR) not in sys.path:    # all are plain modules next to this file
         sys.path.insert(0, str(APP_DIR))
-    import config  # type: ignore[import-not-found]
-    import models  # type: ignore[import-not-found]
-    return config, models
+    return __import__(name)
 
 
-def models_status() -> dict:
-    """What the features need, what is installed, which licences are open (models.status)."""
-    config, models = _models_modules()
-    return models.status(config.load_settings())
+def pipeline_job_view(job_dir: Path) -> dict:
+    """{"workflow", "template", "stages", "run"} of a job, from its files (pipeline.job_view).
+    A job without workflow.json gets the default template. _wf.WorkflowError: damaged file."""
+    return _app_module("pipeline").job_view(job_dir)
 
 
-def models_accept(ids: Sequence[str]) -> None:
-    """Record that the person at this PC accepted these licences. ValueError: unknown id."""
-    _models_modules()[1].accept_licences(list(ids))
+def pipeline_write_workflow(job_dir: Path, workflow: dict) -> None:
+    """Store a (resolved, validated) workflow as the job's workflow.json."""
+    _app_module("pipeline").write_workflow(job_dir, workflow)
+
+
+def pipeline_reset_stage(job_dir: Path, stage: str) -> None:
+    """Delete a stage's record and what it alone produced (ValueError: cannot be reset)."""
+    _app_module("pipeline").reset_stage(job_dir, stage)
+
+
+def models_features() -> dict:
+    """{"features": [...], "disk_mb": int}: the table of the features that need network
+    weights (models.features_table)."""
+    return _app_module("models").features_table()
+
+
+def models_default_features() -> List[str]:
+    """The ids of the features the default template's stages use (models.default_features):
+    what a download without names fetches."""
+    return list(_app_module("models").default_features())
+
+
+def workflow_needs(workflow: dict) -> dict:
+    """{"licences_needed": [{id, label, url, stage}], "models_needed": [{file, mb, stage}]}
+    of the stages a workflow switches on (models.needs)."""
+    return _app_module("models").needs(workflow)
 
 
 def models_dir() -> Path:
     """Where the weights are installed; files still being fetched are in its _part folder."""
-    return Path(_models_modules()[0].MODELS)
+    return Path(_app_module("config").MODELS)
 
 
-def models_file_mb(name: str) -> float:
-    """The size of one weights file as the catalogue states it, in MB (0 when unknown)."""
-    try:
-        return _models_modules()[1].CATALOGUE[name]["size_mb"]
-    except (KeyError, TypeError):
-        return 0
+def load_user_settings() -> dict:
+    """The user's templates and default template (user-settings.json in the project root)."""
+    return _wf.load_user()
 
 
-# ---------------------------------------------------------------------------- per-scan switches
-
-def check_job_options(raw: Any) -> Optional[dict]:
-    """The `options` of a request: None when not given, else the switches in a fixed order.
-    Anything but the known keys with true or false is refused."""
-    if raw is None:
-        return None
-    if not isinstance(raw, dict) or any(key not in JOB_OPTIONS or not isinstance(value, bool)
-                                        for key, value in raw.items()):
-        raise ApiError(400, "bad_options", "扫描选项不合法：只接受 %s，值只能是 true 或 false"
-                       % "、".join(JOB_OPTIONS))
-    return {key: raw[key] for key in JOB_OPTIONS if key in raw}
-
-
-def stored_job_options(meta: Optional[dict]) -> dict:
-    """The switches kept in server-job.json. The file can be edited by hand, so only what
-    check_job_options would accept is used."""
-    raw = (meta or {}).get("options")
-    if not isinstance(raw, dict):
-        return {}
-    return {key: raw[key] for key in JOB_OPTIONS if isinstance(raw.get(key), bool)}
+def save_user_settings(data: dict) -> None:
+    _wf.save_user(data)
 
 
 # ---------------------------------------------------------------------------- names and paths
@@ -877,11 +948,127 @@ def _say(text: str) -> None:
         pass
 
 
+# ---------------------------------------------------------------------------- workflow requests
+
+_TEMPLATE_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+RESERVED_TEMPLATE_IDS = ("default",)        # /api/templates/default sets the default template
+
+
+def valid_template_id(value: Any) -> bool:
+    return (isinstance(value, str) and _TEMPLATE_ID_RE.match(value) is not None
+            and value not in RESERVED_TEMPLATE_IDS)
+
+
+def bad_workflow(error: "_wf.WorkflowError") -> ApiError:
+    """The 400 for a workflow, template or override that does not validate."""
+    return ApiError(400, "bad_workflow", "流程设置不合法：%s" % "；".join(error.problems)[:600],
+                    problems=list(error.problems))
+
+
+def _stage_ids(raw: Any, name: str) -> List[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list) or not all(isinstance(i, str) for i in raw):
+        raise ApiError(400, "bad_request", "%s 必须是阶段名称的列表" % name)
+    return list(dict.fromkeys(raw))
+
+
+def parse_run_request(body: dict) -> Tuple[Optional[str], List[str], List[str]]:
+    """(to, only, force) of the body of /run, /plan, /start and of a create with `start`.
+    Names are checked against the plan, not here (an unknown one is a PlanError)."""
+    to = body.get("to")
+    if to is not None and not isinstance(to, str):
+        raise ApiError(400, "bad_request", "to 必须是一个阶段名称")
+    return to or None, _stage_ids(body.get("only"), "only"), _stage_ids(body.get("force"), "force")
+
+
+def reject_removed_fields(body: dict) -> None:
+    """`quality` and `options` are gone: a client that still sends them is told so."""
+    for key in ("quality", "options"):
+        if key in body:
+            raise ApiError(400, "bad_request",
+                           "%s 已经取消：请用 template（模板）和 workflow（流程设置）" % key)
+
+
+def check_override(raw: Any) -> Optional[dict]:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise bad_workflow(_wf.WorkflowError(["workflow 必须是对象：{阶段: {enabled, params}}"]))
+    return raw
+
+
+def changes_from_template(workflow: dict, user: dict) -> dict:
+    """The partial override that turns the job's template into this workflow (the template as
+    it is now); {} when the template no longer exists."""
+    try:
+        base = _wf.resolve(workflow.get("template"), user=user)
+    except _wf.WorkflowError:
+        return {}
+    diff: Dict[str, Any] = {}
+    for sid in _wf.STAGE_ORDER:
+        a, b = workflow["stages"][sid], base["stages"][sid]
+        entry: Dict[str, Any] = {}
+        if a["enabled"] != b["enabled"]:
+            entry["enabled"] = a["enabled"]
+        params = {k: v for k, v in a["params"].items() if v != b["params"].get(k)}
+        if params:
+            entry["params"] = params
+        if entry:
+            diff[sid] = entry
+    return diff
+
+
+def stage_overview(stages: Any) -> Optional[dict]:
+    """{id: {"state", "progress"}} of the full per-stage map: what a list of jobs needs."""
+    if not isinstance(stages, dict):
+        return None
+    return {sid: {"state": (entry or {}).get("state"), "progress": (entry or {}).get("progress")}
+            for sid, entry in stages.items() if isinstance(entry, dict)}
+
+
+def _with_enabled(entry: dict, user: dict) -> dict:
+    entry = dict(entry)
+    try:
+        entry["enabled"] = _wf.effective_enabled(_wf.resolve(entry["id"], user=user))
+    except _wf.WorkflowError as exc:
+        entry["enabled"] = None
+        entry["problems"] = list(exc.problems)
+    return entry
+
+
+def _default_template_id() -> str:
+    return load_user_settings().get("default_template") or _wf.DEFAULT_TEMPLATE
+
+
+def workflow_schema() -> dict:
+    """GET /api/workflow/schema: workflow.schema() plus the templates and the table of the
+    features that need weights. A models table that cannot be read does not take the
+    schema down with it: `features` is empty and `features_error` says why."""
+    user = load_user_settings()
+    result = _wf.schema()
+    result["default_template"] = user.get("default_template") or _wf.DEFAULT_TEMPLATE
+    result["templates"] = templates_view(user)["templates"]
+    try:
+        result["features"] = ModelDownloads.table()
+    except ApiError as err:
+        result["features"] = []
+        result["features_error"] = err.message
+    return result
+
+
+def templates_view(user: Optional[dict] = None) -> dict:
+    user = load_user_settings() if user is None else user
+    default = user.get("default_template") or _wf.DEFAULT_TEMPLATE
+    return {"templates": [_with_enabled(t, user) for t in _wf.templates(user)],
+            "default_template": default}
+
+
 # ---------------------------------------------------------------------------- derived files
 
 class BackgroundBuilder:
-    """Work derived from a finished job that the server does itself (browser previews, the
-    coverage map): one piece at a time, each in a child process (so a big file neither slows
+    """Work derived from a finished job that the server does itself (browser previews): one
+    piece at a time, each in a child process (so a big file neither slows
     the server's own threads nor can it hang them), with a time limit. Requests only queue a
     key (job, what) and report its state; nobody waits for the work. The child dies with the
     server, is stopped when its job is deleted, and is killed after `time_limit` seconds.
@@ -1162,7 +1349,7 @@ class PreviewBuilder(BackgroundBuilder):
     def outdated_outputs(self, job: str, status: dict) -> List[str]:
         """Paths ("output/preview.spz") of the previews in output/ that the viewer does not
         use because they are not what the variant should be (see `find`)."""
-        source = self.source(job, status) if status.get("state") == "done" else None
+        source = self.source(job, status) if status.get("state") in TERMINAL_STATES else None
         if source is None:
             return []
         return ["output/" + PREVIEW_VARIANTS[variant][0] for variant in PREVIEW_VARIANTS
@@ -1173,7 +1360,7 @@ class PreviewBuilder(BackgroundBuilder):
     def state(self, job: str, variant: str, status: dict) -> dict:
         result: Dict[str, Any] = {"variant": variant, "name": PREVIEW_VARIANTS[variant][0],
                                   "max_gaussians": PREVIEW_VARIANTS[variant][1]}
-        source = self.source(job, status) if status.get("state") == "done" else None
+        source = self.source(job, status) if status.get("state") in TERMINAL_STATES else None
         if source is None:
             result["state"] = "no_splat"
             return result
@@ -1196,7 +1383,7 @@ class PreviewBuilder(BackgroundBuilder):
         status = self.app.require_job(job)
         result: Dict[str, Any] = {"variants": {variant: self.state(job, variant, status)
                                                for variant in PREVIEW_VARIANTS}, "source": None}
-        source = self.source(job, status) if status.get("state") == "done" else None
+        source = self.source(job, status) if status.get("state") in TERMINAL_STATES else None
         if source is not None:
             try:
                 info = self.source_info(source)
@@ -1213,8 +1400,8 @@ class PreviewBuilder(BackgroundBuilder):
         """Queue the conversion unless the preview exists or is already on its way."""
         app = self.app
         status = app.require_job(job)
-        if status["state"] != "done":
-            raise ApiError(409, "not_done", "任务完成之后才能生成预览")
+        if status["state"] not in TERMINAL_STATES:
+            raise ApiError(409, "not_done", "任务运行结束之后才能生成预览")
         state = self.state(job, variant, status)
         if state["state"] == "no_splat":
             raise ApiError(409, "no_splat", "找不到高斯点云文件")
@@ -1225,7 +1412,7 @@ class PreviewBuilder(BackgroundBuilder):
 
     def file(self, job: str, variant: str) -> Path:
         status = self.app.require_job(job)
-        source = self.source(job, status) if status["state"] == "done" else None
+        source = self.source(job, status) if status["state"] in TERMINAL_STATES else None
         ready = self.ready_file(job, variant, source) if source is not None else None
         if ready is None:
             raise ApiError(404, "preview_missing", "预览文件还没有生成")
@@ -1235,7 +1422,7 @@ class PreviewBuilder(BackgroundBuilder):
         """Run one conversion. Returns None on success, else the message for the user."""
         app = self.app
         status = app.read_status(job, fresh=True)
-        source = self.source(job, status) if status and status["state"] == "done" else None
+        source = self.source(job, status) if status and status["state"] in TERMINAL_STATES else None
         if source is None:
             return "找不到高斯点云文件"
         name, limit = PREVIEW_VARIANTS[variant]
@@ -1282,179 +1469,17 @@ class PreviewBuilder(BackgroundBuilder):
         return None
 
 
-# ---------------------------------------------------------------------------- coverage map
-
-COVERAGE_UNAVAILABLE = {
-    "not_done": "任务完成之后才能计算拍摄覆盖",
-    "no_splat": "找不到高斯点云文件",
-    "no_cameras": "这个任务没有保存训练用的相机位置，无法计算拍摄覆盖",
-}
-
-
-class CoverageBuilder(BackgroundBuilder):
-    """Computes the coverage map of a finished job (app/coverage.py, in a child process; see
-    BackgroundBuilder) and keeps it in web-preview/ with a note of what it was computed from.
-
-    Inputs, all in the job folder: the splat (as for the previews), the training cameras
-    (dataset/sparse/images.bin + cameras.bin, or dataset/sparse/0/ in newer jobs), the
-    training frame (output/scene_transform.json, else train/run/scene_transform.json; none
-    means the same frame) and the scene's up direction (report.json orientation; without it
-    coverage.py takes the cameras' average up)."""
-
-    label = "coverage"
-    failure = "无法计算拍摄覆盖"
-
-    def __init__(self, app: "App") -> None:
-        super().__init__(app, COVERAGE_TIME_LIMIT_SECONDS)
-
-    def inputs(self, job: str, status: dict) -> Tuple[Optional[dict], Optional[str]]:
-        """({"splat", "images", "cameras", "transform", "up"}, None), or (None, the reason
-        it cannot be computed: a key of COVERAGE_UNAVAILABLE)."""
-        if status.get("state") != "done":
-            return None, "not_done"
-        splat = self.app.previews.source(job, status)
-        if splat is None:
-            return None, "no_splat"
-        job_dir = self.app.job_dir(job)
-
-        def existing(parts: Sequence[str]) -> Optional[Path]:
-            try:
-                path = safe_join(job_dir, parts)
-            except ApiError:
-                return None
-            return path if path.is_file() else None
-
-        sparse = None
-        for folder in (["dataset", "sparse"], ["dataset", "sparse", "0"]):
-            images, cameras = existing(folder + ["images.bin"]), existing(folder + ["cameras.bin"])
-            if images is not None and cameras is not None:
-                sparse = (images, cameras)
-                break
-        if sparse is None:
-            return None, "no_cameras"
-        transform = existing(["output", "scene_transform.json"]) \
-            or existing(["train", "run", "scene_transform.json"])
-        up = None
-        outputs = status.get("outputs")
-        rel = outputs.get("report") if isinstance(outputs, dict) else None
-        report_path = existing(rel.replace("\\", "/").split("/")) if isinstance(rel, str) else None
-        report = read_json(report_path or job_dir / "output" / "report.json")
-        orientation = report.get("orientation") if isinstance(report, dict) else None
-        if isinstance(orientation, dict):
-            vector = orientation.get("up_in_file_coordinates")
-            if isinstance(vector, list) and len(vector) == 3 \
-                    and all(isinstance(v, (int, float)) and v == v and abs(v) < 1e6 for v in vector) \
-                    and sum(v * v for v in vector) > 1e-6:
-                up = [float(v) for v in vector]
-        return {"splat": splat, "images": sparse[0], "cameras": sparse[1],
-                "transform": transform, "up": up}, None
-
-    @staticmethod
-    def made_from(inputs: dict) -> dict:
-        """What the note beside the map records: format version, inputs' sizes and times."""
-        def key(path: Optional[Path]) -> Optional[List[int]]:
-            if path is None:
-                return None
-            info = path.stat()
-            return [info.st_size, info.st_mtime_ns]
-        return {"version": _coverage.FORMAT_VERSION, "splat": key(inputs["splat"]),
-                "images": key(inputs["images"]), "cameras": key(inputs["cameras"]),
-                "transform": key(inputs["transform"]), "up": inputs["up"]}
-
-    def _paths(self, job: str) -> Tuple[Path, Path]:
-        job_dir = self.app.job_dir(job)
-        return (safe_join(job_dir, [PREVIEW_CACHE_DIR, COVERAGE_NAME]),
-                safe_join(job_dir, [PREVIEW_CACHE_DIR, COVERAGE_SOURCE_NAME]))
-
-    def ready_file(self, job: str, inputs: dict) -> Optional[Path]:
-        """The cached map when it was computed from exactly these inputs, else None."""
-        try:
-            out, note = self._paths(job)
-            if not out.is_file():
-                return None
-            return out if read_json(note) == self.made_from(inputs) else None
-        except (ApiError, OSError, ValueError):
-            return None
-
-    def state(self, job: str, status: Optional[dict] = None) -> dict:
-        status = status if status is not None else self.app.require_job(job)
-        inputs, missing = self.inputs(job, status)
-        if inputs is None:
-            return {"state": "unavailable", "reason": missing,
-                    "message": COVERAGE_UNAVAILABLE[missing]}
-        ready = self.ready_file(job, inputs)
-        if ready is not None:
-            try:
-                return {"state": "ready", "size": ready.stat().st_size}
-            except OSError:
-                pass
-        return self._queue_state((job, "coverage"))
-
-    def request(self, job: str) -> dict:
-        """Queue the computation unless the map exists or is already on its way."""
-        status = self.app.require_job(job)
-        state = self.state(job, status)
-        if state["state"] == "unavailable":
-            raise ApiError(409, state["reason"], state["message"])
-        if state["state"] in ("missing", "failed"):
-            self._enqueue((job, "coverage"))
-            state = self.state(job, status)
-        return state
-
-    def file(self, job: str) -> Path:
-        status = self.app.require_job(job)
-        inputs, _missing = self.inputs(job, status)
-        ready = self.ready_file(job, inputs) if inputs is not None else None
-        if ready is None:
-            raise ApiError(404, "coverage_missing", "拍摄覆盖还没有计算")
-        return ready
-
-    def _build(self, job: str, what: str) -> Optional[str]:
-        app = self.app
-        status = app.read_status(job, fresh=True) or {}
-        inputs, missing = self.inputs(job, status)
-        if inputs is None:
-            return COVERAGE_UNAVAILABLE[missing or "no_splat"]
-        made = self.made_from(inputs)
-        folder = safe_join(app.job_dir(job), [PREVIEW_CACHE_DIR])
-        folder.mkdir(exist_ok=True)
-        out, note = self._paths(job)
-        if shutil.disk_usage(folder).free < DISK_RESERVE_BYTES:
-            return "电脑磁盘空间不足，无法计算拍摄覆盖"
-        try:
-            note.unlink()       # the old map no longer counts, whatever happens next
-        except FileNotFoundError:
-            pass
-        returncode, output, reason, seconds = self._run_child(build_coverage_command(
-            inputs["splat"], inputs["images"], inputs["cameras"], out, inputs["transform"],
-            inputs["up"]))
-        log.info("coverage of %s: exit code %s after %.1f s%s", job, returncode, seconds,
-                 ", %s" % reason if reason else "")
-        if reason == "stopped":
-            return "已中断"
-        if reason == "time_limit":
-            return "计算拍摄覆盖超过 %d 分钟，已被停止" % (self.time_limit // 60)
-        if returncode != 0 or not out.is_file():
-            detail = _last_error_line(output)
-            return "无法计算拍摄覆盖（退出码 %s）%s" % (returncode, "：" + detail[:300] if detail else "")
-        try:
-            if self.made_from(inputs) != made:
-                return "任务文件在计算过程中发生了变化，请重试"
-            write_json_atomic(note, made)
-        except (OSError, ValueError) as exc:
-            return "无法保存拍摄覆盖：%s" % exc
-        return None
-
-
 # ---------------------------------------------------------------------------- network weights
 
 class ModelDownloads:
-    """What /api/models reports and does: the state of the weights and licences, recording a
-    licence the person at this PC accepted, and one download at a time.
+    """What /api/models reports and does: the state of the weights, and one download at a time.
+
+    There is no licence step here: every feature works the same way (switching the stage on is
+    the choice, the weights come when the stage starts, the pipeline records the licence).
+    This download is only the optional way to fetch weights ahead of time.
 
     A download is a child process (build_models_command) with a time limit that is killed when
-    the server stops; requests only start it and report where it is. Nothing here accepts a
-    licence by itself: `accept` runs only for an explicit request from a loopback client.
+    the server stops; requests only start it and report where it is.
     """
 
     def __init__(self, app: "App") -> None:
@@ -1471,17 +1496,29 @@ class ModelDownloads:
     # ---- what the API reports
 
     @staticmethod
-    def status() -> dict:
+    def whole_table() -> dict:
+        """models.features_table(), checked for its shape: {"features": [...], "disk_mb"}."""
         try:
-            status = models_status()
-            if not isinstance(status.get("features"), dict) \
-                    or not isinstance(status.get("licences"), dict):
+            table = models_features()
+            if not isinstance(table, dict) or not isinstance(table.get("features"), list) \
+                    or not all(isinstance(f, dict) and isinstance(f.get("id"), str)
+                               and isinstance(f.get("files", []), list)
+                               for f in table["features"]):
                 raise ValueError("unexpected answer")
         except Exception as exc:  # noqa: BLE001 - a damaged settings.json, a missing module ...
             # The page asks again every few seconds and each refused request is logged anyway.
             log.debug("the state of the models could not be read: %r", exc)
             raise ApiError(500, "models_unavailable", "无法读取模型状态：%s" % exc)
-        return status
+        return table
+
+    @classmethod
+    def table(cls) -> List[dict]:
+        return cls.whole_table()["features"]
+
+    @staticmethod
+    def missing_files(feature: dict) -> List[Tuple[str, float]]:
+        return [(str(f.get("name")), float(f.get("mb") or 0)) for f in feature.get("files") or []
+                if isinstance(f, dict) and not f.get("installed")]
 
     def download_view(self) -> dict:
         with self.lock:
@@ -1513,37 +1550,34 @@ class ModelDownloads:
                 "total_mb": sum(row["size_mb"] for row in rows), "files": rows}
 
     def overview(self, *, loopback: bool) -> dict:
-        status = self.status()
-        result = dict(status)
-        result["features"] = {
-            key: dict(info, label=FEATURE_LABELS.get(key, key))
-            for key, info in status["features"].items() if isinstance(info, dict)}
-        result["download"] = self.download_view()
-        result["can_manage"] = bool(loopback)
-        return result
+        whole = self.whole_table()
+        table = whole["features"]
+        lack: Dict[str, float] = {}
+        for feature in table:
+            for f in feature.get("files") or []:
+                if isinstance(f, dict) and not f.get("installed"):
+                    lack[str(f.get("name"))] = float(f.get("mb") or 0)
+        free_mb = None
+        try:
+            probe = models_dir()
+            while not probe.exists() and probe.parent != probe:
+                probe = probe.parent
+            free_mb = int(shutil.disk_usage(probe).free // (1024 * 1024))
+        except Exception:  # noqa: BLE001 - a number for the panel, not worth failing for
+            pass
+        return {"features": table, "disk_mb": whole.get("disk_mb"),
+                "download_mb": round(sum(lack.values())), "free_mb": free_mb,
+                "download": self.download_view(), "can_manage": bool(loopback)}
 
     # ---- actions (loopback clients only: the handler checks)
 
-    def accept(self, ids: Sequence[str]) -> None:
-        known = self.status()["licences"]
-        unknown = [i for i in ids if i not in known]
-        if unknown:
-            raise ApiError(400, "bad_licence", "没有这个许可：%s" % "、".join(unknown)[:200])
-        try:
-            models_accept(list(ids))
-        except ValueError as exc:
-            raise ApiError(400, "bad_licence", "没有这个许可：%s" % exc)
-        except OSError as exc:
-            raise ApiError(500, "io_error", "无法保存许可记录：%s" % exc)
-        log.info("licences accepted by the person at this PC: %s", ", ".join(ids))
-
     def start(self, names: Sequence[str]) -> bool:
-        """Start a download for the features named (none: what the enabled features lack).
-        False when nothing is missing, so nothing was started."""
+        """Start a download for the features named (none: the ones the default template
+        uses). False when nothing is missing, so nothing was started."""
         app = self.app
         with self.lock:
-            features = self.status()["features"]
-            unknown = [n for n in names if n not in features]
+            by_id = {f["id"]: f for f in self.table()}
+            unknown = [n for n in names if n not in by_id]
             if unknown:
                 raise ApiError(400, "bad_feature", "没有这个功能：%s" % "、".join(unknown)[:200])
             if app.stop_event.is_set():
@@ -1552,27 +1586,22 @@ class ModelDownloads:
                 raise ApiError(409, "download_busy", "已经有模型在下载，请等它结束")
             if names:
                 wanted = list(dict.fromkeys(names))
-                waiting = sorted({licence for n in wanted
-                                  for licence in features[n].get("licences_needed") or []})
-                if waiting:
-                    blocked = [FEATURE_LABELS.get(n, n) for n in wanted
-                               if features[n].get("licences_needed")]
-                    raise ApiError(409, "licence_needed", "「%s」要先同意许可（%s）才能下载"
-                                   % ("」「".join(blocked), "、".join(waiting)), licences=waiting)
             else:
-                wanted = [key for key, info in features.items() if info.get("enabled")]
-            wanted = [n for n in wanted if features[n].get("files_missing")]
+                try:
+                    wanted = [n for n in models_default_features() if n in by_id]
+                except Exception as exc:  # noqa: BLE001 - said as the error of this call
+                    raise ApiError(500, "models_unavailable", "无法读取模型状态：%s" % exc)
+            wanted = [n for n in wanted if self.missing_files(by_id[n])]
             files: List[Tuple[str, float]] = []
             for n in wanted:
-                for name in features[n]["files_missing"]:
+                for name, size in self.missing_files(by_id[n]):
                     if name not in [f[0] for f in files]:
-                        files.append((name, models_file_mb(name)))
+                        files.append((name, size))
             if not files:
                 return False
             self._check_disk(files)
             self.state, self.features, self.files, self.error = "running", wanted, files, None
-            # No names: the command line works out by itself what the enabled features lack.
-            cmd = build_models_command(wanted if names else None)
+            cmd = build_models_command(wanted)
             self._thread = threading.Thread(target=self._run, args=(cmd, wanted),
                                             name="scan3d-models", daemon=True)
             self._thread.start()
@@ -1665,11 +1694,10 @@ class ModelDownloads:
             return "下载被中断：扫描程序被关闭了。" + kept
         if reason == "time_limit":
             return "下载超过 %d 小时，已被停止。%s" % (self.time_limit // 3600, kept)
-        # The command line exits with 1 whenever an enabled feature still lacks a file, also
-        # one nobody asked for here: what counts is whether the files asked for have arrived.
-        features = self.status()["features"]
-        if not any((features.get(n) or {}).get("files_missing")
-                   or (features.get(n) or {}).get("licences_needed") for n in wanted):
+        # The command line may exit with 1 for a reason nobody asked about here: what counts is
+        # whether the files asked for have arrived.
+        by_id = {f["id"]: f for f in self.table()}
+        if not any(self.missing_files(by_id.get(n) or {}) for n in wanted):
             return None
         detail = ""
         for line in reversed(output.decode("utf-8", "replace").strip().splitlines()):
@@ -1721,7 +1749,6 @@ class App:
         self.stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self.previews = PreviewBuilder(self)
-        self.coverage = CoverageBuilder(self)
         self.models = ModelDownloads(self)
 
     # ---- lifecycle
@@ -1740,7 +1767,6 @@ class App:
         self.stop_event.set()
         self._wake.set()
         self.previews.shutdown()
-        self.coverage.shutdown()
         self.models.shutdown()
         worker = self._worker
         if worker is not None and worker.is_alive():
@@ -1825,10 +1851,9 @@ class App:
         return names
 
     @staticmethod
-    def _new_status(job: str, state: str, quality: str, message: str) -> dict:
-        return {"job": job, "state": state, "stage": None, "stage_index": 0,
-                "stage_count": len(STAGES), "stage_progress": None, "message": message,
-                "quality": quality, "started_at": None, "updated_at": now_iso(),
+    def _new_status(job: str, state: str, message: str) -> dict:
+        return {"job": job, "state": state, "stage": None, "stage_progress": None,
+                "message": message, "started_at": None, "updated_at": now_iso(),
                 "finished_at": None, "error": None, "pid": None, "outputs": {}}
 
     def _finish(self, job: str, state: str, message: str, *, error: Optional[str] = None,
@@ -1840,6 +1865,7 @@ class App:
                 return
             status.update({"state": state, "message": message, "error": error,
                            "finished_at": now_iso(), "pid": None})
+            self._settle_stages(status, state, error)
             if extra:
                 status.update(extra)
             self.write_status(job, status)
@@ -1847,6 +1873,26 @@ class App:
             log.exception("could not write the final status of %s", job)
 
     # ---- views
+
+    @staticmethod
+    def _settle_stages(status: dict, state: str, error: Optional[str]) -> None:
+        """A run that ended without the pipeline's word (it died, was stopped, was cancelled
+        while queued) leaves stages marked queued or running: a stage that was running
+        failed, one that was only waiting is pending again."""
+        stages = status.get("stages")
+        if not isinstance(stages, dict):
+            return
+        for entry in stages.values():
+            if not isinstance(entry, dict):
+                continue
+            if entry.get("state") == "running":
+                entry["state"] = "failed" if state == "failed" else "pending"
+                if state == "failed":
+                    entry["error"] = entry.get("error") or error
+            elif entry.get("state") == "queued":
+                entry["state"] = "pending"
+            if entry.get("state") != "running":
+                entry["progress"] = None
 
     def list_uploads(self, job: str) -> Tuple[int, int]:
         """(count, total bytes) of the complete uploads of a job."""
@@ -1896,6 +1942,8 @@ class App:
         return files
 
     def log_names(self, job: str) -> List[str]:
+        """pipeline.log, then one log per stage that wrote one (in stage order), any other
+        log of the job, and the launcher's own."""
         job_dir = self.runs_dir / job
         names: List[str] = []
         try:
@@ -1905,32 +1953,77 @@ class App:
                                and e.name.lower().endswith(".log"))
         except OSError:
             pass
-        if "pipeline.log" in names:  # the main log first
-            names.remove("pipeline.log")
-            names.insert(0, "pipeline.log")
+
+        def order(name: str) -> Tuple[int, int, str]:
+            stem = name[:-4]
+            if name == "pipeline.log":
+                return 0, 0, name
+            if stem in STAGES:
+                return 1, STAGES.index(stem), name
+            return 2, 0, name
+
+        names.sort(key=order)
         if (job_dir / "launcher.log").is_file():
             names.append("launcher.log")
         return names
 
+    def workflow_state(self, job: str) -> Tuple[Optional[dict], Optional[str]]:
+        """(pipeline.job_view of the job, None), or (None, why not): a damaged workflow.json
+        must not make the job vanish from the list."""
+        try:
+            return pipeline_job_view(self.runs_dir / job), None
+        except _wf.WorkflowError as exc:
+            return None, "；".join(exc.problems)
+        except Exception as exc:  # noqa: BLE001 - shown in the job's own view
+            log.debug("workflow of %s could not be read", job, exc_info=True)
+            return None, "无法读取流程：%s" % exc
+
     def job_view(self, job: str, status: Optional[dict] = None, *, detail: bool = False,
-                 loopback: bool = False) -> Optional[dict]:
+                 loopback: bool = False,
+                 queue_now: Optional[Tuple[List[str], Optional[str]]] = None) -> Optional[dict]:
         status = status if status is not None else self.read_status(job)
         if status is None:
             return None
         meta = self.read_meta(job)
-        view = self._new_status(job, status["state"], DEFAULT_QUALITY, "")
+        view = self._new_status(job, status["state"], "")
         view["updated_at"] = None
         view.update(status)
-        with self.lock:
-            queue = list(self.queue)
-            current = self.current
+        for key in STATUS_DROPPED:      # fields of jobs made before the workflow redesign
+            view.pop(key, None)
+        if queue_now is None:
+            with self.lock:
+                queue_now = (list(self.queue), self.current)
+        queue, current = queue_now
         state = view["state"]
         view["queue_position"] = queue.index(job) + 1 if job in queue else None
         view["source"] = (meta or {}).get("source", "external")
-        view["options"] = stored_job_options(meta)
         view["created_at"] = (meta or {}).get("created_at")
-        if view.get("quality") not in QUALITIES and meta:
-            view["quality"] = meta.get("quality")
+
+        info, problem = self.workflow_state(job)
+        run = dict(info.get("run") or {}) if info else {}
+        stages = None
+        if info:
+            stages = {sid: dict(entry) if isinstance(entry, dict) else entry
+                      for sid, entry in (info.get("stages") or {}).items()}
+        elif isinstance(status.get("stages"), dict):
+            stages = status["stages"]
+        if state == "queued" and isinstance(status.get("run"), dict):
+            # Queued by the server, not started yet: the plan is the run it asked for.
+            run = dict(status["run"])
+            for sid in run.get("plan") or []:
+                if stages is not None and isinstance(stages.get(sid), dict):
+                    stages[sid].update(state="queued", progress=None)
+        view["run"] = {"to": run.get("to"), "only": list(run.get("only") or []),
+                       "force": list(run.get("force") or []), "plan": list(run.get("plan") or [])}
+        view["template"] = info.get("template") if info else None
+        if problem:
+            view["workflow_error"] = problem
+        if detail:
+            view["stages"] = stages
+            view["workflow"] = info.get("workflow") if info else None
+        else:
+            view["stages"] = stage_overview(stages)
+            view.pop("workflow", None)
 
         started = parse_iso(view.get("started_at"))
         elapsed = None
@@ -1943,10 +2036,13 @@ class App:
         view["elapsed_seconds"] = elapsed
 
         actions: List[str] = []
+        idle = state not in ACTIVE_STATES and job != current
         if state in ACTIVE_STATES:
             actions.append("cancel")
-        if state in (STATE_CREATED, "failed", "cancelled") and meta and job != current:
-            actions.append("start")
+        if idle and meta:
+            actions += ["run", "start"]     # `start` is the old name of `run`
+        if idle:
+            actions.append("edit")          # change the workflow, clear a stage
         if state != "running" and job != current:
             actions.append("delete")
         if loopback:
@@ -1960,7 +2056,7 @@ class App:
             count, total = self.list_uploads(job)
             view["uploads"] = {"count": count, "bytes": total}
             view["output_files"] = self.output_files(job, status)
-            if state == "done":
+            if state in TERMINAL_STATES:
                 try:
                     outdated = self.previews.outdated_outputs(job, status)
                 except (ApiError, OSError, ValueError):
@@ -1969,15 +2065,30 @@ class App:
                     if entry["path"] in outdated:
                         entry["outdated"] = True
             view["logs"] = self.log_names(job)
-            if loopback and state == "done" and self.viewer_exe.is_file() and any(
+            if loopback and state in TERMINAL_STATES and self.viewer_exe.is_file() and any(
                     f["key"] == "splat" for f in view["output_files"]):
                 actions.append("open_viewer")
+            view["licences"], view["models_needed"] = [], []
+            if info:
+                try:
+                    view["changes"] = changes_from_template(info["workflow"],
+                                                            load_user_settings())
+                    needs = workflow_needs(info["workflow"])
+                    view["licences"] = list(needs.get("licences") or [])
+                    view["models_needed"] = list(needs.get("models_needed") or [])
+                except Exception as exc:  # noqa: BLE001 - the rest of the view is still right
+                    log.debug("needs of %s could not be worked out", job, exc_info=True)
+                    view["needs_error"] = "无法确定需要的模型：%s" % exc
         return view
 
     def list_jobs(self, *, loopback: bool = False) -> dict:
+        # The queue is read before the jobs, so that a job is never shown as running while
+        # the list says another one is current.
+        with self.lock:
+            queue_now = (list(self.queue), self.current)
         views = []
         for name in self.job_names():
-            view = self.job_view(name, loopback=loopback)
+            view = self.job_view(name, loopback=loopback, queue_now=queue_now)
             if view is not None:
                 views.append(view)
 
@@ -1989,15 +2100,20 @@ class App:
             return 0.0
 
         views.sort(key=sort_key, reverse=True)
-        with self.lock:
-            return {"jobs": views, "queue": list(self.queue), "current": self.current}
+        return {"jobs": views, "queue": queue_now[0], "current": queue_now[1]}
 
     # ---- actions
 
-    def create_job(self, name: Optional[str], quality: str, *, source: str = "upload",
-                   input_path: Optional[str] = None, options: Optional[dict] = None) -> str:
-        if quality not in QUALITIES:
-            raise ApiError(400, "bad_quality", "质量选项不合法")
+    def resolve_workflow(self, template: Optional[str], override: Optional[dict]) -> dict:
+        """The complete workflow of a template with an override on top (ApiError 400
+        bad_workflow when it does not validate)."""
+        try:
+            return _wf.resolve(template, override, user=load_user_settings())
+        except _wf.WorkflowError as exc:
+            raise bad_workflow(exc)
+
+    def create_job(self, name: Optional[str], workflow: dict, *, source: str = "upload",
+                   input_path: Optional[str] = None) -> str:
         if name is not None and not valid_job_name(name):
             raise ApiError(400, "bad_name",
                            "名称只能包含英文字母、数字、- 和 _，以字母或数字开头，最长 64 个字符")
@@ -2019,13 +2135,18 @@ class App:
             if job is None:
                 raise ApiError(409, "exists", "这个名称已经被使用，请换一个")
             job_dir = self.runs_dir / job
-            if source == "upload":
-                (job_dir / "upload").mkdir()
-                input_path = str(job_dir / "upload")
-            write_json_atomic(job_dir / "server-job.json", {
-                "job": job, "source": source, "input_path": input_path, "quality": quality,
-                "options": dict(options or {}), "created_at": now_iso()})
-            self.write_status(job, self._new_status(job, STATE_CREATED, quality, "等待开始"))
+            try:
+                if source == "upload":
+                    (job_dir / "upload").mkdir()
+                    input_path = str(job_dir / "upload")
+                pipeline_write_workflow(job_dir, workflow)
+                write_json_atomic(job_dir / "server-job.json", {
+                    "job": job, "source": source, "input_path": input_path, "run": None,
+                    "created_at": now_iso()})
+                self.write_status(job, self._new_status(job, STATE_CREATED, "等待开始"))
+            except Exception:
+                remove_tree(job_dir)
+                raise
         return job
 
     def check_local_path(self, raw: Any) -> str:
@@ -2063,13 +2184,46 @@ class App:
             raise ApiError(400, "bad_path", "请选择一个文件夹，或一个视频文件")
         return os.path.abspath(text)
 
-    def start_job(self, job: str, quality: Optional[str] = None,
-                  options: Optional[dict] = None) -> None:
-        """Queue a job. `options` (already checked by check_job_options) replaces the stored
-        switches when it is not None."""
-        if quality is not None and quality not in QUALITIES:
-            raise ApiError(400, "bad_quality", "质量选项不合法")
-        status = self.require_job(job)
+    # ---- running: plan, queue
+
+    def plan_run(self, job: str, to: Optional[str], only: Sequence[str],
+                 force: Sequence[str], *, with_needs: bool = True) -> dict:
+        """What a run with this request would do, without doing it: {"steps": [{"stage",
+        "reason", "label"}], "licences": [...], "models_needed": [...]} for the stages of the
+        plan (`with_needs` False leaves the last two out: queueing does not need them).
+        ApiError 400 with the PlanError's code when it cannot be carried out."""
+        self.require_job(job)
+        info, problem = self.workflow_state(job)
+        if info is None:
+            raise ApiError(409, "bad_workflow", "这个任务的流程设置无法读取：%s" % problem)
+        states = {sid: (entry or {}).get("state") for sid, entry in info["stages"].items()}
+        try:
+            steps = _wf.plan(info["workflow"], states, to=to, only=only or None, force=force)
+        except _wf.PlanError as exc:
+            raise ApiError(400, exc.code, exc.message)
+        ids = [step["stage"] for step in steps]
+        result = {"steps": [dict(step, label=_wf.stage_label(step["stage"])) for step in steps]}
+        if not with_needs:
+            return result
+        try:
+            needs = workflow_needs(info["workflow"])
+        except Exception as exc:  # noqa: BLE001 - said in the plan's own words
+            log.debug("needs of %s could not be worked out", job, exc_info=True)
+            raise ApiError(500, "models_unavailable", "无法确定需要的模型：%s" % exc)
+
+        def of_plan(items: Any) -> list:
+            return [i for i in (items or []) if not isinstance(i, dict) or i.get("stage") is None
+                    or i.get("stage") in ids]
+
+        result["licences"] = of_plan(needs.get("licences"))
+        result["models_needed"] = of_plan(needs.get("models_needed"))
+        return result
+
+    def start_job(self, job: str, to: Optional[str] = None, only: Sequence[str] = (),
+                  force: Sequence[str] = ()) -> dict:
+        """Queue a run of the job. Returns its plan (see plan_run). The job's stored
+        workflow decides what runs; `to`, `only` and `force` narrow or widen this run."""
+        self.require_job(job)
         meta = self.read_meta(job)
         if meta is None:
             raise ApiError(409, "not_startable", "这个任务不是在这里创建的，无法从这里启动")
@@ -2077,11 +2231,8 @@ class App:
             self.check_local_path(meta.get("input_path"))
         with self.lock:
             status = self.require_job(job)
-            state = status["state"]
-            if job == self.current or job in self.queue or state in ACTIVE_STATES:
+            if job == self.current or job in self.queue or status["state"] in ACTIVE_STATES:
                 raise ApiError(409, "already_active", "任务已经在排队或运行")
-            if state == "done":
-                raise ApiError(409, "already_done", "任务已经完成；如需重新扫描请新建任务")
             if self.uploads.get(job):
                 raise ApiError(409, "uploading", "还有文件正在上传，请稍候")
             job_dir = self.runs_dir / job
@@ -2089,21 +2240,120 @@ class App:
                 meta["input_path"] = str(job_dir / "upload")
                 if self.list_uploads(job)[0] == 0:
                     raise ApiError(400, "no_input", "还没有上传任何照片或视频")
-            if quality is not None:
-                meta["quality"] = quality
-            if meta.get("quality") not in QUALITIES:
-                meta["quality"] = DEFAULT_QUALITY
-            if options is not None:
-                meta["options"] = dict(options)
+            plan = self.plan_run(job, to, only, force, with_needs=False)
+            run = {"to": to, "only": list(only), "force": list(force)}
+            meta["run"] = run
             write_json_atomic(job_dir / "server-job.json", meta)
             try:
                 os.unlink(job_dir / "cancel")
             except FileNotFoundError:
                 pass
             remove_tree(job_dir / "upload.part")
-            self.write_status(job, self._new_status(job, "queued", meta["quality"], "排队中"))
+            # What the last run left (outputs, so the results stay viewable) is kept; what
+            # described that run is replaced.
+            queued = dict(status)
+            for key in ("stages", "warnings", "exit_code"):
+                queued.pop(key, None)
+            queued.update(self._new_status(job, "queued", "排队中"))
+            queued["outputs"] = status.get("outputs") or {}
+            queued["run"] = dict(run, plan=[step["stage"] for step in plan["steps"]])
+            self.write_status(job, queued)
             self.queue.append(job)
         self._wake.set()
+        return plan
+
+    def set_workflow(self, job: str, template: Optional[str], override: Optional[dict]) -> None:
+        """Change the stored workflow: with a template, start again from that template's
+        settings plus the override; without, merge the override into what the job has."""
+        self.require_job(job)
+        with self.lock:
+            self._require_idle(job)
+            info, problem = self.workflow_state(job)
+            if template is None:
+                if info is None:
+                    raise ApiError(409, "bad_workflow", "这个任务的流程设置无法读取：%s" % problem)
+                try:
+                    new = _wf.apply_overrides(info["workflow"], override or {})
+                except _wf.WorkflowError as exc:
+                    raise bad_workflow(exc)
+            else:
+                new = self.resolve_workflow(template, override)
+            pipeline_write_workflow(self.runs_dir / job, new)
+
+    def _require_idle(self, job: str) -> None:
+        status = self.require_job(job)
+        if job == self.current or job in self.queue or status["state"] in ACTIVE_STATES:
+            raise ApiError(409, "job_busy", "任务正在排队或运行，请先等它结束或取消")
+
+    def reset_stage(self, job: str, stage: str) -> None:
+        """Delete the result of one stage (its record and what only it produced)."""
+        self.require_job(job)
+        if stage not in STAGES:
+            raise ApiError(400, "unknown_stage", "没有这个阶段：%s" % stage)
+        self._require_idle(job)
+        self.previews.cancel(job)   # a conversion may be reading the splat
+        with self.lock:
+            self._require_idle(job)
+            try:
+                pipeline_reset_stage(self.runs_dir / job, stage)
+            except ValueError as exc:
+                raise ApiError(400, "cannot_reset", str(exc))
+            except OSError as exc:
+                raise ApiError(409, "in_use", "无法清除：文件正被其他程序使用（%s）" % exc)
+            self._status_cache.pop(job, None)
+            self._camera_cache.pop(job, None)
+
+    # ---- the coverage map: a stage like the others, its result is output/coverage.json
+
+    def coverage_file(self, job: str) -> Optional[Path]:
+        try:
+            path = safe_join(self.job_dir(job), list(COVERAGE_FILE))
+        except ApiError:
+            return None
+        return path if path.is_file() else None
+
+    def coverage_state(self, job: str) -> dict:
+        """{"state": ready (plus size, and `stale` when the photos or settings changed since)
+        | missing | queued | building | failed (plus error) | unavailable (plus reason and
+        message)}. Nothing is computed by asking."""
+        status = self.require_job(job)
+        info, _problem = self.workflow_state(job)
+        entry = ((info or {}).get("stages") or {}).get("coverage")
+        entry = entry if isinstance(entry, dict) else {}
+        stage_state = entry.get("state")
+        if status["state"] == "queued" and "coverage" in (status.get("run") or {}).get("plan", []):
+            stage_state = "queued"
+        if stage_state == "queued":
+            return {"state": "queued"}
+        if stage_state == "running":
+            return {"state": "building"}
+        if stage_state == "failed":
+            return {"state": "failed", "error": entry.get("error") or "拍摄覆盖没有算出来"}
+        path = self.coverage_file(job)
+        if path is not None:
+            try:
+                result: Dict[str, Any] = {"state": "ready", "size": path.stat().st_size}
+            except OSError:
+                result = {}
+            if result:
+                if stage_state == "stale":
+                    result["stale"] = True
+                return result
+        if self.previews.source(job, status) is None:
+            return {"state": "unavailable", "reason": "no_splat",
+                    "message": "还没有高斯点云，无法计算拍摄覆盖"}
+        return {"state": "missing", "enabled": stage_state != "disabled"}
+
+    def request_coverage(self, job: str) -> dict:
+        """Queue `--only coverage` unless the map exists (and is current) or is on its way."""
+        state = self.coverage_state(job)
+        if state["state"] == "unavailable":
+            raise ApiError(409, state["reason"], state["message"])
+        if state["state"] in ("queued", "building") or (
+                state["state"] == "ready" and not state.get("stale")):
+            return state
+        self.start_job(job, only=["coverage"])
+        return self.coverage_state(job)
 
     def cancel_job(self, job: str) -> None:
         with self.lock:
@@ -2127,7 +2377,6 @@ class App:
     def delete_job(self, job: str) -> None:
         self.require_job(job)
         self.previews.cancel(job)
-        self.coverage.cancel(job)
         with self.lock:
             status = self.require_job(job)
             if job == self.current or status["state"] == "running":
@@ -2248,9 +2497,11 @@ class App:
             if cancel_file.exists():
                 self._finish(job, "cancelled", "已取消")
                 return
+            run = meta.get("run") if isinstance(meta.get("run"), dict) else {}
             cmd = build_run_command(job, str(meta.get("input_path") or job_dir / "upload"),
-                                    str(meta.get("quality") or DEFAULT_QUALITY),
-                                    stored_job_options(meta) or None)
+                                    to=run.get("to") if isinstance(run.get("to"), str) else None,
+                                    only=_stage_ids(run.get("only"), "only"),
+                                    force=_stage_ids(run.get("force"), "force"))
             env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
             with open(job_dir / "launcher.log", "ab") as launcher_log:
                 launcher_log.write(("\n$ %s\n" % subprocess.list2cmdline(cmd)).encode("utf-8"))
@@ -2834,8 +3085,8 @@ class Handler(BaseHTTPRequestHandler):
             self._require_method("GET", "HEAD")
             info: Dict[str, Any] = {
                 "app": "scan3d", "loopback": self._loopback,
-                "qualities": list(QUALITIES), "default_quality": DEFAULT_QUALITY,
-                "stages": list(STAGES), "extensions": list(ALLOWED_EXTENSIONS),
+                "stages": list(STAGES), "default_template": _default_template_id(),
+                "extensions": list(ALLOWED_EXTENSIONS),
                 "max_upload_bytes": MAX_UPLOAD_BYTES, "server_time": now_iso()}
             if self._loopback:   # the token is in these: never for any other client
                 info["lan_urls"] = lan_urls(app)
@@ -2851,6 +3102,13 @@ class Handler(BaseHTTPRequestHandler):
         if parts and parts[0] == "models":
             self._api_models(parts[1:])
             return
+        if parts == ["workflow", "schema"]:
+            self._require_method("GET", "HEAD")
+            self._send_json(workflow_schema())
+            return
+        if parts and parts[0] == "templates":
+            self._api_templates(parts[1:])
+            return
         if len(parts) < 2 or parts[0] != "jobs":
             raise ApiError(404, "not_found", "接口不存在")
 
@@ -2864,10 +3122,31 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": True})
             else:
                 self._send_json(self._job_or_404(job, fresh=False))
-        elif rest == ["start"]:
+        elif rest in (["run"], ["start"]):     # `start` is the old name of `run`
             self._require_method("POST")
             body = self._read_json_body()
-            app.start_job(job, body.get("quality"), check_job_options(body.get("options")))
+            reject_removed_fields(body)
+            to, only, force = parse_run_request(body)
+            app.start_job(job, to, only, force)
+            self._send_json(self._job_or_404(job), 202)
+        elif rest == ["plan"]:
+            self._require_method("POST")
+            app.require_job(job)
+            body = self._read_json_body()
+            to, only, force = parse_run_request(body)
+            self._send_json(app.plan_run(job, to, only, force))
+        elif rest == ["workflow"]:
+            self._require_method("PUT")
+            app.require_job(job)
+            body = dict(self._read_json_body())
+            template = body.pop("template", None)
+            if template is not None and not isinstance(template, str):
+                raise bad_workflow(_wf.WorkflowError(["template 必须是模板名称"]))
+            app.set_workflow(job, template, check_override(body))
+            self._send_json(self._job_or_404(job))
+        elif len(rest) == 3 and rest[0] == "stages" and rest[2] == "reset":
+            self._require_method("POST")
+            app.reset_stage(job, rest[1])
             self._send_json(self._job_or_404(job))
         elif rest == ["cancel"]:
             self._require_method("POST")
@@ -2917,13 +3196,17 @@ class Handler(BaseHTTPRequestHandler):
         elif rest == ["coverage"]:
             self._require_method("GET", "HEAD", "POST")
             if self.command == "POST":
-                state = app.coverage.request(job)
+                state = app.request_coverage(job)
                 self._send_json(state, 202 if state["state"] in ("queued", "building") else 200)
             else:
-                self._send_json(app.coverage.state(job))
+                self._send_json(app.coverage_state(job))
         elif rest == ["coverage", "data"]:
             self._require_method("GET", "HEAD")
-            self._send_file(app.coverage.file(job), "application/json; charset=utf-8")
+            app.require_job(job)
+            path = app.coverage_file(job)
+            if path is None:
+                raise ApiError(404, "coverage_missing", "拍摄覆盖还没有计算")
+            self._send_file(path, "application/json; charset=utf-8")
         else:
             raise ApiError(404, "not_found", "接口不存在")
 
@@ -2946,19 +3229,35 @@ class Handler(BaseHTTPRequestHandler):
     def _api_create(self) -> None:
         app = self.app
         body = self._read_json_body()
+        reject_removed_fields(body)
         name = body.get("name")
         if name == "":
             name = None   # an empty field means "generate one"; anything else must be valid
-        quality = body.get("quality") or DEFAULT_QUALITY
-        options = check_job_options(body.get("options"))   # before anything is created
+        if name is not None and not valid_job_name(name):
+            raise ApiError(400, "bad_name",
+                           "名称只能包含英文字母、数字、- 和 _，以字母或数字开头，最长 64 个字符")
+        template = body.get("template")
+        if template is not None and not isinstance(template, str):
+            raise bad_workflow(_wf.WorkflowError(["template 必须是模板名称"]))
+        to, only, force = parse_run_request(body)
+        start = bool(body.get("start"))
+        if (to or only or force) and not start:
+            raise ApiError(400, "bad_request", "to、only、force 只能和 start 一起用")
+        workflow = app.resolve_workflow(template or None, check_override(body.get("workflow")))
         if body.get("path") is not None:
             self._require_loopback()
             path = app.check_local_path(body.get("path"))
-            job = app.create_job(name, quality, source="path", input_path=path, options=options)
-            if body.get("start"):
-                app.start_job(job)
+            if start:    # a request that cannot be run must not leave a job behind
+                try:
+                    _wf.plan(workflow, _wf.stage_states(workflow, {}), to=to, only=only or None,
+                             force=force)
+                except _wf.PlanError as exc:
+                    raise ApiError(400, exc.code, exc.message)
+            job = app.create_job(name, workflow, source="path", input_path=path)
+            if start:
+                app.start_job(job, to, only, force)
         else:
-            job = app.create_job(name, quality, options=options)
+            job = app.create_job(name, workflow)
         self._send_json(self._job_or_404(job), 201)
 
     def _api_models(self, rest: List[str]) -> None:
@@ -2966,14 +3265,6 @@ class Handler(BaseHTTPRequestHandler):
         if not rest:
             self._require_method("GET", "HEAD")
             self._send_json(downloads.overview(loopback=self._loopback))
-        elif rest == ["accept"]:
-            self._require_method("POST")
-            self._require_loopback()
-            ids = self._read_json_body().get("licences")
-            if not isinstance(ids, list) or not ids or not all(isinstance(i, str) for i in ids):
-                raise ApiError(400, "bad_licence", "请指明要同意哪些许可")
-            downloads.accept(ids)
-            self._send_json(downloads.overview(loopback=True))
         elif rest == ["download"]:
             self._require_method("POST")
             self._require_loopback()
@@ -2986,6 +3277,90 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(downloads.overview(loopback=True), 202 if started else 200)
         else:
             raise ApiError(404, "not_found", "接口不存在")
+
+    def _api_templates(self, rest: List[str]) -> None:
+        app = self.app
+        if not rest:
+            self._require_method("GET", "HEAD")
+            self._send_json(templates_view())
+            return
+        if len(rest) != 1:
+            raise ApiError(404, "not_found", "接口不存在")
+        tid = rest[0]
+        self._require_method("PUT", "DELETE")
+        self._require_loopback()
+        body = self._read_json_body() if self.command == "PUT" else {}
+        with app.lock:      # read, change, write: one at a time
+            user = copy.deepcopy(load_user_settings())
+            if self.command == "DELETE":
+                self._delete_template(tid, user)
+            elif tid == "default":
+                self._set_default_template(body.get("id"), user)
+            else:
+                self._save_template(tid, body, user)
+            self._send_json(templates_view(user))
+
+    @staticmethod
+    def _set_default_template(tid: Any, user: dict) -> None:
+        if not isinstance(tid, str) or tid not in [t["id"] for t in _wf.templates(user)]:
+            raise ApiError(400, "bad_template", "没有这个模板：%s" % (tid,))
+        try:
+            _wf.resolve(tid, user=user)
+        except _wf.WorkflowError as exc:
+            raise bad_workflow(exc)
+        user["default_template"] = tid
+        save_user_settings(user)
+
+    @staticmethod
+    def _delete_template(tid: str, user: dict) -> None:
+        saved = user.get("templates") if isinstance(user.get("templates"), dict) else {}
+        if tid not in saved:
+            if tid in _wf.TEMPLATES:
+                raise ApiError(409, "builtin_template", "内置模板不能删除")
+            raise ApiError(404, "not_found", "没有这个模板")
+        users = [other for other, entry in saved.items()
+                 if other != tid and isinstance(entry, dict) and entry.get("base") == tid]
+        if users:
+            raise ApiError(409, "template_in_use", "「%s」是别的模板的基础，先删除它们：%s"
+                           % (tid, "、".join(users)))
+        del saved[tid]
+        user["templates"] = saved
+        if user.get("default_template") == tid:
+            del user["default_template"]
+        save_user_settings(user)
+
+    @staticmethod
+    def _save_template(tid: str, body: dict, user: dict) -> None:
+        if not valid_template_id(tid):
+            raise ApiError(400, "bad_name", "模板名称只能包含英文字母、数字、- 和 _，最长 64 个字符")
+        label, desc = body.get("label"), body.get("desc", "")
+        if not isinstance(label, str) or not label.strip() or len(label) > MAX_TEMPLATE_LABEL:
+            raise ApiError(400, "bad_request", "请给模板起一个名字（最多 %d 个字）" % MAX_TEMPLATE_LABEL)
+        if not isinstance(desc, str) or len(desc) > 300:
+            raise ApiError(400, "bad_request", "模板说明必须是文字，最多 300 个字")
+        stages = body.get("stages", {})
+        if not isinstance(stages, dict):
+            raise bad_workflow(_wf.WorkflowError(["stages 必须是对象：{阶段: {enabled, params}}"]))
+        known = [t["id"] for t in _wf.templates(user)]
+        base = body.get("base") or _wf.DEFAULT_TEMPLATE
+        if not isinstance(base, str) or base not in known or base == tid and tid not in _wf.TEMPLATES:
+            raise bad_workflow(_wf.WorkflowError(["没有这个基础模板：%s" % (base,)]))
+        saved = user.get("templates") if isinstance(user.get("templates"), dict) else {}
+        if tid not in saved and len(saved) >= MAX_USER_TEMPLATES:
+            raise ApiError(409, "too_many_templates", "自己保存的模板太多了（最多 %d 个）"
+                           % MAX_USER_TEMPLATES)
+        saved = dict(saved)
+        saved[tid] = {"label": label.strip(), "desc": desc.strip(), "base": base,
+                      "stages": stages}
+        trial = dict(user, templates=saved)
+        try:
+            # the template must resolve, and the override must name real stages and parameters
+            resolved = _wf.resolve(tid, None, user=trial)
+            _wf.validate(copy.deepcopy(resolved), overrides=stages)
+        except _wf.WorkflowError as exc:
+            raise bad_workflow(exc)
+        user["templates"] = saved
+        save_user_settings(user)
 
     def _upload_paths(self, job: str, name: str) -> Tuple[Path, Path]:
         if not valid_component(name):

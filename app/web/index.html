@@ -13,6 +13,24 @@
 </head>
 <body>
 
+<!-- icons used with <use href="#i-name"> (drawn with currentColor) -->
+<svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="i-done" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 12.5l2.7 2.7L16 9.5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-failed" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M9 9l6 6M15 9l-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+    <symbol id="i-queued" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 7v5l3.2 2" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-pending" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/></symbol>
+    <symbol id="i-disabled" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2" stroke-dasharray="3.2 3.2"/><path d="M8.5 12h7" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/></symbol>
+    <symbol id="i-run" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2" opacity="0.25"/><path d="M21 12a9 9 0 0 0-9-9" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-stale" viewBox="0 0 24 24"><path d="M20 12a8 8 0 1 1-2.6-5.9" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/><path d="M20.5 3.5v5h-5" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5.5" y="11" width="13" height="9.5" rx="2.2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8.5 11V8a3.5 3.5 0 0 1 7 0v3" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2" fill="currentColor"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></symbol>
+    <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.5 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+  </defs>
+</svg>
+
 <header class="topbar">
   <a class="brand" href="#/">
     <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
@@ -21,30 +39,28 @@
     </svg>
     <span>三维扫描</span>
   </a>
-  <span class="conn" id="conn" hidden></span>
 </header>
 
-<main>
-  <div class="banner" id="banner" role="status" hidden></div>
+<div class="banner" id="banner" role="status" hidden></div>
 
-  <!-- ===================================================== home: new scan + job list -->
+<div class="shell">
+  <!-- ===================================================== the task list -->
+  <aside class="side" id="side" aria-labelledby="side-title">
+    <div class="side-head">
+      <h2 id="side-title">任务 <span class="count" id="side-count"></span></h2>
+      <a class="btn small primary" href="#/" id="btn-new"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"/></svg>新建任务</a>
+    </div>
+    <p class="empty" id="jobs-empty">还没有任务。</p>
+    <ul class="job-list" id="job-list"></ul>
+  </aside>
+
+  <main class="content" id="content">
+
+  <!-- ===================================================== home: new task -->
   <div id="view-home">
-    <!-- The network weights the features need and the licences they come under. One line
-         while nothing a default scan needs is missing; the rows are built by app.js. -->
-    <details class="card slim models" id="models-card" hidden>
-      <summary>
-        <h2>模型与许可</h2>
-        <span class="models-summary" id="models-summary"></span>
-      </summary>
-      <p class="hint">部分功能要用到第三方模型。带许可的模型，需要你本人同意许可后才会下载和使用；没同意的功能会被跳过，其余照常运行。</p>
-      <ul class="model-list" id="model-list"></ul>
-      <p class="hint" id="models-remote" hidden>同意许可和下载模型要在运行扫描程序的电脑上操作。</p>
-      <p class="form-error" id="models-error" role="alert" hidden></p>
-    </details>
-
     <section class="card" id="new-scan" aria-labelledby="new-scan-title">
-      <h1 id="new-scan-title">新建扫描</h1>
-      <p class="lead">围绕物体或场景拍一组照片或一段视频，电脑会算出相机位置、训练三维高斯并生成网格模型。</p>
+      <h1 id="new-scan-title">新建任务</h1>
+      <p class="lead">围绕物体或场景拍一组照片或一段视频。每个任务有一张工作流图：可以只做到高斯，也可以再加网格，每一步单独运行。</p>
 
       <div class="tabs" id="source-tabs" role="tablist" hidden>
         <button type="button" class="tab is-active" id="tab-upload" role="tab" aria-selected="true">上传照片或视频</button>
@@ -75,44 +91,11 @@
         <p class="hint">文件夹里放图片和（或）视频；也可以直接填一个视频文件的路径。文件不会被复制或修改。</p>
       </div>
 
-      <fieldset class="quality" id="quality">
-        <legend>质量</legend>
-        <label class="quality-option">
-          <input type="radio" name="quality" value="preview">
-          <span class="quality-body">
-            <span class="quality-name">预览</span>
-            <span class="quality-desc">约 35 分钟，其中网格要约半小时。高斯细节比较粗，只用来确认素材能不能用。</span>
-          </span>
-        </label>
-        <label class="quality-option">
-          <input type="radio" name="quality" value="standard" checked>
-          <span class="quality-body">
-            <span class="quality-name">标准</span>
-            <span class="quality-desc">约 50 分钟（训练约 20 分钟，网格约半小时）。适合大多数场景。</span>
-          </span>
-        </label>
-        <label class="quality-option">
-          <input type="radio" name="quality" value="high">
-          <span class="quality-body">
-            <span class="quality-name">高质量</span>
-            <span class="quality-desc">约 1.5–2 小时（估计，没完整跑过）。300 万个高斯，近看更清晰，文件更大，照片少于 150 张时提升有限。</span>
-          </span>
-        </label>
+      <fieldset class="quality" id="tpl-picker" hidden>
+        <legend>模板：要做到哪一步</legend>
+        <div class="quality-grid" id="tpl-options"></div>
+        <p class="hint tpl-hint">模板只是起点：建好任务后，工作流图里每个阶段的开关和参数都能再改。同一时间只运行一个任务，其余的会排队。</p>
       </fieldset>
-      <p class="hint">耗时以 130 张照片、RTX 5070 Ti 笔记本显卡为参考，实际取决于素材数量和显卡性能。同一时间只运行一个任务，其余的会排队。</p>
-
-      <fieldset class="seg scan-kind" id="scan-kind">
-        <legend>扫描类型</legend>
-        <label><input type="radio" name="scan-kind" value="scene" checked><span>场景</span></label>
-        <label><input type="radio" name="scan-kind" value="object"><span>物体（只保留主体，背景不重建）</span></label>
-      </fieldset>
-      <p class="hint option-note" id="scan-kind-note" hidden></p>
-
-      <label class="check" for="opt-masks">
-        <input type="checkbox" id="opt-masks" checked aria-describedby="opt-masks-note">
-        <span>抠除画面里的人</span>
-      </label>
-      <p class="hint option-note" id="opt-masks-note" hidden></p>
 
       <label class="field">
         <span class="field-label">名称（可选）</span>
@@ -120,6 +103,12 @@
                maxlength="64" placeholder="留空则自动生成，例如 scan-20260101-120000">
         <span class="hint">只能用英文字母、数字、- 和 _。</span>
       </label>
+
+      <label class="check" for="opt-start">
+        <input type="checkbox" id="opt-start" checked>
+        <span>素材备好后马上按模板运行</span>
+      </label>
+      <p class="hint option-note">不勾选的话，只建好任务，先去看工作流图、调整要做的阶段，再点「运行」。</p>
 
       <div class="upload-progress" id="upload-progress" hidden>
         <div class="progress"><div class="progress-bar" id="upload-bar"></div></div>
@@ -130,7 +119,7 @@
       <p class="form-error" id="form-error" role="alert" hidden></p>
 
       <div class="actions">
-        <button type="button" class="btn primary" id="btn-start">开始扫描</button>
+        <button type="button" class="btn primary" id="btn-start">上传并运行</button>
         <button type="button" class="btn" id="btn-abort" hidden>取消上传</button>
       </div>
     </section>
@@ -147,57 +136,75 @@
       </div>
     </section>
 
-    <section class="jobs" aria-labelledby="jobs-title">
-      <h2 id="jobs-title">扫描记录</h2>
-      <p class="empty" id="jobs-empty">还没有扫描记录。</p>
-      <ul class="job-list" id="job-list"></ul>
-    </section>
+    <!-- The network weights the features need. Nothing here blocks a run: weights download by
+         themselves when a stage that needs them starts. -->
+    <details class="card slim models" id="models-card" hidden>
+      <summary>
+        <h2>模型</h2>
+        <span class="models-summary" id="models-summary"></span>
+      </summary>
+      <p class="hint">打开某个功能，用到的模型会在那一步开始时自动下载，也可以在这里提前下载。使用即表示同意各模型的协议（链接在每一项里）。</p>
+      <ul class="model-list" id="model-list"></ul>
+      <p class="hint" id="models-disk"></p>
+      <p class="hint" id="models-remote" hidden>提前下载要在运行扫描程序的电脑上操作。</p>
+      <p class="form-error" id="models-error" role="alert" hidden></p>
+    </details>
   </div>
 
-  <!-- ===================================================== detail of one job -->
+  <!-- ===================================================== one task -->
   <div id="view-detail" hidden>
-    <a class="back" href="#/">‹ 返回列表</a>
+    <a class="back" href="#/"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-back"/></svg>全部任务</a>
 
-    <section class="card">
-      <div class="detail-head">
-        <h1 id="d-name"></h1>
-        <span class="badge" id="d-state"></span>
+    <section class="card job-head" aria-labelledby="d-name">
+      <div class="head-row">
+        <div class="head-title">
+          <h1 id="d-name"></h1>
+          <span class="badge" id="d-state"></span>
+        </div>
+        <div class="head-actions">
+          <button type="button" class="btn primary run-btn" id="btn-job-start" hidden><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-play"/></svg>运行</button>
+          <button type="button" class="btn danger" id="btn-job-cancel" hidden>停止</button>
+          <button type="button" class="btn" id="btn-job-folder" hidden>打开任务文件夹</button>
+          <button type="button" class="btn quiet-danger" id="btn-job-delete" hidden>删除</button>
+        </div>
       </div>
       <p class="meta" id="d-meta"></p>
-
-      <ol class="stages" id="d-stages"></ol>
-
-      <div class="progress-row" id="d-progress-row" hidden>
-        <div class="progress" id="d-progress"><div class="progress-bar" id="d-bar"></div></div>
-        <span class="progress-percent" id="d-percent"></span>
-      </div>
       <p class="message" id="d-message" role="status"></p>
 
       <div class="error-box" id="d-error" role="alert" hidden>
-        <h2>扫描失败</h2>
+        <h2 id="d-error-title">运行失败</h2>
         <pre id="d-error-text"></pre>
+        <p class="hint">点上面的「运行」会从没做完的地方继续；失败的阶段在图里是红色，选中它能看到原因和日志。</p>
       </div>
-
       <ul class="warn-box" id="d-warnings" hidden></ul>
 
-      <div class="outputs" id="d-outputs" hidden>
-        <h2>输出文件</h2>
-        <ul class="output-list" id="d-output-list"></ul>
-        <div class="actions">
-          <button type="button" class="btn" id="btn-open-folder" hidden>打开输出文件夹</button>
-          <button type="button" class="btn" id="btn-open-viewer" hidden>在查看器中打开</button>
+      <div class="nextrun" id="d-next" aria-live="polite">
+        <p class="next-title" id="d-next-title"></p>
+        <div class="chips" id="d-next-chips"></div>
+        <div class="next-extra" id="d-next-extra"></div>
+      </div>
+      <p class="form-error" id="d-action-error" role="alert" hidden></p>
+    </section>
+
+    <!-- ===================================================== the workflow graph -->
+    <section class="card graph-card" id="wf-card" aria-labelledby="wf-title">
+      <div class="wf-head">
+        <h2 id="wf-title">工作流</h2>
+        <button type="button" class="btn small tpl-btn" id="wf-template-btn" aria-expanded="false" aria-controls="wf-templates">模板：<span id="wf-template-name"></span> ▾</button>
+      </div>
+      <p class="hint" id="wf-busy-note"></p>
+      <div class="templates" id="wf-templates" hidden></div>
+      <div class="graph-wrap" id="wf-wrap">
+        <div class="graph" id="wf-graph">
+          <svg class="edges" id="wf-edges" aria-hidden="true" focusable="false"></svg>
         </div>
       </div>
-
-      <p class="form-error" id="d-action-error" role="alert" hidden></p>
-
-      <div class="actions" id="d-actions">
-        <button type="button" class="btn primary" id="btn-job-start" hidden>开始扫描</button>
-        <button type="button" class="btn danger" id="btn-job-cancel" hidden>取消任务</button>
-        <button type="button" class="btn" id="btn-job-folder" hidden>打开任务文件夹</button>
-        <button type="button" class="btn quiet-danger" id="btn-job-delete" hidden>删除</button>
-      </div>
+      <ul class="legend" id="wf-legend" aria-label="状态说明"></ul>
+      <p class="hint">点一个阶段看它的参数和结果；阶段上的开关决定这个阶段做不做。灰色虚线的阶段没有打开；带锁的开关表示它是必需的，或者别的阶段要用它。</p>
     </section>
+
+    <span id="np-home"></span>
+    <section class="card node-panel" id="np" hidden></section>
 
     <!-- ===================================================== everything in output/, in the page -->
     <section class="card viewer" id="d-viewer" hidden>
@@ -281,6 +288,15 @@
       </div>
     </section>
 
+    <details class="card outputs" id="d-outputs" hidden>
+      <summary id="d-outputs-count">输出文件</summary>
+      <ul class="output-list" id="d-output-list"></ul>
+      <div class="actions">
+        <button type="button" class="btn" id="btn-open-folder" hidden>打开输出文件夹</button>
+        <button type="button" class="btn" id="btn-open-viewer" hidden>在查看器中打开</button>
+      </div>
+    </details>
+
     <details class="card log" id="d-log">
       <summary>运行日志</summary>
       <div class="log-tools">
@@ -291,12 +307,15 @@
       <pre class="log-text" id="d-log-text" tabindex="0"></pre>
     </details>
   </div>
-</main>
+  </main>
+</div>
 
 <!-- shown when the page itself cannot run -->
 <noscript><p class="noscript">这个页面需要启用 JavaScript。</p></noscript>
 
+<script src="/static/common.js"></script>
 <script src="/static/jobview.js"></script>
+<script src="/static/workflow.js"></script>
 <script src="/static/app.js"></script>
 </body>
 </html>
