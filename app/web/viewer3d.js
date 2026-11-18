@@ -14,17 +14,31 @@
  * are loaded "precise" (Spark's extended splats: float positions, near-exact SH); by default
  * Spark packs positions into 16-bit floats and the SH bands into 7, 8 and 6 bits, which is what
  * the reduced preview gets, to save memory. Splat files are decoded while they download.
+ *
+ * "Coverage" mode shows the same splat (whatever quality is loaded; nothing is downloaded
+ * for it but the small coverage map from the server, see app/coverage.py) with each Gaussian
+ * coloured by how well the photos saw the place it is in. This uses Spark's per-splat colour
+ * override (splatRgba): the splat itself is not changed, and dropping the override brings
+ * the normal colours back. Training cameras are drawn as white dots; a weak region picked
+ * in the list is drawn white, with a camera frustum where to stand to photograph it.
  */
 import * as THREE from "three";
 import { OrbitControls } from "three/addons/controls/OrbitControls.js";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
-import { SparkRenderer, SplatMesh } from "@sparkjsdev/spark";
+import { SparkRenderer, SplatMesh, RgbaArray } from "@sparkjsdev/spark";
 
 const MAX_PIXEL_RATIO = 2;          // sharper than this costs a phone far more than it shows
 const BACKGROUND = 0x1b1f24;
 const WIRE_COLOUR = 0x39e58c;
 const SOLID_COLOUR = 0x9fb2c6;
 const CAMERA_STOPS = 12;            // "next viewpoint" walks through about this many cameras
+// Coverage colours by level (0 weak, 1 medium, 2 strong): the Okabe-Ito vermillion, yellow and
+// blue, which stay apart for the common kinds of colour blindness (and differ in brightness).
+// jobview.js draws the legend with the same three.
+export const COVERAGE_COLOURS = [[213, 94, 0], [240, 228, 66], [0, 114, 178]];
+const COVERAGE_NONE = [118, 118, 118];       // not judged (far background, faint floaters)
+const COVERAGE_PICKED = [255, 255, 255];     // the weak region picked in the list
+const MARKER_COLOUR = 0xffffff;
 
 export function webgl2Supported() {
   try {
@@ -109,6 +123,91 @@ function disposeObject(root) {
   });
 }
 
+// Line segments built piece by piece (camera frustums, the way to a region).
+class LineList {
+  constructor() { this.points = []; }
+  line(a, b) { this.points.push(a.x, a.y, a.z, b.x, b.y, b.z); }
+  frustum(position, forward, up, size) {
+    const apex = new THREE.Vector3().fromArray(position);
+    const f = new THREE.Vector3().fromArray(forward);
+    if (!isFinite(apex.lengthSq()) || !(f.lengthSq() > 1e-12)) { return; }
+    f.normalize();
+    let r = new THREE.Vector3().crossVectors(f, up);
+    if (r.lengthSq() < 1e-8) { r = new THREE.Vector3(1, 0, 0); }
+    r.normalize();
+    const u = new THREE.Vector3().crossVectors(r, f).normalize();
+    const centre = apex.clone().addScaledVector(f, size);
+    const corners = [[1, 1], [-1, 1], [-1, -1], [1, -1]].map(([a, b]) =>
+      centre.clone().addScaledVector(r, a * size * 0.6).addScaledVector(u, b * size * 0.45));
+    for (let i = 0; i < 4; i++) {
+      this.line(apex, corners[i]);
+      this.line(corners[i], corners[(i + 1) % 4]);
+    }
+    // a tick on the top edge, so up and down can be told apart
+    this.line(centre.clone().addScaledVector(u, size * 0.45), centre.clone().addScaledVector(u, size * 0.75));
+  }
+  build(colour, opacity) {
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(this.points, 3));
+    // transparent: drawn after the splats (which are), so they cannot paint over it
+    const material = new THREE.LineBasicMaterial({ color: colour, transparent: true, opacity, depthTest: false });
+    const lines = new THREE.LineSegments(geometry, material);
+    lines.renderOrder = 20;       // over the splats: these are markers, not scenery
+    return lines;
+  }
+}
+
+function decodeBase64(text, Type) {
+  const raw = atob(String(text || ""));
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) { bytes[i] = raw.charCodeAt(i); }
+  if (bytes.length % Type.BYTES_PER_ELEMENT) { throw new Error("覆盖数据已损坏"); }
+  return new Type(bytes.buffer);
+}
+
+/* One colour per Gaussian from the voxel it lies in (the map's voxels carry a level and, for
+ * the listed weak regions, the region number). The colour keeps some of the Gaussian's own
+ * brightness so the scene stays recognisable; the opacity is the Gaussian's own. */
+function colourByCoverage(mesh, data, count) {
+  const grid = data.grid || {}, voxels = data.voxels || {};
+  const origin = grid.origin, size = grid.voxel, dims = grid.dims;
+  if (!Array.isArray(origin) || origin.length !== 3 || !Array.isArray(dims) || dims.length !== 3 || !(size > 0)) {
+    throw new Error("覆盖数据格式不对");
+  }
+  const keys = decodeBase64(voxels.keys, Uint32Array), level = decodeBase64(voxels.level, Uint8Array);
+  const region = voxels.region ? decodeBase64(voxels.region, Uint8Array) : new Uint8Array(keys.length);
+  if (level.length !== keys.length || region.length !== keys.length) { throw new Error("覆盖数据已损坏"); }
+  const lookup = new Map();
+  for (let i = 0; i < keys.length; i++) { lookup.set(keys[i], level[i] | (region[i] << 4)); }
+  const [ox, oy, oz] = origin, [nx, ny, nz] = dims;
+  const base = new Uint8Array(Math.max(1, Math.ceil(count / 2048)) * 2048 * 4);
+  const regionOf = new Uint8Array(count);
+  const counts = { weak: 0, medium: 0, strong: 0, none: 0 };
+  const names = ["weak", "medium", "strong"];
+  mesh.forEachSplat((index, center, _scales, _quaternion, opacity, colour) => {
+    if (index >= count) { return; }
+    const a = Math.floor((center.x - ox) / size), b = Math.floor((center.y - oy) / size), c = Math.floor((center.z - oz) / size);
+    let value;
+    if (a >= 0 && b >= 0 && c >= 0 && a < nx && b < ny && c < nz) { value = lookup.get(a + nx * (b + ny * c)); }
+    let rgb = COVERAGE_NONE;
+    if (value === undefined || !COVERAGE_COLOURS[value & 15]) {
+      counts.none++;
+    } else {
+      rgb = COVERAGE_COLOURS[value & 15];
+      counts[names[value & 15]]++;
+      regionOf[index] = value >> 4;
+    }
+    const light = Math.min(1, Math.max(0, 0.3 * colour.r + 0.59 * colour.g + 0.11 * colour.b));
+    const k = 0.45 + 0.55 * light;
+    const at = 4 * index;
+    base[at] = rgb[0] * k;
+    base[at + 1] = rgb[1] * k;
+    base[at + 2] = rgb[2] * k;
+    base[at + 3] = Math.round(Math.min(1, Math.max(0, opacity)) * 255);
+  });
+  return { data, object: mesh, base, regionOf, count, counts, rgba: null, picked: 0 };
+}
+
 export class Viewer3D {
   /* stage: the element the canvas goes into.
    * hooks: onProgress({label, loaded, total}) while loading (total 0: unknown),
@@ -119,6 +218,8 @@ export class Viewer3D {
     this.generation = 0;
     this.abort = null;
     this.loaded = { splat: null, mesh: null, collision: null };   // kind -> {url, object}
+    this.coverage = null;       // while colouring: {data, object, base, regionOf, rgba, picked, ...}
+    this.markers = null;        // THREE.Group: training cameras and the suggested position
     this.mode = null;
     this.style = "wire";
     this.rotation = new THREE.Quaternion();
@@ -230,7 +331,7 @@ export class Viewer3D {
     this.setState("loading");
 
     const need = {
-      splat: config.mode === "splat" || config.mode === "overlay",
+      splat: config.mode === "splat" || config.mode === "overlay" || config.mode === "coverage",
       mesh: config.mode === "mesh",
       collision: config.mode === "collision" || config.mode === "overlay"
     };
@@ -274,10 +375,18 @@ export class Viewer3D {
       return;
     }
     this.applyStyle();
+    let coverage = null;
+    try {
+      coverage = this.applyCoverage(config.mode === "coverage" ? config.coverage : null);
+    } catch (error) {
+      this.clearCoverage();
+      this.fail("无法显示拍摄覆盖（" + String((error && error.message) || error).slice(0, 120) + "）");
+      return;
+    }
     if (!this.framed) { this.resetView(); this.framed = true; }
     this.forceFrames = 30;     // sorting the splats takes a few frames to settle
     this.setState("ready");
-    this.hooks.onReady({ splats: this.splatCount(), shDegree: this.splatShDegree() });
+    this.hooks.onReady({ splats: this.splatCount(), shDegree: this.splatShDegree(), coverage });
   }
 
   splatCount() {
@@ -375,6 +484,7 @@ export class Viewer3D {
   drop(kind) {
     const have = this.loaded[kind];
     if (!have) { return; }
+    if (kind === "splat") { this.clearCoverage(); }
     this.loaded[kind] = null;
     this.disposeLoaded(kind, have.object);
     this.dirty = true;
@@ -405,6 +515,125 @@ export class Viewer3D {
   setStyle(style) {
     this.style = style;
     this.applyStyle();
+  }
+
+  // ---- coverage
+
+  /* Colour the loaded splat by `data` (the server's coverage map), or back to normal when
+   * data is null. Returns the number of Gaussians per level {weak, medium, strong, none}. */
+  applyCoverage(data) {
+    const have = this.loaded.splat;
+    if (!data || !have) { this.clearCoverage(); return null; }
+    let state = this.coverage;
+    if (!state || state.data !== data || state.object !== have.object) {
+      this.clearCoverage();
+      state = this.coverage = colourByCoverage(have.object, data, this.splatCount());
+    }
+    state.picked = 0;
+    this.setOverride(state.base);
+    this.showMarkers(data, null);
+    return state.counts;
+  }
+
+  setOverride(colours) {
+    const state = this.coverage, mesh = state.object;
+    if (state.rgba) { state.rgba.dispose(); }
+    state.rgba = new RgbaArray({ array: colours, count: state.count });
+    mesh.splatRgba = state.rgba;
+    mesh.updateGenerator();
+    this.forceFrames = 10;
+    this.dirty = true;
+  }
+
+  clearCoverage() {
+    const state = this.coverage;
+    this.coverage = null;
+    if (state) {
+      try {
+        if (state.object.splatRgba) { state.object.splatRgba = null; state.object.updateGenerator(); }
+      } catch (e) { /* the splat is already gone */ }
+      if (state.rgba) { state.rgba.dispose(); }
+    }
+    if (this.markers) {
+      this.scene.remove(this.markers);
+      disposeObject(this.markers);
+      this.markers = null;
+    }
+    this.dirty = true;
+  }
+
+  /* Show weak region `number` (1, 2, ...) in white and mark where to stand; 0: none. Moves
+   * the view: "suggest" to the suggested position, looking at the region the way the new
+   * photo should (the marker there shows once the view is turned or zoomed out; without a
+   * suggestion: as "photo"); "photo" to where the nearest photo was taken, looking at it. */
+  pickRegion(number, go) {
+    const state = this.coverage;
+    if (!state) { return; }
+    const region = (state.data.regions || []).find((r) => r.number === number) || null;
+    state.picked = region ? number : 0;
+    if (region) {
+      const colours = state.base.slice();
+      const of = state.regionOf;
+      for (let i = 0; i < state.count; i++) {
+        if (of[i] === number) { colours.set(COVERAGE_PICKED, 4 * i); }
+      }
+      this.setOverride(colours);
+    } else {
+      this.setOverride(state.base);
+    }
+    this.showMarkers(state.data, region);
+    if (!region) { return; }
+    if (go === "suggest" && region.suggest) {
+      this.lookFrom(region.suggest.position, region.suggest.target);
+    } else if (go === "photo" || go === "suggest") {
+      const camera = (state.data.cameras || []).find((c) => c.name === region.nearest_photo);
+      if (camera) { this.lookFrom(camera.position, region.center); }
+    }
+  }
+
+  // Stand at `position`, look at `target` (both in splat coordinates).
+  lookFrom(position, target) {
+    const from = new THREE.Vector3().fromArray(position).applyQuaternion(this.rotation);
+    const to = new THREE.Vector3().fromArray(target).applyQuaternion(this.rotation);
+    if (!isFinite(from.lengthSq()) || !isFinite(to.lengthSq())) { return; }
+    const distance = Math.max(from.distanceTo(to), 1e-4);
+    this.camera.position.copy(from);
+    this.camera.up.set(0, 1, 0);
+    this.controls.target.copy(to);
+    this.setClip(distance);
+    this.controls.update();
+    this.dirty = true;
+  }
+
+  // A dot (a few pixels, at any distance) where each training photo was taken; for a picked
+  // region a camera frustum at the suggested position, with a line to the region.
+  showMarkers(data, region) {
+    if (this.markers) { this.scene.remove(this.markers); disposeObject(this.markers); this.markers = null; }
+    const group = new THREE.Group();
+    group.quaternion.copy(this.rotation);
+    const up = new THREE.Vector3().fromArray(Array.isArray(data.up) ? data.up : [0, 0, 1]).normalize();
+    const size = Math.max(Number(data.typical_distance) || 1, 1e-4) * 0.1;
+    const spots = [];
+    for (const c of data.cameras || []) {
+      if (Array.isArray(c.position) && c.position.length === 3 && c.position.every(Number.isFinite)) { spots.push(...c.position); }
+    }
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.Float32BufferAttribute(spots, 3));
+    const dots = new THREE.Points(geometry, new THREE.PointsMaterial({
+      color: MARKER_COLOUR, size: 5, sizeAttenuation: false, transparent: true, opacity: 0.8, depthTest: false }));
+    dots.renderOrder = 20;
+    group.add(dots);
+    if (region && region.suggest) {
+      const here = new LineList();
+      const from = new THREE.Vector3().fromArray(region.suggest.position);
+      const to = new THREE.Vector3().fromArray(region.suggest.target);
+      here.frustum(region.suggest.position, to.clone().sub(from).toArray(), up, size);
+      here.line(from, to);
+      group.add(here.build(MARKER_COLOUR, 1));
+    }
+    this.markers = group;
+    this.scene.add(group);
+    this.dirty = true;
   }
 
   // ---- camera
@@ -525,6 +754,7 @@ export class Viewer3D {
     this.resizer.disconnect();
     this.canvas.removeEventListener("webglcontextlost", this.onContextLost);
     for (const kind of Object.keys(this.loaded)) { this.drop(kind); }
+    this.clearCoverage();
     this.controls.dispose();
     try { this.scene.remove(this.spark); this.spark.dispose(); } catch (e) { /* already gone */ }
     this.renderer.dispose();

@@ -11,10 +11,11 @@ RUNS = ROOT / "runs"
 # Network weights the tools need, kept inside the bundle so nothing is fetched while scanning.
 MODELS = TOOLS / "models"
 
-# Spirula Studio does every reconstruction step: frame extraction, masking, camera poses,
-# surface normals, the dense seed cloud, splat training and surface extraction.
+# Spirula Studio: frame extraction, masking, camera poses, priors, splat training and surface
+# extraction. COLMAP: the undistorted image workspace and texturing the mesh from the photos.
 TOOL_PATHS = {
     "spirula": TOOLS / "spirula" / "spirula.exe",
+    "colmap": TOOLS / "colmap" / "bin" / "colmap.exe",
 }
 
 QUALITIES = ("preview", "standard", "high")

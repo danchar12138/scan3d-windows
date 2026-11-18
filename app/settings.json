@@ -6,6 +6,7 @@
   "video": {
     "target_frames": 240,
     "similar_bits": 4,
+    "blur_reject_px": 2.0,
     "max_long_side": 3840
   },
   "masks": {
@@ -42,23 +43,11 @@
       "normals": false,
       "dense_seed": false,
       "train_preset": "3dgs",
-      "train_args": [],
+      "train_args": ["--primitive", "mip"],
       "mesh": {"visual_faces": 150000, "collision_faces": 10000, "texture_size": 2048}
     },
     "standard": {
       "max_image_size": 1920,
-      "iterations": 15000,
-      "cap_max": 1000000,
-      "masks": true,
-      "subject_only": false,
-      "normals": true,
-      "dense_seed": false,
-      "train_preset": "3dgs",
-      "train_args": [],
-      "mesh": {"visual_faces": 300000, "collision_faces": 20000, "texture_size": 4096}
-    },
-    "high": {
-      "max_image_size": 3072,
       "iterations": 30000,
       "cap_max": 2000000,
       "masks": true,
@@ -66,7 +55,19 @@
       "normals": true,
       "dense_seed": false,
       "train_preset": "3dgs",
-      "train_args": [],
+      "train_args": ["--primitive", "mip"],
+      "mesh": {"visual_faces": 300000, "collision_faces": 20000, "texture_size": 4096}
+    },
+    "high": {
+      "max_image_size": 3072,
+      "iterations": 50000,
+      "cap_max": 3000000,
+      "masks": true,
+      "subject_only": false,
+      "normals": true,
+      "dense_seed": false,
+      "train_preset": "3dgs",
+      "train_args": ["--primitive", "mip"],
       "mesh": {"visual_faces": 600000, "collision_faces": 30000, "texture_size": 8192}
     }
   },

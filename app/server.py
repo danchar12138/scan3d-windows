@@ -10,6 +10,8 @@ Entry points
     build_run_command(job, input_path, quality, options=None)
                                                   the one place the pipeline command is built
     build_preview_command(source, out, max_gaussians)   the same for a browser preview
+    build_coverage_command(splat, images, cameras, out, transform, up)
+                                                  the same for the coverage map
     build_models_command(features)                the same for a download of network weights
     models_status(), models_accept(ids), models_dir(), models_file_mb(name)
                                                   the only calls into models.py and config.py;
@@ -32,6 +34,10 @@ Files the server keeps in `runs/<job>/`
                      for the names and format).
                      Each has a small .json beside it that records which splat.ply it was made
                      from and what it holds; a preview whose splat has changed is rebuilt.
+                     Also coverage.json, the coverage map (see GET /coverage), with
+                     coverage.source.json beside it: the sizes and times of the files it was
+                     computed from and the format version; when any of them differs it is
+                     computed again.
 A folder in `runs/` is a job only if it has a status.json and a valid job name.
 `runs/.server-token` holds the pairing token (see "Network exposure").
 
@@ -132,6 +138,25 @@ HTTP API (JSON, UTF-8). Errors are `{"error": "<code>", "message": "<Chinese tex
                                                [{"position", "forward", "up"}]}. Empty when the
                                                job folder has no dataset/sparse/images.bin. The
                                                viewer starts from one of them.
+    GET    /api/jobs/<job>/coverage            how well the photos saw each part of the scene
+                                               (app/coverage.py has the method): {"state":
+                                               ready (plus size) | missing | queued | building
+                                               | failed (plus error) | unavailable (plus
+                                               reason not_done | no_splat | no_cameras, and
+                                               message)}. Nothing is computed by asking.
+    POST   /api/jobs/<job>/coverage            compute it in the background; answers at once
+                                               with the state (202 while queued or building,
+                                               200 when ready or failed again already; 409
+                                               with the reason as error code when
+                                               unavailable). One computation at a time, in a
+                                               child process with a time limit
+                                               (COVERAGE_TIME_LIMIT_SECONDS). Measured with
+                                               1,000,000 Gaussians: 3-6 s for 128-225 photos,
+                                               14 s for 300; up to 40 s while the PC is busy.
+    GET    /api/jobs/<job>/coverage/data       the coverage map (JSON, a few hundred KB; the
+                                               format is in app/coverage.py), cached in
+                                               web-preview/. ETag, HEAD. 404 coverage_missing
+                                               until it is ready.
     GET    /api/models                         the network weights the features need, for any
                                                authorised client: {"features": {<key>: {label,
                                                files, enabled, ready, licences_needed,
@@ -223,12 +248,14 @@ WEB_DIR = APP_DIR / "web"
 try:  # imported as part of a package
     from . import proc as _proc  # type: ignore[import-not-found]
     from . import splatconv as _splatconv  # type: ignore[import-not-found]
+    from . import coverage as _coverage  # type: ignore[import-not-found]
 except ImportError:  # run as a plain script next to proc.py (the embeddable Python's
     # ._pth file can keep the script folder off sys.path, so add it explicitly)
     if str(APP_DIR) not in sys.path:
         sys.path.insert(0, str(APP_DIR))
     import proc as _proc  # type: ignore[no-redef]
     import splatconv as _splatconv  # type: ignore[no-redef]
+    import coverage as _coverage  # type: ignore[no-redef]
 
 log = logging.getLogger("scan3d.server")
 
@@ -276,6 +303,9 @@ PREVIEW_VARIANTS = {            # variant -> (file name, most Gaussians kept or 
 PREVIEW_CACHE_DIR = "web-preview"       # in the job folder: previews the server built itself
 PREVIEW_TIME_LIMIT_SECONDS = 600.0      # one conversion; 2,000,000 Gaussians take 15-30 s
 MAX_VIEWER_CAMERAS = 200
+COVERAGE_NAME = "coverage.json"                 # in web-preview/: the coverage map
+COVERAGE_SOURCE_NAME = "coverage.source.json"   # ... and what it was computed from
+COVERAGE_TIME_LIMIT_SECONDS = 600.0             # one computation; measured 3-40 s (see above)
 
 # Per-scan switches a client may set; each one overrides that key of the quality preset.
 JOB_OPTIONS = ("masks", "subject_only")
@@ -369,6 +399,19 @@ def build_preview_command(source: os.PathLike, out: os.PathLike,
     cmd = [sys.executable, str(APP_DIR / "splatconv.py"), str(source), str(out)]
     if max_gaussians is not None:
         cmd += ["--max", str(max_gaussians)]
+    return cmd
+
+
+def build_coverage_command(splat: os.PathLike, images: os.PathLike, cameras: os.PathLike,
+                           out: os.PathLike, transform: Optional[os.PathLike] = None,
+                           up: Optional[Sequence[float]] = None) -> List[str]:
+    """The command that computes the coverage map of a job. Tests may replace this too."""
+    cmd = [sys.executable, str(APP_DIR / "coverage.py"), str(splat), str(images), str(cameras),
+           str(out)]
+    if transform is not None:
+        cmd += ["--transform", str(transform)]
+    if up is not None:
+        cmd += ["--up", ",".join(repr(float(v)) for v in up)]
     return cmd
 
 
@@ -834,18 +877,21 @@ def _say(text: str) -> None:
         pass
 
 
-# ---------------------------------------------------------------------------- browser previews
+# ---------------------------------------------------------------------------- derived files
 
-class PreviewBuilder:
-    """Builds the browser previews a job lacks: one conversion at a time, each in a child
-    process (so a big file neither slows the server's own threads nor can it hang them), with
-    a time limit. Requests only queue work and report state; nobody waits for a conversion.
-
-    A preview is looked for in output/ first (the pipeline writes it there), then in the
-    job's web-preview/ folder, where the ones built here are kept.
+class BackgroundBuilder:
+    """Work derived from a finished job that the server does itself (browser previews, the
+    coverage map): one piece at a time, each in a child process (so a big file neither slows
+    the server's own threads nor can it hang them), with a time limit. Requests only queue a
+    key (job, what) and report its state; nobody waits for the work. The child dies with the
+    server, is stopped when its job is deleted, and is killed after `time_limit` seconds.
+    Subclasses implement _build(job, what): None on success, else the message for the user.
     """
 
-    def __init__(self, app: "App") -> None:
+    label = "work"                          # in log lines and the thread name
+    failure = "无法完成"                     # the start of the user's message when _build raised
+
+    def __init__(self, app: "App", time_limit: float) -> None:
         self.app = app
         self.lock = threading.Lock()
         self.pending: "collections.deque[Tuple[str, str]]" = collections.deque()
@@ -853,10 +899,159 @@ class PreviewBuilder:
         self.child: Optional[subprocess.Popen] = None
         self.abort_current = False
         self.errors: Dict[Tuple[str, str], str] = {}
-        self.time_limit = PREVIEW_TIME_LIMIT_SECONDS
-        self._headers: Dict[str, Tuple[tuple, Any]] = {}    # file -> (stat key, what its header says)
+        self.time_limit = time_limit
         self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
+
+    def _queue_state(self, key: Tuple[str, str]) -> dict:
+        """{"state": building | queued | failed (plus error) | missing} of work not done."""
+        with self.lock:
+            if self.current == key:
+                return {"state": "building"}
+            if key in self.pending:
+                return {"state": "queued"}
+            if key in self.errors:
+                return {"state": "failed", "error": self.errors[key]}
+        return {"state": "missing"}
+
+    def _enqueue(self, key: Tuple[str, str]) -> None:
+        with self.lock:
+            if self.app.stop_event.is_set():
+                raise ApiError(503, "stopping", "扫描程序正在停止")
+            self.errors.pop(key, None)
+            if key != self.current and key not in self.pending:
+                self.pending.append(key)
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._loop, daemon=True,
+                                                name="scan3d-" + self.label)
+                self._thread.start()
+        self._wake.set()
+
+    # ---- stopping
+
+    def cancel(self, job: str, timeout: float = 10.0) -> None:
+        """Drop everything queued for a job and stop its running child (the job is being
+        deleted, and a child process with files open would keep the folder in use)."""
+        with self.lock:
+            self.pending = collections.deque(k for k in self.pending if k[0] != job)
+            for key in [k for k in self.errors if k[0] == job]:
+                del self.errors[key]
+            busy = self.current is not None and self.current[0] == job
+            if busy:
+                self.abort_current = True
+        deadline = time.monotonic() + timeout
+        while busy and time.monotonic() < deadline:
+            time.sleep(0.05)
+            with self.lock:
+                busy = self.current is not None and self.current[0] == job
+
+    def shutdown(self, timeout: float = 10.0) -> None:
+        """Called with app.stop_event set: the loop kills its child and ends."""
+        with self.lock:
+            self.pending.clear()
+        self._wake.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout)
+        child = self.child
+        if child is not None and child.poll() is None:  # the loop did not get to it
+            _proc.kill_tree(child.pid)
+
+    # ---- the worker
+
+    def _loop(self) -> None:
+        app = self.app
+        while not app.stop_event.is_set():
+            with self.lock:
+                key = self.pending.popleft() if self.pending else None
+                self.current = key
+                self.abort_current = False
+            if key is None:
+                self._wake.wait(0.5)
+                self._wake.clear()
+                continue
+            error: Optional[str] = None
+            try:
+                error = self._build(*key)
+            except Exception as exc:  # noqa: BLE001 - one bad job must not stop the others
+                log.exception("%s %s of %s could not be built", self.label, key[1], key[0])
+                error = "%s：%s" % (self.failure, exc)
+            with self.lock:
+                if error is not None and not self.abort_current:
+                    self.errors[key] = error
+                self.current = None
+                self.child = None
+
+    def _build(self, job: str, what: str) -> Optional[str]:
+        raise NotImplementedError
+
+    def _run_child(self, cmd: Sequence[str]) -> Tuple[Optional[int], bytes, Optional[str], float]:
+        """Run one child to its end: (exit code, what it printed, None | "stopped" |
+        "time_limit", seconds). It is stopped when the server stops or its job is deleted."""
+        app = self.app
+        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
+        child = subprocess.Popen(
+            list(cmd), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            cwd=str(app.root), env=env,
+            creationflags=(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0)
+        with self.lock:
+            self.child = child
+        assign = getattr(_proc, "_assign_to_job", None)
+        if assign is not None:
+            try:
+                assign(child)   # dies with this process, like the pipeline
+            except Exception:  # noqa: BLE001 - best effort
+                pass
+        started = time.monotonic()
+        reason = None
+        output = b""
+        while True:
+            try:
+                output, _ = child.communicate(timeout=0.2)
+                break
+            except subprocess.TimeoutExpired:
+                pass
+            if app.stop_event.is_set() or self.abort_current:
+                reason = "stopped"
+            elif time.monotonic() - started > self.time_limit:
+                reason = "time_limit"
+            if reason is not None:
+                _proc.kill_tree(child.pid)
+                try:
+                    output, _ = child.communicate(timeout=10)
+                except subprocess.TimeoutExpired:
+                    child.kill()
+                break
+        return child.returncode, output or b"", reason, time.monotonic() - started
+
+
+def _last_error_line(output: bytes) -> str:
+    """What a child said last: the "error" of a JSON line, else the last non-empty line."""
+    for line in reversed(output.decode("utf-8", "replace").strip().splitlines()):
+        try:
+            detail = str(json.loads(line).get("error") or "")
+        except (ValueError, AttributeError):
+            detail = line.strip()
+        if detail:
+            return detail
+    return ""
+
+
+# ---------------------------------------------------------------------------- browser previews
+
+class PreviewBuilder(BackgroundBuilder):
+    """Builds the browser previews a job lacks (see BackgroundBuilder for how).
+
+    A preview is looked for in output/ first (the pipeline writes it there), then in the
+    job's web-preview/ folder, where the ones built here are kept.
+    """
+
+    label = "preview"
+    failure = "无法生成预览"
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app, PREVIEW_TIME_LIMIT_SECONDS)
+        self._headers: Dict[str, Tuple[tuple, Any]] = {}    # file -> (stat key, what its header says)
 
     # ---- where things are
 
@@ -994,16 +1189,7 @@ class PreviewBuilder:
                 return result
             except OSError:
                 pass
-        key = (job, variant)
-        with self.lock:
-            if self.current == key:
-                result["state"] = "building"
-            elif key in self.pending:
-                result["state"] = "queued"
-            elif key in self.errors:
-                result.update(state="failed", error=self.errors[key])
-            else:
-                result["state"] = "missing"
+        result.update(self._queue_state((job, variant)))
         return result
 
     def overview(self, job: str) -> dict:
@@ -1033,18 +1219,7 @@ class PreviewBuilder:
         if state["state"] == "no_splat":
             raise ApiError(409, "no_splat", "找不到高斯点云文件")
         if state["state"] in ("missing", "failed"):
-            key = (job, variant)
-            with self.lock:
-                if app.stop_event.is_set():
-                    raise ApiError(503, "stopping", "扫描程序正在停止")
-                self.errors.pop(key, None)
-                if key != self.current and key not in self.pending:
-                    self.pending.append(key)
-                if self._thread is None or not self._thread.is_alive():
-                    self._thread = threading.Thread(target=self._loop, name="scan3d-preview",
-                                                    daemon=True)
-                    self._thread.start()
-            self._wake.set()
+            self._enqueue((job, variant))
             state = self.state(job, variant, status)
         return state
 
@@ -1055,61 +1230,6 @@ class PreviewBuilder:
         if ready is None:
             raise ApiError(404, "preview_missing", "预览文件还没有生成")
         return ready[0]
-
-    # ---- stopping
-
-    def cancel(self, job: str, timeout: float = 10.0) -> None:
-        """Drop everything queued for a job and stop its running conversion (the job is
-        being deleted, and a child process with files open would keep the folder in use)."""
-        with self.lock:
-            self.pending = collections.deque(k for k in self.pending if k[0] != job)
-            for key in [k for k in self.errors if k[0] == job]:
-                del self.errors[key]
-            busy = self.current is not None and self.current[0] == job
-            if busy:
-                self.abort_current = True
-        deadline = time.monotonic() + timeout
-        while busy and time.monotonic() < deadline:
-            time.sleep(0.05)
-            with self.lock:
-                busy = self.current is not None and self.current[0] == job
-
-    def shutdown(self, timeout: float = 10.0) -> None:
-        """Called with app.stop_event set: the loop kills its child and ends."""
-        with self.lock:
-            self.pending.clear()
-        self._wake.set()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout)
-        child = self.child
-        if child is not None and child.poll() is None:  # the loop did not get to it
-            _proc.kill_tree(child.pid)
-
-    # ---- the worker
-
-    def _loop(self) -> None:
-        app = self.app
-        while not app.stop_event.is_set():
-            with self.lock:
-                key = self.pending.popleft() if self.pending else None
-                self.current = key
-                self.abort_current = False
-            if key is None:
-                self._wake.wait(0.5)
-                self._wake.clear()
-                continue
-            error: Optional[str] = None
-            try:
-                error = self._build(*key)
-            except Exception as exc:  # noqa: BLE001 - one bad job must not stop the others
-                log.exception("preview %s of %s could not be built", key[1], key[0])
-                error = "无法生成预览：%s" % exc
-            with self.lock:
-                if error is not None and not self.abort_current:
-                    self.errors[key] = error
-                self.current = None
-                self.child = None
 
     def _build(self, job: str, variant: str) -> Optional[str]:
         """Run one conversion. Returns None on success, else the message for the user."""
@@ -1125,57 +1245,17 @@ class PreviewBuilder:
         out = safe_join(app.job_dir(job), [PREVIEW_CACHE_DIR, name])
         if shutil.disk_usage(folder).free < made_from["source_size"] // 4 + DISK_RESERVE_BYTES:
             return "电脑磁盘空间不足，无法生成预览"
-        cmd = build_preview_command(source, out, limit)
-        env = dict(os.environ, PYTHONIOENCODING="utf-8", PYTHONUNBUFFERED="1")
-        child = subprocess.Popen(
-            cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            cwd=str(app.root), env=env,
-            creationflags=(CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP) if os.name == "nt" else 0)
-        with self.lock:
-            self.child = child
-        assign = getattr(_proc, "_assign_to_job", None)
-        if assign is not None:
-            try:
-                assign(child)   # dies with this process, like the pipeline
-            except Exception:  # noqa: BLE001 - best effort
-                pass
-        started = time.monotonic()
-        reason = None
-        output = b""
-        while True:
-            try:
-                output, _ = child.communicate(timeout=0.2)
-                break
-            except subprocess.TimeoutExpired:
-                pass
-            if app.stop_event.is_set() or self.abort_current:
-                reason = "stopped"
-            elif time.monotonic() - started > self.time_limit:
-                reason = "time_limit"
-            if reason is not None:
-                _proc.kill_tree(child.pid)
-                try:
-                    output, _ = child.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
-                    child.kill()
-                break
-        log.info("preview %s of %s: exit code %s after %.1f s%s", variant, job, child.returncode,
-                 time.monotonic() - started, ", %s" % reason if reason else "")
+        returncode, output, reason, seconds = self._run_child(
+            build_preview_command(source, out, limit))
+        log.info("preview %s of %s: exit code %s after %.1f s%s", variant, job, returncode,
+                 seconds, ", %s" % reason if reason else "")
         if reason == "stopped":
             return "已中断"
         if reason == "time_limit":
             return "生成预览超过 %d 分钟，已被停止" % (self.time_limit // 60)
-        if child.returncode != 0 or not out.is_file():
-            detail = ""
-            for line in reversed(output.decode("utf-8", "replace").strip().splitlines()):
-                try:
-                    detail = str(json.loads(line).get("error") or "")
-                except (ValueError, AttributeError):
-                    detail = line.strip()
-                if detail:
-                    break
-            return "无法生成预览（退出码 %s）%s" % (child.returncode,
-                                           "：" + detail[:300] if detail else "")
+        if returncode != 0 or not out.is_file():
+            detail = _last_error_line(output)
+            return "无法生成预览（退出码 %s）%s" % (returncode, "：" + detail[:300] if detail else "")
         try:
             if self._source_key(source) != made_from:
                 return "高斯点云文件在转换过程中发生了变化，请重试"
@@ -1199,6 +1279,170 @@ class PreviewBuilder:
             write_json_atomic(out.with_name(name + ".json"), dict(made_from, **holds))
         except (OSError, ValueError) as exc:
             return "无法保存预览：%s" % exc
+        return None
+
+
+# ---------------------------------------------------------------------------- coverage map
+
+COVERAGE_UNAVAILABLE = {
+    "not_done": "任务完成之后才能计算拍摄覆盖",
+    "no_splat": "找不到高斯点云文件",
+    "no_cameras": "这个任务没有保存训练用的相机位置，无法计算拍摄覆盖",
+}
+
+
+class CoverageBuilder(BackgroundBuilder):
+    """Computes the coverage map of a finished job (app/coverage.py, in a child process; see
+    BackgroundBuilder) and keeps it in web-preview/ with a note of what it was computed from.
+
+    Inputs, all in the job folder: the splat (as for the previews), the training cameras
+    (dataset/sparse/images.bin + cameras.bin, or dataset/sparse/0/ in newer jobs), the
+    training frame (output/scene_transform.json, else train/run/scene_transform.json; none
+    means the same frame) and the scene's up direction (report.json orientation; without it
+    coverage.py takes the cameras' average up)."""
+
+    label = "coverage"
+    failure = "无法计算拍摄覆盖"
+
+    def __init__(self, app: "App") -> None:
+        super().__init__(app, COVERAGE_TIME_LIMIT_SECONDS)
+
+    def inputs(self, job: str, status: dict) -> Tuple[Optional[dict], Optional[str]]:
+        """({"splat", "images", "cameras", "transform", "up"}, None), or (None, the reason
+        it cannot be computed: a key of COVERAGE_UNAVAILABLE)."""
+        if status.get("state") != "done":
+            return None, "not_done"
+        splat = self.app.previews.source(job, status)
+        if splat is None:
+            return None, "no_splat"
+        job_dir = self.app.job_dir(job)
+
+        def existing(parts: Sequence[str]) -> Optional[Path]:
+            try:
+                path = safe_join(job_dir, parts)
+            except ApiError:
+                return None
+            return path if path.is_file() else None
+
+        sparse = None
+        for folder in (["dataset", "sparse"], ["dataset", "sparse", "0"]):
+            images, cameras = existing(folder + ["images.bin"]), existing(folder + ["cameras.bin"])
+            if images is not None and cameras is not None:
+                sparse = (images, cameras)
+                break
+        if sparse is None:
+            return None, "no_cameras"
+        transform = existing(["output", "scene_transform.json"]) \
+            or existing(["train", "run", "scene_transform.json"])
+        up = None
+        outputs = status.get("outputs")
+        rel = outputs.get("report") if isinstance(outputs, dict) else None
+        report_path = existing(rel.replace("\\", "/").split("/")) if isinstance(rel, str) else None
+        report = read_json(report_path or job_dir / "output" / "report.json")
+        orientation = report.get("orientation") if isinstance(report, dict) else None
+        if isinstance(orientation, dict):
+            vector = orientation.get("up_in_file_coordinates")
+            if isinstance(vector, list) and len(vector) == 3 \
+                    and all(isinstance(v, (int, float)) and v == v and abs(v) < 1e6 for v in vector) \
+                    and sum(v * v for v in vector) > 1e-6:
+                up = [float(v) for v in vector]
+        return {"splat": splat, "images": sparse[0], "cameras": sparse[1],
+                "transform": transform, "up": up}, None
+
+    @staticmethod
+    def made_from(inputs: dict) -> dict:
+        """What the note beside the map records: format version, inputs' sizes and times."""
+        def key(path: Optional[Path]) -> Optional[List[int]]:
+            if path is None:
+                return None
+            info = path.stat()
+            return [info.st_size, info.st_mtime_ns]
+        return {"version": _coverage.FORMAT_VERSION, "splat": key(inputs["splat"]),
+                "images": key(inputs["images"]), "cameras": key(inputs["cameras"]),
+                "transform": key(inputs["transform"]), "up": inputs["up"]}
+
+    def _paths(self, job: str) -> Tuple[Path, Path]:
+        job_dir = self.app.job_dir(job)
+        return (safe_join(job_dir, [PREVIEW_CACHE_DIR, COVERAGE_NAME]),
+                safe_join(job_dir, [PREVIEW_CACHE_DIR, COVERAGE_SOURCE_NAME]))
+
+    def ready_file(self, job: str, inputs: dict) -> Optional[Path]:
+        """The cached map when it was computed from exactly these inputs, else None."""
+        try:
+            out, note = self._paths(job)
+            if not out.is_file():
+                return None
+            return out if read_json(note) == self.made_from(inputs) else None
+        except (ApiError, OSError, ValueError):
+            return None
+
+    def state(self, job: str, status: Optional[dict] = None) -> dict:
+        status = status if status is not None else self.app.require_job(job)
+        inputs, missing = self.inputs(job, status)
+        if inputs is None:
+            return {"state": "unavailable", "reason": missing,
+                    "message": COVERAGE_UNAVAILABLE[missing]}
+        ready = self.ready_file(job, inputs)
+        if ready is not None:
+            try:
+                return {"state": "ready", "size": ready.stat().st_size}
+            except OSError:
+                pass
+        return self._queue_state((job, "coverage"))
+
+    def request(self, job: str) -> dict:
+        """Queue the computation unless the map exists or is already on its way."""
+        status = self.app.require_job(job)
+        state = self.state(job, status)
+        if state["state"] == "unavailable":
+            raise ApiError(409, state["reason"], state["message"])
+        if state["state"] in ("missing", "failed"):
+            self._enqueue((job, "coverage"))
+            state = self.state(job, status)
+        return state
+
+    def file(self, job: str) -> Path:
+        status = self.app.require_job(job)
+        inputs, _missing = self.inputs(job, status)
+        ready = self.ready_file(job, inputs) if inputs is not None else None
+        if ready is None:
+            raise ApiError(404, "coverage_missing", "拍摄覆盖还没有计算")
+        return ready
+
+    def _build(self, job: str, what: str) -> Optional[str]:
+        app = self.app
+        status = app.read_status(job, fresh=True) or {}
+        inputs, missing = self.inputs(job, status)
+        if inputs is None:
+            return COVERAGE_UNAVAILABLE[missing or "no_splat"]
+        made = self.made_from(inputs)
+        folder = safe_join(app.job_dir(job), [PREVIEW_CACHE_DIR])
+        folder.mkdir(exist_ok=True)
+        out, note = self._paths(job)
+        if shutil.disk_usage(folder).free < DISK_RESERVE_BYTES:
+            return "电脑磁盘空间不足，无法计算拍摄覆盖"
+        try:
+            note.unlink()       # the old map no longer counts, whatever happens next
+        except FileNotFoundError:
+            pass
+        returncode, output, reason, seconds = self._run_child(build_coverage_command(
+            inputs["splat"], inputs["images"], inputs["cameras"], out, inputs["transform"],
+            inputs["up"]))
+        log.info("coverage of %s: exit code %s after %.1f s%s", job, returncode, seconds,
+                 ", %s" % reason if reason else "")
+        if reason == "stopped":
+            return "已中断"
+        if reason == "time_limit":
+            return "计算拍摄覆盖超过 %d 分钟，已被停止" % (self.time_limit // 60)
+        if returncode != 0 or not out.is_file():
+            detail = _last_error_line(output)
+            return "无法计算拍摄覆盖（退出码 %s）%s" % (returncode, "：" + detail[:300] if detail else "")
+        try:
+            if self.made_from(inputs) != made:
+                return "任务文件在计算过程中发生了变化，请重试"
+            write_json_atomic(note, made)
+        except (OSError, ValueError) as exc:
+            return "无法保存拍摄覆盖：%s" % exc
         return None
 
 
@@ -1477,6 +1721,7 @@ class App:
         self.stop_event = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self.previews = PreviewBuilder(self)
+        self.coverage = CoverageBuilder(self)
         self.models = ModelDownloads(self)
 
     # ---- lifecycle
@@ -1495,6 +1740,7 @@ class App:
         self.stop_event.set()
         self._wake.set()
         self.previews.shutdown()
+        self.coverage.shutdown()
         self.models.shutdown()
         worker = self._worker
         if worker is not None and worker.is_alive():
@@ -1881,6 +2127,7 @@ class App:
     def delete_job(self, job: str) -> None:
         self.require_job(job)
         self.previews.cancel(job)
+        self.coverage.cancel(job)
         with self.lock:
             status = self.require_job(job)
             if job == self.current or status["state"] == "running":
@@ -2667,6 +2914,16 @@ class Handler(BaseHTTPRequestHandler):
             self._require_method("GET", "HEAD")
             app.require_job(job)
             self._send_json(app.viewer_cameras(job))
+        elif rest == ["coverage"]:
+            self._require_method("GET", "HEAD", "POST")
+            if self.command == "POST":
+                state = app.coverage.request(job)
+                self._send_json(state, 202 if state["state"] in ("queued", "building") else 200)
+            else:
+                self._send_json(app.coverage.state(job))
+        elif rest == ["coverage", "data"]:
+            self._require_method("GET", "HEAD")
+            self._send_file(app.coverage.file(job), "application/json; charset=utf-8")
         else:
             raise ApiError(404, "not_found", "接口不存在")
 

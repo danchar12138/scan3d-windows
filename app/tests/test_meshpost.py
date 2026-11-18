@@ -3,12 +3,13 @@
     python -m unittest app.tests.test_meshpost          (from the project root)
     python app/tests/test_meshpost.py
 
-The pipeline test drives build_meshes end to end against a stand-in for spirula.exe (a small
-Python script behind a .cmd launcher), so it needs no GPU and takes a few seconds. Set
-SCAN3D_MESH_ITEST=1 to also run the real tool on runs/sb-std (about four minutes, uses the GPU).
+The pipeline tests drive build_meshes end to end against a stand-in for colmap.exe (a small
+Python script behind a .cmd launcher), so they need no GPU and take a few seconds each. Set
+SCAN3D_MESH_ITEST=1 to also run the real tool on runs/sb-v2 (about 20 minutes, uses the GPU).
 """
 import array
 import json
+import math
 import os
 import shutil
 import struct
@@ -212,202 +213,6 @@ class TopologyTests(unittest.TestCase):
             self.assertAlmostEqual(sum(c * c for c in a), 1.0, places=5)
         # away from the cut nothing changes
         self.assertEqual(list(together[:6]), list(apart[:6]))
-
-
-class CollapseTests(unittest.TestCase):
-    def test_reaches_the_budget_without_moving_a_vertex(self):
-        m = grid(20, height=lambda x, y: 0.2 * x * x + 0.1 * y)
-        out, stats = mp.collapse_to(m, 200)
-        self.assertLessEqual(out.face_count, 200)
-        self.assertGreaterEqual(out.face_count, 198)
-        self.assertEqual(stats["faces_before"], 800)
-        self.assertEqual(stats["faces_after"], out.face_count)
-        before = {tuple(m.xyz[3 * i:3 * i + 3]) for i in range(m.vertex_count)}
-        after = {tuple(out.xyz[3 * i:3 * i + 3]) for i in range(out.vertex_count)}
-        self.assertLessEqual(after, before)                  # a subset: nothing new, nothing moved
-        self.assertEqual(max(out.tris), out.vertex_count - 1)
-        self.assertIs(mp.drop_degenerate_faces(out, zero_area=True), out)
-        self.assertEqual(len(mp.face_components(out)[2]), 1)
-
-    def test_under_budget_is_left_alone(self):
-        m = grid(4)
-        out, stats = mp.collapse_to(m, 32)
-        self.assertEqual(list(out.tris), list(m.tris))
-        self.assertEqual(stats["collapses"], 0)
-        with self.assertRaises(mp.MeshError):
-            mp.collapse_to(m, 2)
-
-    def test_flat_outline_is_kept(self):
-        # Everything inside a flat square is free to go; its outline is not.
-        out, _ = mp.collapse_to(grid(12), 40)
-        self.assertLessEqual(out.face_count, 40)
-        self.assertEqual([min(out.xyz[k::3]) for k in range(3)], [0.0, 0.0, 0.0])
-        self.assertEqual([max(out.xyz[k::3]) for k in range(3)], [1.0, 1.0, 0.0])
-        corners = {(0.0, 0.0, 0.0), (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (1.0, 1.0, 0.0)}
-        self.assertLessEqual(corners, {tuple(out.xyz[3 * i:3 * i + 3]) for i in range(out.vertex_count)})
-        area = sum(mp.face_components(out)[2].values())
-        self.assertAlmostEqual(area, 1.0, places=5)
-        for a, b in border_edges(out):                       # still a square: every open edge on a side
-            self.assertTrue(any(a[k] == b[k] and a[k] in (0.0, 1.0) for k in (0, 1)))
-
-    def test_shape_decides_what_goes_first(self):
-        # Flat on the left, corrugated on the right: the faces that are left are on the right.
-        m = grid(24, height=lambda x, y: 0.0 if x <= 0.5 else 0.05 * ((round(x * 24) + round(y * 24)) % 2))
-        out, _ = mp.collapse_to(m, 400)
-        left = sum(1 for f in range(out.face_count)
-                   if max(out.xyz[3 * i] for i in out.tris[3 * f:3 * f + 3]) <= 0.5)
-        self.assertLess(left, 0.2 * out.face_count)
-
-    def test_texture_coordinates_are_kept_and_the_seam_stays_shut(self):
-        m = two_chart_grid(16)
-        out, stats = mp.collapse_to(m, 150, texels=256.0 * 256.0)
-        self.assertLessEqual(out.face_count, 150)
-        self.assertEqual(len(out.uv), 2 * out.vertex_count)
-        pairs = {(tuple(m.xyz[3 * i:3 * i + 3]), tuple(m.uv[2 * i:2 * i + 2])) for i in range(m.vertex_count)}
-        reach = mp.TEXTURE_REACH_TEXELS / 256.0 + 1e-6
-        untouched = 0
-        for f in range(out.face_count):
-            idx = out.tris[3 * f:3 * f + 3]
-            coords = [tuple(out.uv[2 * i:2 * i + 2]) for i in idx]
-            # the three corners are in one chart, never across the gap between the two
-            self.assertEqual(len({c[0] < 0.5 for c in coords}), 1)
-            # and the triangle is the same way round in the atlas as in space
-            (u0, v0), (u1, v1), (u2, v2) = coords
-            self.assertGreater((u1 - u0) * (v2 - v0) - (v1 - v0) * (u2 - u0), 0.0)
-            # a corner is a vertex the input had with the coordinates the input gave it, or a
-            # coordinate made for it no further outside its chart than the gutter allows
-            if all((tuple(out.xyz[3 * i:3 * i + 3]), c) in pairs for i, c in zip(idx, coords)):
-                untouched += 1
-            for u, v in coords:
-                self.assertTrue(0.05 - reach <= u <= 0.45 + reach or 0.55 - reach <= u <= 0.95 + reach)
-                self.assertTrue(0.05 - reach <= v <= 0.95 + reach)
-        self.assertGreater(untouched, 0.8 * out.face_count)
-        self.assertLess(stats["faces_stretched"], 0.1 * out.face_count)
-        self.assertGreater(stats["atlas_shown"], 0.9)
-        # no crack along the cut: once welded, only the outline of the square is open
-        for a, b in border_edges(mp.weld(out)):
-            self.assertTrue(any(a[k] == b[k] and a[k] in (0.0, 1.0) for k in (0, 1)))
-
-    def test_a_face_that_leaves_its_chart_keeps_a_patch_of_it(self):
-        # Eight faces in two charts, down to four or fewer: far too few to keep every corner
-        # inside its own chart. Whatever cannot keep its patch must go on showing a piece of
-        # its own chart, pulled out of shape: never one flat colour, and never a triangle
-        # stretched across the gap between two charts.
-        m = two_chart_grid(2)
-        out, stats = mp.collapse_to(m, 4, texels=64.0 * 64.0)
-        self.assertLessEqual(out.face_count, 4)
-        reach = mp.TEXTURE_REACH_TEXELS / 64.0 + 1e-6
-        for f in range(out.face_count):
-            coords = [tuple(out.uv[2 * i:2 * i + 2]) for i in out.tris[3 * f:3 * f + 3]]
-            self.assertEqual(len({c[0] < 0.5 for c in coords}), 1)
-            (u0, v0), (u1, v1), (u2, v2) = coords
-            self.assertGreater((u1 - u0) * (v2 - v0) - (v1 - v0) * (u2 - u0), 0.0)
-            for u, v in coords:
-                self.assertTrue(0.05 - reach <= u <= 0.45 + reach or 0.55 - reach <= u <= 0.95 + reach)
-        self.assertGreaterEqual(min(out.uv), 0.0)
-        self.assertLessEqual(max(out.uv), 1.0)
-        self.assertLessEqual(stats["faces_stretched"], out.face_count)
-
-    def strip_of_charts(self, n=12):
-        """A flat strip of n squares along x, each square a chart of its own (two faces), laid
-        out in the atlas with a wide gap between neighbours: every vertex is on a chart border."""
-        xyz, uv, tris = [], [], []
-        for i in range(n):
-            base = len(xyz) // 3
-            for dx, dy in ((0, 0), (1, 0), (1, 1), (0, 1)):
-                xyz += [float(i + dx), float(dy), 0.0]
-                uv += [(i + 0.25 + 0.5 * dx) / n, 0.25 + 0.5 * dy]
-            tris += [base, base + 1, base + 2, base, base + 2, base + 3]
-        return mp.Mesh(array.array("f", xyz), array.array("i", tris), array.array("f", uv))
-
-    def test_coordinates_outside_a_chart_stay_within_reach_of_it(self):
-        # Two faces per chart and a third of the faces to go: charts have to be left. With no
-        # reach, a corner that leaves keeps the coordinate it had; with some, new coordinates
-        # appear, each no further from its chart than the reach.
-        n = 12
-        m = self.strip_of_charts(n)
-        texels = 240.0                                   # so a chart is 10 texels wide, 20 apart
-        given = {tuple(m.uv[2 * i:2 * i + 2]) for i in range(m.vertex_count)}
-        with unittest.mock.patch.object(mp, "TEXTURE_REACH_TEXELS", 0.0):
-            out, stats = mp.collapse_to(m, 16, texels=texels * texels)
-        self.assertLessEqual(out.face_count, 16)
-        self.assertLessEqual({tuple(out.uv[2 * i:2 * i + 2]) for i in range(out.vertex_count)}, given)
-        self.assertGreater(stats["faces_stretched"], 0)
-        with unittest.mock.patch.object(mp, "TEXTURE_REACH_TEXELS", 3.0):
-            out, stats = mp.collapse_to(m, 16, texels=texels * texels)
-        self.assertLessEqual(out.face_count, 16)
-        made = {tuple(out.uv[2 * i:2 * i + 2]) for i in range(out.vertex_count)} - given
-        self.assertTrue(made)
-        for u, v in made:
-            chart = min(range(n), key=lambda i: abs(u - (i + 0.5) / n))
-            lo, hi = (chart + 0.25) / n, (chart + 0.75) / n
-            du = max(lo - u, 0.0, u - hi)
-            dv = max(0.25 - v, 0.0, v - 0.75)
-            self.assertLessEqual((du * du + dv * dv) ** 0.5 * texels, 3.0 + 1e-3)
-        for f in range(out.face_count):                    # and no face lies across two charts
-            us = [out.uv[2 * i] for i in out.tris[3 * f:3 * f + 3]]
-            self.assertLess(max(us) - min(us), 0.5 / n + 2 * 3.0 / texels + 1e-6)
-
-    def closed_box(self, n=6, bumps=0.0):
-        """A cube with n x n squares per side, welded shut; `bumps` pushes every vertex in or out."""
-        parts = []
-        for axis in range(3):
-            for side in (0.0, 1.0):
-                g = grid(n)
-                xyz = []
-                for i in range(g.vertex_count):
-                    p = [g.xyz[3 * i], g.xyz[3 * i + 1]]
-                    p.insert(axis, side)
-                    xyz += p
-                tris = list(g.tris)
-                if (axis + int(side)) % 2:                  # keep every face pointing outwards
-                    tris = [t for f in range(0, len(tris), 3) for t in (tris[f], tris[f + 2], tris[f + 1])]
-                parts.append((xyz, tris))
-        m = mp.weld(merged(*parts))
-        if bumps:
-            for i in range(m.vertex_count):
-                scale = 1.0 + bumps * (((i * 7919) % 11) / 10.0 - 0.5)
-                for k in range(3):
-                    m.xyz[3 * i + k] = 0.5 + (m.xyz[3 * i + k] - 0.5) * scale
-        return m
-
-    def test_closed_surface_collapses_cleanly(self):
-        # Down to a handful of faces: no face twice, nothing torn open.
-        m = self.closed_box()
-        self.assertEqual(m.vertex_count, 6 * 7 * 7 - 12 * 7 + 8)
-        self.assertEqual(border_edges(m), [])
-        out, _ = mp.collapse_to(m, 24)
-        self.assertLessEqual(out.face_count, 24)
-        faces = Counter(tuple(sorted(out.tris[3 * f:3 * f + 3])) for f in range(out.face_count))
-        self.assertEqual(max(faces.values()), 1)
-        self.assertEqual(border_edges(out), [])
-        self.assertEqual([min(out.xyz[k::3]) for k in range(3)], [0.0] * 3)   # still the whole cube
-        self.assertEqual([max(out.xyz[k::3]) for k in range(3)], [1.0] * 3)
-
-    def test_budget_is_met_even_where_every_collapse_bends_the_surface(self):
-        # A lumpy closed surface, with the turn limit set so tight that no collapse passes it:
-        # the first round runs dry at once (one round alone stops at all 432 faces); the second,
-        # which only refuses outright flips, gets to the budget.
-        lumpy = self.closed_box(bumps=0.3)
-        with unittest.mock.patch.object(mp, "COLLAPSE_MAX_TURN_COS", 0.99999):
-            out, stats = mp.collapse_to(lumpy, 100)
-        self.assertEqual(stats["faces_before"], 432)
-        self.assertLessEqual(out.face_count, 100)
-        self.assertGreater(out.face_count, 90)
-        self.assertIs(mp.drop_degenerate_faces(out), out)
-
-    def test_tick_reports_and_can_stop_the_work(self):
-        m = grid(80)                                         # 12,800 faces: several thousand collapses
-        seen = []
-        mp.collapse_to(m, 2000, tick=seen.append)
-        self.assertTrue(seen)
-        self.assertEqual(seen, sorted(seen, reverse=True))
-        self.assertTrue(all(2000 <= left < 12800 for left in seen))
-
-        def stop(_left):
-            raise proc.Cancelled("stop")
-        with self.assertRaises(proc.Cancelled):
-            mp.collapse_to(m, 2000, tick=stop)
 
 
 class FrameTests(TempDirCase):
@@ -626,11 +431,410 @@ class ReadGlbTests(TempDirCase):
 
 
 # ---------------------------------------------------------------------------------------------
-# End to end against a stand-in for spirula.exe
+# Helpers for the texturing pieces: COLMAP binary models, PNG files with every row filter
 # ---------------------------------------------------------------------------------------------
 
-FAKE_TOOL = r'''
-import array, os, struct, sys, time, zlib
+def quat_from_matrix(R):
+    """(w, x, y, z) for a row-major 3x3 rotation (no special cases needed for the test poses)."""
+    r00, r01, r02, r10, r11, r12, r20, r21, r22 = R
+    w = math.sqrt(max(0.0, 1.0 + r00 + r11 + r22)) / 2.0
+    return (w, (r21 - r12) / (4 * w), (r02 - r20) / (4 * w), (r10 - r01) / (4 * w))
+
+
+def write_model(folder, cameras, images):
+    """cameras: {id: (model, w, h, params)}; images: [(id, name, R row-major, t, camera id)]."""
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    out = bytearray(struct.pack("<Q", len(cameras)))
+    for cid, (model, w, h, params) in cameras.items():
+        out += struct.pack("<iiQQ", cid, model, w, h) + struct.pack("<%dd" % len(params), *params)
+    (folder / "cameras.bin").write_bytes(bytes(out))
+    out = bytearray(struct.pack("<Q", len(images)))
+    for iid, name, R, t, cid in images:
+        out += struct.pack("<i4d3di", iid, *quat_from_matrix(R), *t, cid)
+        out += name.encode() + b"\x00" + struct.pack("<Q", 0)
+    (folder / "images.bin").write_bytes(bytes(out))
+
+
+def png_bytes(width, height, rows, channels=1, filters=(0,)):
+    """Encode 8-bit rows (bytes, width*channels each) as PNG, cycling through `filters`."""
+    def chunk(kind, body):
+        return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+    bpp = channels
+    prev = bytes(width * channels)
+    raw = bytearray()
+    for y, row in enumerate(rows):
+        kind = filters[y % len(filters)]
+        out = bytearray(len(row))
+        for i, value in enumerate(row):
+            a = row[i - bpp] if i >= bpp else 0
+            b = prev[i]
+            c = prev[i - bpp] if i >= bpp else 0
+            if kind == 0:
+                pred = 0
+            elif kind == 1:
+                pred = a
+            elif kind == 2:
+                pred = b
+            elif kind == 3:
+                pred = (a + b) >> 1
+            else:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            out[i] = (value - pred) & 255
+        raw += bytes([kind]) + out
+        prev = row
+    ctype = {1: 0, 2: 4, 3: 2, 4: 6}[channels]
+    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, ctype, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(bytes(raw))) + chunk(b"IEND", b""))
+
+
+def decode_png(data):
+    """(width, height, channels, rows) of an 8-bit non-interlaced PNG, via the module's own unfilter."""
+    ihdr = None
+    idat = b""
+    for kind, body in mp._png_chunks(data):
+        if kind == b"IHDR":
+            ihdr = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            idat += body
+    w, h, depth, ctype = ihdr[:4]
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}[ctype]
+    return w, h, channels, mp._unfilter(zlib.decompress(idat), h, w * channels, channels)
+
+
+# A pinhole camera at (2, 2, -3) looking along +z at the plane z = 0 (the stand-in's scene).
+LOOK_R = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0)
+LOOK_T = (-2.0, -2.0, 3.0)                     # t = -R C, C = (2, 2, -3)
+LOOK_CAMERA = (1, 64, 48, (40.0, 40.0, 32.0, 24.0))
+# The pipeline tests' camera: further back, it sees the whole stand-in scene, floaters included.
+WIDE_T = (-21.0, -6.0, 30.0)                    # C = (21, 6, -30)
+
+
+class CameraModelTests(TempDirCase):
+    def test_model_round_trip(self):
+        cams = {1: (4, 3072, 2304, (2562.3, 2566.2, 1546.9, 1177.9, -0.0335, 0.0317, 8.4e-05, 0.00064)),
+                3: (1, 640, 480, (500.0, 501.0, 320.0, 240.0))}
+        Rz = (0.0, -1.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0)
+        write_model(self.tmp, cams, [(7, "photos/a.jpg", Rz, (1.0, 2.0, 3.0), 1),
+                                     (9, "b.jpg", LOOK_R, LOOK_T, 3)])
+        self.assertEqual(mp.read_cameras_bin(self.tmp / "cameras.bin"), cams)
+        images = mp.read_images_bin(self.tmp / "images.bin")
+        self.assertEqual([(i, n, c) for i, n, _, _, c in images], [(7, "photos/a.jpg", 1), (9, "b.jpg", 3)])
+        for got, want in zip(images[0][2], Rz):
+            self.assertAlmostEqual(got, want, places=12)
+        self.assertEqual(images[1][3], LOOK_T)
+
+    def test_undistort_inverts_distort(self):
+        cases = [(0, (500.0, 320.0, 240.0)), (1, (500.0, 510.0, 320.0, 240.0)),
+                 (2, (500.0, 320.0, 240.0, -0.08)), (3, (500.0, 320.0, 240.0, -0.08, 0.02)),
+                 (4, (2562.3, 2566.2, 1546.9, 1177.9, -0.0335, 0.0317, 8.4e-05, 0.00064)),
+                 (5, (500.0, 500.0, 320.0, 240.0, 0.01, -0.002, 0.001, 0.0)),
+                 (6, (500.0, 500.0, 320.0, 240.0, -0.1, 0.02, 0.001, -0.001, 0.01, 0.0, 0.0, 0.0))]
+        for model, params in cases:
+            with self.subTest(model=model):
+                for x, y in ((0.0, 0.0), (0.3, -0.2), (-0.55, 0.4)):
+                    u, v = mp.distort(model, params, x, y)
+                    bx, by = mp.undistort(model, params, u, v)
+                    self.assertAlmostEqual(bx, x, places=7)
+                    self.assertAlmostEqual(by, y, places=7)
+        with self.assertRaises(mp.MeshError):
+            mp.distort(9, (1.0,), 0.0, 0.0)
+
+
+class PngTests(TempDirCase):
+    def test_masks_with_every_filter(self):
+        w, h = 23, 9
+        rows = [bytes((255 if (x + 2 * y) % 7 else 0) for x in range(w)) for y in range(h)]
+        want = [bytes(1 if v >= 128 else 0 for v in r) for r in rows]
+        for filters in ((0,), (1,), (2,), (3,), (4,), (0, 1, 2, 3, 4)):
+            with self.subTest(filters=filters):
+                (self.tmp / "m.png").write_bytes(png_bytes(w, h, rows, 1, filters))
+                self.assertEqual(mp.read_mask_png(self.tmp / "m.png"), (w, h, want))
+        # RGB and grey+alpha masks are read by their first channel
+        rgb = [bytes(v for x in r for v in (x, 7, 200)) for r in rows]
+        (self.tmp / "c.png").write_bytes(png_bytes(w, h, rgb, 3, (4, 1)))
+        self.assertEqual(mp.read_mask_png(self.tmp / "c.png"), (w, h, want))
+        ga = [bytes(v for x in r for v in (x, 255)) for r in rows]
+        (self.tmp / "g.png").write_bytes(png_bytes(w, h, ga, 2, (2, 3)))
+        self.assertEqual(mp.read_mask_png(self.tmp / "g.png"), (w, h, want))
+
+    def test_one_bit_mask(self):
+        def chunk(kind, body):
+            return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
+        raw = b"\x00\xa0\x00" + b"\x00\xff\x80"             # 10 px wide: 1010 0000 00 / 1111 1111 10
+        data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 10, 2, 1, 0, 0, 0, 0))
+                + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+        (self.tmp / "b.png").write_bytes(data)
+        self.assertEqual(mp.read_mask_png(self.tmp / "b.png"),
+                         (10, 2, [bytes([1, 0, 1, 0, 0, 0, 0, 0, 0, 0]), bytes([1] * 9 + [0])]))
+
+    def test_unsupported_masks_are_refused(self):
+        (self.tmp / "x.png").write_bytes(b"GIF89a....")
+        with self.assertRaises(mp.MeshError):
+            mp.read_mask_png(self.tmp / "x.png")
+
+    def test_padding_rows(self):
+        rows = [bytes((x * 9 + y * 31) % 256 for x in range(3 * 5)) for y in range(3)]
+        data = png_bytes(5, 3, rows, 3, (4, 1, 2))
+        padded = mp.pad_png_rows(data, 8)
+        self.assertEqual(mp.image_size(padded), ("image/png", 5, 8))
+        w, h, channels, back = decode_png(padded)
+        self.assertEqual((w, h, channels), (5, 8, 3))
+        self.assertEqual(back[:3], rows)                      # the atlas is untouched
+        self.assertEqual(back[3:], [bytes(15)] * 5)           # black below it
+        self.assertEqual(padded[-12:], b"\x00\x00\x00\x00IEND\xaeB`\x82")
+        self.assertIs(mp.pad_png_rows(data, 3), data)
+
+
+class OccluderTests(TempDirCase):
+    def test_cells_cover_the_masked_pixels(self):
+        w, h = 40, 30
+        rows = [bytes(0 if (10 <= x < 14 and 5 <= y < 9) else 1 for x in range(w)) for y in range(h)]
+        cells = mp.masked_cells(w, h, rows, 4)
+        # the 4x4 block sits in cells (2..3, 1..2), grown by one cell on every side
+        self.assertEqual(cells, {(x, y) for x in range(1, 5) for y in range(0, 4)})
+        self.assertEqual(mp.masked_cells(w, h, [bytes([1] * w)] * h, 4), set())
+        corner = [bytes(0 if x == 0 and y == 0 else 1 for x in range(w)) for y in range(h)]
+        self.assertEqual(mp.masked_cells(w, h, corner, 4), {(0, 0), (1, 0), (0, 1), (1, 1)})
+
+    def test_triangles_hide_the_masked_area_from_its_camera(self):
+        model, cw, ch, params = LOOK_CAMERA
+        mw, mh = 32, 24                                      # the mask is at half the camera's size
+        cells = {(3, 2), (4, 2), (5, 2), (3, 3)}
+        cell = 4
+        tris = mp.occluder_triangles(cells, cell, mw, mh, LOOK_CAMERA, LOOK_R, LOOK_T, 0.5)
+        C = (2.0, 2.0, -3.0)
+        covered = set()
+        for tri in tris:
+            p = [tri[0:3], tri[3:6], tri[6:9]]
+            for q in p:
+                self.assertAlmostEqual(q[2] - C[2], 0.5, places=6)    # all at the given depth
+            u = [p[1][k] - p[0][k] for k in range(3)]
+            v = [p[2][k] - p[0][k] for k in range(3)]
+            n = (u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0])
+            g = [C[k] - sum(q[k] for q in p) / 3 for k in range(3)]
+            self.assertLess(sum(a * b for a, b in zip(n, g)), 0.0)    # the back faces the camera
+            # project the corners into the mask and record the cells they span
+            xs = [(params[0] * (q[0] - C[0]) / (q[2] - C[2]) + params[2]) * mw / cw for q in p]
+            ys = [(params[1] * (q[1] - C[1]) / (q[2] - C[2]) + params[3]) * mh / ch for q in p]
+            for cx in range(math.floor(min(xs) / cell + 1e-6), math.ceil(max(xs) / cell - 1e-6)):
+                for cy in range(math.floor(min(ys) / cell + 1e-6), math.ceil(max(ys) / cell - 1e-6)):
+                    covered.add((cx, cy))
+        self.assertEqual(covered, cells)
+        self.assertEqual(len(tris), 4)                         # two runs in row 2 and 3, two triangles each
+
+    def test_occluders_only_for_photos_with_masked_pixels(self):
+        ds = self.tmp / "ds"
+        write_model(ds / "sparse" / "0", {1: LOOK_CAMERA},
+                    [(1, "photos/a.jpg", LOOK_R, LOOK_T, 1), (2, "photos/b.jpg", LOOK_R, LOOK_T, 1),
+                     (3, "photos/c.jpg", LOOK_R, LOOK_T, 1)])
+        (ds / "masks" / "photos").mkdir(parents=True)
+        person = [bytes(0 if (20 <= x < 30 and 10 <= y < 30) else 255 for x in range(64)) for y in range(48)]
+        (ds / "masks" / "photos" / "a.png").write_bytes(png_bytes(64, 48, person))
+        (ds / "masks" / "photos" / "b.png").write_bytes(png_bytes(64, 48, [bytes([255] * 64)] * 48))
+        xyz = grid(8, 4.0).xyz                                 # the plane z = 0, 3 in front of the camera
+        cams = mp.read_cameras_bin(ds / "sparse" / "0" / "cameras.bin")
+        imgs = mp.read_images_bin(ds / "sparse" / "0" / "images.bin")
+        tris, masked = mp.build_occluders(dataset_dir=ds, cameras=cams, images=imgs, xyz=xyz,
+                                          log_path=self.tmp / "log")
+        self.assertEqual(masked, 1)
+        self.assertTrue(tris)
+        diag = math.sqrt(32.0)
+        for tri in tris:
+            for k in (2, 5, 8):
+                depth = tri[k] + 3.0
+                self.assertGreater(depth, 0.0)
+                self.assertLessEqual(depth, mp.OCCLUDER_MAX_DEPTH * diag + 1e-9)   # well before the wall
+        self.assertEqual(mp.build_occluders(dataset_dir=self.tmp, cameras=cams, images=imgs, xyz=xyz,
+                                            log_path=self.tmp / "log"), ([], 0))
+
+
+class ShardTests(unittest.TestCase):
+    def test_pixel_sizes_and_depths(self):
+        # LOOK camera: f = 40 px, 3 units in front of the plane z = 0, centred on (2, 2).
+        cams = {1: LOOK_CAMERA}
+        images = [(1, "a.jpg", LOOK_R, LOOK_T, 1)]
+        xyz = array.array("f", [2.0, 2.0, 0.0, 2.3, 2.0, 0.0, 2.0, 2.3, 0.0,       # 0.3 wide: 4 px edges
+                                1.0, 1.0, 0.0, 3.0, 1.0, 0.0, 1.0, 3.0, 0.0,       # 2 wide: 40 px edges
+                                2.0, 2.0, -4.0, 2.1, 2.0, -4.0, 2.0, 2.1, -4.0,    # behind the camera
+                                9.0, 2.0, 0.0, 9.1, 2.0, 0.0, 9.0, 2.1, 0.0])      # outside the picture
+        mesh = mp.Mesh(xyz, array.array("i", range(12)))
+        sizes, depths = mp.face_pixel_sizes(mesh, cams, images)
+        self.assertAlmostEqual(sizes[0], 40 * math.hypot(0.3, 0.3) / 3, places=4)
+        self.assertAlmostEqual(sizes[1], 40 * math.hypot(2.0, 2.0) / 3, places=4)
+        self.assertEqual(sizes[2:], [math.inf, math.inf])
+        self.assertAlmostEqual(depths[1], 1.0, places=5)        # as far as the rest of the surface
+        self.assertEqual(depths[2:], [0.0, 0.0])
+        # a second view from further away sees the face smaller: the smallest size counts
+        further = images + [(2, "b.jpg", LOOK_R, (-2.0, -2.0, 30.0), 1)]
+        self.assertLess(mp.face_pixel_sizes(mesh, cams, further)[0][1], sizes[1])
+        with self.assertRaises(mp.MeshError):
+            mp.face_pixel_sizes(mesh, {1: (4, 64, 48, (40.0,) * 8)}, images)
+
+    def test_only_large_faces_far_behind_the_surface_go(self):
+        cams = {1: LOOK_CAMERA}
+        images = [(1, "a.jpg", LOOK_R, LOOK_T, 1)]
+        surface = grid(10, 4.0)                                  # the plane z = 0, 3 in front
+        parts = [(list(surface.xyz), list(surface.tris)),
+                 ([1.0, 1.0, 0.0, 3.0, 1.0, 0.0, 1.0, 3.0, 0.0], [0, 1, 2]),        # large, near: a wall
+                 ([-8.0, -8.0, 9.0, 12.0, -8.0, 9.0, -8.0, 12.0, 9.0], [0, 1, 2]),  # large, far: a shard
+                 ([2.0, 2.0, 9.0, 2.2, 2.0, 9.0, 2.0, 2.2, 9.0], [0, 1, 2])]        # small, far: surface
+        mesh = merged(*parts)
+        kept, removed = mp.drop_shards(mesh, cams, images, 30.0, 2.0)
+        self.assertEqual(removed, 1)
+        self.assertEqual(kept.face_count, mesh.face_count - 1)
+        self.assertNotIn(12.0, set(kept.xyz))
+        same, removed = mp.drop_shards(mesh, cams, images, 30.0, 10.0)
+        self.assertEqual(removed, 0)
+        self.assertIs(same, mesh)
+
+
+class PlyTests(TempDirCase):
+    def test_round_trip_with_extra_triangles(self):
+        m = merged(cube())
+        extra = [(9.0, 9.0, 9.0, 9.5, 9.0, 9.0, 9.0, 9.5, 9.0)]
+        mp.write_ply(self.tmp / "m.ply", m.xyz, m.tris, extra)
+        xyz, tris, uv = mp.read_ply(self.tmp / "m.ply")
+        self.assertIsNone(uv)
+        self.assertEqual(xyz[:24], m.xyz)
+        self.assertEqual(list(xyz[24:]), list(extra[0]))
+        self.assertEqual(tris[:36], m.tris)
+        self.assertEqual(list(tris[36:]), [8, 9, 10])
+
+    def test_reads_what_colmap_writes(self):
+        # vertices with colour, CRLF header, faces with texture coordinates
+        head = ("ply\r\nformat binary_little_endian 1.0\r\ncomment TextureFile texture.png\r\n"
+                "element vertex 3\r\nproperty float x\r\nproperty float y\r\nproperty float z\r\n"
+                "property uchar red\r\nproperty uchar green\r\nproperty uchar blue\r\n"
+                "element face 1\r\nproperty list uchar int vertex_indices\r\n"
+                "property list uchar float texcoord\r\nend_header\r\n").encode()
+        body = b"".join(struct.pack("<3f3B", *p, 1, 2, 3) for p in ((0, 0, 0), (1, 0, 0), (0, 1, 0)))
+        body += struct.pack("<B3iB6f", 3, 0, 1, 2, 6, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6)
+        (self.tmp / "t.ply").write_bytes(head + body)
+        xyz, tris, uv = mp.read_ply(self.tmp / "t.ply")
+        self.assertEqual(list(xyz), [0, 0, 0, 1, 0, 0, 0, 1, 0])
+        self.assertEqual(list(tris), [0, 1, 2])
+        self.assertEqual([round(v, 6) for v in uv], [0.1, 0.2, 0.3, 0.4, 0.5, 0.6])
+
+    def test_rejects_what_it_cannot_use(self):
+        (self.tmp / "a.ply").write_bytes(b"ply\nformat ascii 1.0\nelement vertex 0\nend_header\n")
+        with self.assertRaisesRegex(mp.MeshError, "binary"):
+            mp.read_ply(self.tmp / "a.ply")
+        head = (b"ply\nformat binary_little_endian 1.0\nelement vertex 4\nproperty float x\n"
+                b"property float y\nproperty float z\nelement face 1\n"
+                b"property list uchar int vertex_indices\nend_header\n")
+        (self.tmp / "q.ply").write_bytes(head + bytes(48) + struct.pack("<B4i", 4, 0, 1, 2, 3))
+        with self.assertRaisesRegex(mp.MeshError, "triangles"):
+            mp.read_ply(self.tmp / "q.ply")
+        (self.tmp / "r.ply").write_bytes(head.replace(b"vertex 4", b"vertex 2") + bytes(24)
+                                         + struct.pack("<B3i", 3, 0, 1, 2))
+        with self.assertRaisesRegex(mp.MeshError, "does not exist"):
+            mp.read_ply(self.tmp / "r.ply")
+
+
+class AssembleTests(unittest.TestCase):
+    def test_coordinates_fill_and_drop(self):
+        # A strip of four faces textured by COLMAP except faces 1 and 2, plus a separate face
+        # that nothing textured. Atlas 8 x 4 in a padded 8 x 8 image.
+        xyz = array.array("f", [0, 0, 0, 1, 0, 0, 0, 1, 0, 1, 1, 0, 2, 1, 0, 2, 0, 0, 3, 1, 0,
+                                9, 9, 9, 9.5, 9, 9, 9, 9.5, 9])
+        tris = array.array("i", [0, 1, 2, 2, 1, 3, 3, 1, 5, 3, 5, 4, 7, 8, 9])
+        tris[12:15] = array.array("i", [7, 8, 9])
+        xyz.extend([0.0, 0.0, 0.0])                          # vertex 10 unused
+        face_uv = array.array("f", [0.1, 0.9, 0.2, 0.9, 0.1, 0.8] + [0.0] * 6 + [0.0] * 6
+                              + [0.5, 0.5, 0.6, 0.5, 0.6, 0.6] + [0.0] * 6)
+        out_xyz, out_tris, out_uv, stats = mp.assemble_textured(xyz, tris, face_uv, 8, 4, 8)
+        self.assertEqual(stats, {"faces_flat_coloured": 2, "faces_unseen_dropped": 1})
+        self.assertEqual(len(out_tris), 12)
+        corners = [(tuple(out_xyz[3 * i:3 * i + 3]), tuple(round(c, 6) for c in out_uv[2 * i:2 * i + 2]))
+                   for i in out_tris]
+        # face 0 as COLMAP gave it: u kept, v flipped to glTF's top-left origin and squeezed
+        # into the top half of the padded image
+        self.assertEqual(corners[0], ((0.0, 0.0, 0.0), (0.1, 0.05)))
+        self.assertEqual(corners[1], ((1.0, 0.0, 0.0), (0.2, 0.05)))
+        self.assertEqual(corners[2], ((0.0, 1.0, 0.0), (0.1, 0.1)))
+        # faces 1 and 2 are one flat colour taken from where they touch textured faces
+        for f in (1, 2):
+            self.assertEqual(len({c[1] for c in corners[3 * f:3 * f + 3]}), 1)
+        self.assertEqual(corners[3][1], corners[2][1])         # face 1 starts at vertex 2 of face 0
+        # nothing of the untextured island is left
+        self.assertTrue(all(c[0][0] < 5 for c in corners))
+        # one output vertex per (position, coordinate) pair
+        self.assertEqual(len(out_xyz) // 3, len(set(corners)))
+
+
+class ScaleSearchTests(unittest.TestCase):
+    @staticmethod
+    def colmap_like(area_at_one, patches, padding=5):
+        """Atlas sizes the way COLMAP lays them out, for patches of total area s^2 * A plus a gutter."""
+        calls = []
+
+        def probe(scale):
+            calls.append(scale)
+            area = scale * scale * area_at_one + patches * padding * (padding + 2 * math.sqrt(
+                scale * scale * area_at_one / patches))
+            side = math.sqrt(1.3 * area)
+            w = 1
+            while w < side:
+                w *= 2
+            h = int(math.ceil(area / (0.9 * w)))
+            while h > w:
+                w *= 2
+                h = int(math.ceil(area / (0.9 * w)))
+            return w, h
+        return probe, calls
+
+    def test_finds_the_largest_scale_that_fits(self):
+        probe, calls = self.colmap_like(186e6, 32000)
+        scale, (w, h), probes = mp.fit_texture_scale(probe, 4096)
+        self.assertEqual(w, 4096)
+        self.assertLessEqual(probes, mp.ATLAS_PROBES)
+        self.assertEqual(probe(scale), (w, h))
+        # either the atlas is well filled, or a slightly larger scale would not have fitted
+        self.assertTrue(h >= mp.ATLAS_GOOD_FILL * 4096
+                        or probe(scale * (1 + mp.ATLAS_SCALE_TOLERANCE))[0] > 4096)
+        self.assertGreaterEqual(h, 0.6 * 4096)
+        self.assertTrue(all(c <= mp.TEXTURE_MAX_SCALE for c in calls))
+
+    def test_never_magnifies_the_photos(self):
+        probe, calls = self.colmap_like(1e6, 100)
+        scale, (w, h), probes = mp.fit_texture_scale(probe, 8192)
+        self.assertEqual(scale, mp.TEXTURE_MAX_SCALE)
+        self.assertEqual(probes, 1)
+        self.assertLessEqual(w, 8192)
+
+    def test_impossible_budgets_are_explained(self):
+        probe, _ = self.colmap_like(1e6, 10 ** 6)          # a million patches cannot fit in 256 x 256
+        with self.assertRaisesRegex(mp.MeshError, "texture_size"):
+            mp.fit_texture_scale(probe, 256)
+
+
+class TransformTests(unittest.TestCase):
+    def test_points(self):
+        xyz = array.array("f", [1, 2, 3, -1, 0, 0.5])
+        m = (0.0, -2.0, 0.0, 1.0, 2.0, 0.0, 0.0, -1.0, 0.0, 0.0, 2.0, 0.5)
+        self.assertEqual(list(mp.transform_points(xyz, m)), [-3.0, 1.0, 6.5, 1.0, -3.0, 1.5])
+        self.assertEqual(mp.transform_points(xyz, mp.IDENTITY), xyz)
+
+    def test_photo_size_limit(self):
+        cams = {1: (1, 3000, 2000, (1, 1, 1, 1))}
+        few = [(i, "a", LOOK_R, LOOK_T, 1) for i in range(10)]
+        self.assertEqual(mp.photo_size_limit(cams, few), -1)
+        many = [(i, "a", LOOK_R, LOOK_T, 1) for i in range(1000)]
+        limit = mp.photo_size_limit(cams, many)
+        self.assertLess(limit, 3000)
+        k = limit / 3000
+        self.assertLessEqual(1000 * 3000 * 2000 * k * k, mp.PHOTO_PIXEL_BUDGET)
+        self.assertGreater(1000 * 3000 * 2000 * k * k, 0.98 * mp.PHOTO_PIXEL_BUDGET)
+
+
+# ---------------------------------------------------------------------------------------------
+# End to end against a stand-in for colmap.exe
+# ---------------------------------------------------------------------------------------------
+
+FAKE_COLMAP = r'''
+import array, math, os, shutil, struct, sys, time, zlib
 from pathlib import Path
 sys.path.insert(0, os.environ["FAKE_APP_DIR"])
 import meshpost as mp
@@ -638,68 +842,183 @@ import meshpost as mp
 def arg(name, default=None):
     return sys.argv[sys.argv.index(name) + 1] if name in sys.argv else default
 
-def png(width, height):
+def log(text):
+    print(text, file=sys.stderr, flush=True)
+
+def fail_if(name, code=1):
+    if os.environ.get("FAKE_FAIL") == name:
+        log("E: %s failed" % name); sys.exit(code)
+    if os.environ.get("FAKE_HANG") == name:
+        log("%s: working" % name); time.sleep(600)
+
+assert arg("--log_target") == "stderr"
+command = sys.argv[1]
+with open(os.environ["FAKE_CALLS"], "a", encoding="utf-8") as calls:
+    calls.write(" ".join(sys.argv[1:]) + "\n")
+fail_if(command)
+
+if command == "image_undistorter":
+    out = Path(arg("--output_path"))
+    if not out.parent.is_dir():
+        sys.exit(-1073740791)                      # what the real one does: 0xC0000409
+    sparse = Path(arg("--input_path"))
+    cams = mp.read_cameras_bin(sparse / "cameras.bin")
+    images = mp.read_images_bin(sparse / "images.bin")
+    wanted = None
+    if arg("--image_list_path"):
+        wanted = Path(arg("--image_list_path")).read_text(encoding="utf-8").split()
+    (out / "sparse").mkdir(parents=True)
+    body = bytearray(struct.pack("<Q", len(cams)))
+    for cid, (model, w, h, p) in cams.items():
+        body += struct.pack("<iiQQ4d", cid, 1, w, h, p[0], p[0], p[2], p[3])
+    (out / "sparse" / "cameras.bin").write_bytes(bytes(body))
+    shutil.copy(sparse / "images.bin", out / "sparse" / "images.bin")
+    for _, name, _, _, _ in images:
+        if wanted is None or name in wanted:
+            target = out / "images" / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy(Path(arg("--image_path")) / name, target)
+    (out / "stereo").mkdir()
+    log("Undistorting image [1/1]")
+
+elif command == "image_deleter":
+    drop = Path(arg("--image_names_path")).read_text(encoding="utf-8").split()
+    src, dst = Path(arg("--input_path")), Path(arg("--output_path"))
+    assert dst.is_dir()
+    images = [i for i in mp.read_images_bin(src / "images.bin") if i[1] not in drop]
+    body = bytearray(struct.pack("<Q", len(images)))
+    raw = (src / "images.bin").read_bytes()
+    pos = 8
+    for _ in range(struct.unpack_from("<Q", raw, 0)[0]):
+        start = pos
+        end = raw.index(b"\x00", pos + 64)
+        name = raw[pos + 64:end].decode()
+        pos = end + 1 + 8 + 24 * struct.unpack_from("<Q", raw, end + 1)[0]
+        if name not in drop:
+            body += raw[start:pos]
+    (dst / "images.bin").write_bytes(bytes(body))
+    shutil.copy(src / "cameras.bin", dst / "cameras.bin")
+
+elif command == "patch_match_stereo":
+    ws = Path(arg("--workspace_path"))
+    cfg = (ws / "stereo" / "patch-match.cfg").read_text(encoding="utf-8").splitlines()
+    names = cfg[0::2]
+    known = [n for _, n, _, _, _ in mp.read_images_bin(ws / "sparse" / "images.bin")]
+    for name in names:
+        assert (ws / "images" / name).is_file() and name in known, name
+    for kind in ("photometric", "geometric"):
+        for k, name in enumerate(names):
+            log("=== Processing view %d / %d for %s ===" % (k + 1, len(names), name))
+            target = ws / "stereo" / "depth_maps" / (name + "." + kind + ".bin")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"depth")
+
+elif command == "stereo_fusion":
+    ws = Path(arg("--workspace_path"))
+    names = (ws / "stereo" / "fusion.cfg").read_text(encoding="utf-8").split()
+    for k, name in enumerate(names):
+        assert (ws / "stereo" / "depth_maps" / (name + ".geometric.bin")).is_file()
+        log("Fusing image [%d/%d] with index %d" % (k + 1, len(names), k))
+    Path(arg("--output_path")).write_bytes(b"ply points")
+    Path(arg("--output_path") + ".vis").write_bytes(b"vis")
+    log("Number of fused points: 4321")
+
+elif command == "delaunay_mesher":
+    ws = Path(arg("--input_path"))
+    if not (ws / "fused.ply").is_file() or not (ws / "fused.ply.vis").is_file():
+        sys.exit(-1073740791)
+    log("Triangulating points...")
+    log("Integrating image [1/1]")
+    # The scene, in the dataset frame: a 40 x 40 grid over [0, 4]^2 at z = 0 with a ripple at
+    # x > 3 (3200 faces), and 30 floaters of 2 faces each, far to the side.
+    n = 40
+    xyz, tris = [], []
+    for j in range(n + 1):
+        for i in range(n + 1):
+            x, y = 4.0 * i / n, 4.0 * j / n
+            xyz += [x, y, 0.05 * (i % 2) * (x > 3.0)]
+    for j in range(n):
+        for i in range(n):
+            a = j * (n + 1) + i
+            tris += [a, a + 1, a + n + 2, a, a + n + 2, a + n + 1]
+    for k in range(30):
+        base = len(xyz) // 3
+        for dx, dy in ((0, 0), (1, 0), (1, 1), (0, 1)):
+            xyz += [10.0 + k + 0.05 * dx, 10.0 + 0.05 * dy, 0.0]
+        tris += [base, base + 1, base + 2, base, base + 2, base + 3]
+    if os.environ.get("FAKE_SHARD") == "1":
+        # what the graph cut leaves in the sky: one huge triangle far behind the scene, the
+        # largest piece by area
+        base = len(xyz) // 3
+        xyz += [-100.0, -50.0, 60.0, 150.0, -50.0, 60.0, -100.0, 100.0, 60.0]
+        tris += [base, base + 1, base + 2]
+    mp.write_ply(arg("--output_path"), array.array("f", xyz), array.array("i", tris))
+    log("Writing surface mesh...")
+
+elif command == "mesh_simplifier":
+    # Stand-in decimation: keep the first faces, as many as the ratio allows.
+    xyz, tris, _ = mp.read_ply(arg("--input_path"))
+    ratio = float(arg("--MeshSimplification.target_face_ratio"))
+    keep = max(1, int(math.floor(len(tris) // 3 * ratio)))
+    if os.environ.get("FAKE_SIMPLIFY_STUCK") == "1":
+        keep = len(tris) // 3
+    m = mp.select_faces(mp.Mesh(xyz, tris), [f < keep for f in range(len(tris) // 3)])
+    mp.write_ply(arg("--output_path"), m.xyz, m.tris)
+
+elif command == "mesh_texturer":
+    scale = float(arg("--MeshTextureMapping.texture_scale_factor"))
+    xyz, tris, _ = mp.read_ply(arg("--input_path"))
+    n = len(tris) // 3
+    with open(os.environ["FAKE_CALLS"], "a") as calls:
+        calls.write("faces %d\n" % n)
+    log("Loading 1 images...")
+    log("Selecting views for %d faces from 1 images..." % n)
+    # Faces whose first vertex lies in the band 1.0 <= x < 1.4 get no view; all other faces do.
+    unseen = [1.0 <= xyz[3 * tris[3 * f]] < 1.4 for f in range(n)]
+    if os.environ.get("FAKE_NO_VIEWS") == "1":
+        unseen = [True] * n
+    log("%d / %d faces assigned to views" % (unseen.count(False), n))
+    log("Found %d regions" % max(1, n // 8))
+    # Atlas: the patches take 4e6 * scale^2 px plus a gutter per patch; COLMAP's layout rule.
+    area = 4e6 * scale * scale + (n // 8) * 25
+    w = 1
+    while w < math.sqrt(1.3 * area):
+        w *= 2
+    h = int(math.ceil(area / (0.85 * w)))
+    while h > w:
+        w *= 2
+        h = int(math.ceil(area / (0.85 * w)))
+    h = int(os.environ.get("FAKE_ATLAS_HEIGHT", h))
+    log("Atlas size: %d x %d" % (w, h))
+    time.sleep(0.2)
+    log("Baking texture...")
+    out = Path(arg("--output_path"))
+    out.mkdir(parents=True, exist_ok=True)
     def chunk(kind, body):
         return struct.pack(">I", len(body)) + kind + body + struct.pack(">I", zlib.crc32(kind + body))
-    rows = (b"\x00" + bytes(3 * width)) * height
-    return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
-            + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
-
-if sys.argv[1] != "mesh":
-    sys.exit(2)
-run = Path(sys.argv[2]).name
-if "--boom" in run:
-    print("[meshing] error: out of memory"); sys.exit(1)
-if "--nocam" in run:
-    print("[meshing] loading: WARNING: No camera dataset in use: meshing from Gaussian densities only.")
-if "--hang" in run:
-    print("[meshing] loading: ...", flush=True); time.sleep(600)
-assert arg("--lang") == "en" and arg("--format") == "glb+png" and arg("--color") == "texture"
-assert arg("--floater-min-faces") == "100" and int(arg("--chart-angle-deg")) == mp.CHART_ANGLE_DEG
-assert float(arg("--merge-factor")) in (mp.MERGE_FACTOR, mp.LARGE_SPLAT_MERGE_FACTOR)
-assert Path(arg("--data"), "images").is_dir()
-size = int(arg("--texture-size"))
-assert size & (size - 1) == 0
-print("[meshing] loading: Gaussians: 5", flush=True)
-# The scene: a 40 x 40 grid over [0, 4]^2 with a ripple, in two charts with the cut along
-# x = 2 (3200 faces), and 30 floaters of 2 faces each, a chart apiece, far to the side.
-n, half = 40, 20
-xyz, uv, tris = [], [], []
-for first, u0 in ((0, 0.02), (half, 0.42)):
-    base = len(xyz) // 3
-    for j in range(n + 1):
-        for i in range(half + 1):
-            x, y = 4.0 * (first + i) / n, 4.0 * j / n
-            xyz += [x, y, 0.05 * ((first + i) % 2) * (x > 3.0)]
-            uv += [u0 + 0.36 * i / half, 0.02 + 0.96 * j / n]
-    for j in range(n):
-        for i in range(half):
-            a = base + j * (half + 1) + i
-            tris += [a, a + 1, a + half + 2, a, a + half + 2, a + half + 1]
-for k in range(30):
-    base = len(xyz) // 3
-    for dx, dy in ((0, 0), (1, 0), (1, 1), (0, 1)):
-        xyz += [10.0 + k + 0.05 * dx, 10.0 + 0.05 * dy, 0.0]
-        uv += [0.82 + 0.005 * k + 0.004 * dx, 0.02 + 0.004 * dy]
-    tris += [base, base + 1, base + 2, base, base + 2, base + 3]
-for stage in ("point cloud", "Delaunay", "occupancy", "cut edges", "bisection", "marching tets",
-              "merge", "cull unseen", "merge", "cleanup", "cull unseen", "merge", "cleanup",
-              "quality", "orient"):
-    print("[meshing] %s: 0.01s" % stage)
-print("[meshing] stats: - vertices: %d, faces: %d, components: 31;" % (len(xyz) // 3, len(tris) // 3))
-print("[meshing] texel density: cameras rendered: 2/2")
-print("[meshing] UV: charts: 32 over faces: %d (0.01s)" % (len(tris) // 3))
-print("[meshing] UV: charts parameterized: 32 (split retries: 0, parked: 0) (0.01s)")
-print("[meshing] UV: charts packed: 32, efficiency 60%")
-size = int(os.environ.get("FAKE_TEXTURE_SIZE", size))
-textured = os.environ.get("FAKE_NO_TEXTURE") != "1"
-m = mp.Mesh(array.array("f", xyz), array.array("i", tris))
-mp.write_glb(arg("--output") + ".glb", positions=m.xyz, indices=array.array("I", tris),
-             normals=mp.vertex_normals(m), uvs=array.array("f", uv) if textured else None,
-             image=png(size, size) if textured else None)
-Path(arg("--output") + ".positions").write_bytes(m.xyz.tobytes())
-print("[meshing] bake: the %dx%d texture is finished" % (size, size))
-print("[meshing] done: vertices: %d, faces: %d (total 0.1s)" % (len(xyz) // 3, len(tris) // 3))
+    rows = b"".join(b"\x01" + bytes([200, 100, 50]) + bytes(3 * (w - 1)) for _ in range(h))
+    (out / "texture.png").write_bytes(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                                      + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+    # Each textured face gets its own small triangle in the atlas, laid out on a grid.
+    per_row = max(1, int(math.sqrt(n)) + 1)
+    head = ("ply\r\nformat binary_little_endian 1.0\r\ncomment TextureFile texture.png\r\nelement vertex %d\r\n"
+            "property float x\r\nproperty float y\r\nproperty float z\r\nelement face %d\r\n"
+            "property list uchar int vertex_indices\r\nproperty list uchar float texcoord\r\nend_header\r\n"
+            % (len(xyz) // 3, n)).encode()
+    body = bytearray(head) + xyz.tobytes()
+    cell = 1.0 / per_row
+    for f in range(n):
+        if unseen[f]:
+            uv = (0.0,) * 6
+        else:
+            cx, cy = (f % per_row) * cell, (f // per_row) * cell
+            uv = (cx + 0.1 * cell, 1 - (cy + 0.1 * cell), cx + 0.9 * cell, 1 - (cy + 0.1 * cell),
+                  cx + 0.1 * cell, 1 - (cy + 0.9 * cell))
+        body += struct.pack("<B3iB6f", 3, *tris[3 * f:3 * f + 3], 6, *uv)
+    (out / "mesh.ply").write_bytes(bytes(body))
+    log("Writing textured mesh to mesh.ply")
+else:
+    sys.exit(3)
 '''
 
 
@@ -707,23 +1026,29 @@ print("[meshing] done: vertices: %d, faces: %d (total 0.1s)" % (len(xyz) // 3, l
 class PipelineTests(TempDirCase):
     def setUp(self):
         super().setUp()
-        (self.tmp / "fake_tool.py").write_text(FAKE_TOOL, encoding="utf-8")
-        launcher = '@"%s" "%s" %%*\r\n' % (sys.executable, self.tmp / "fake_tool.py")
-        (self.tmp / "spirula.cmd").write_text(launcher, encoding="ascii")
-        self.tools = {"spirula": str(self.tmp / "spirula.cmd")}     # no other tool exists any more
+        (self.tmp / "fake_colmap.py").write_text(FAKE_COLMAP, encoding="utf-8")
+        launcher = '@"%s" "%s" %%*\r\n' % (sys.executable, self.tmp / "fake_colmap.py")
+        (self.tmp / "colmap.cmd").write_text(launcher, encoding="ascii")
+        # spirula is passed by the pipeline but not used for meshing
+        self.tools = {"spirula": str(self.tmp / "no_spirula.exe"), "colmap": str(self.tmp / "colmap.cmd")}
         self.dataset = self.tmp / "dataset"
-        (self.dataset / "images").mkdir(parents=True)
-        (self.dataset / "sparse").mkdir()
-        patch = unittest.mock.patch.dict(os.environ, {"FAKE_APP_DIR": str(APP)})
+        self.add_photos(["photos/a.jpg"])
+        self.calls = self.tmp / "calls.txt"
+        patch = unittest.mock.patch.dict(os.environ, {"FAKE_APP_DIR": str(APP), "FAKE_CALLS": str(self.calls)})
         patch.start()
         self.addCleanup(patch.stop)
 
-    def make_run(self, name="run", transform=None, gaussians=5):
+    def add_photos(self, names):
+        for name in names:
+            (self.dataset / "images" / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.dataset / "images" / name).write_bytes(b"jpeg")
+        write_model(self.dataset / "sparse" / "0", {1: LOOK_CAMERA},
+                    [(k + 1, name, LOOK_R, WIDE_T, 1) for k, name in enumerate(names)])
+
+    def make_run(self, name="run", transform=None):
         run = self.tmp / name
         (run / "step-000000100.ckpt").mkdir(parents=True)
-        (run / "step-000000100.ckpt" / "splat.ply").write_bytes(
-            b"ply\nformat binary_little_endian 1.0\nelement vertex %d\nproperty float x\nend_header\n"
-            % gaussians)
+        (run / "step-000000100.ckpt" / "splat.ply").write_bytes(b"ply\nend_header\n")
         (run / "config.json").write_text("{}")
         if transform:
             (run / "scene_transform.json").write_text(json.dumps(transform))
@@ -738,11 +1063,10 @@ class PipelineTests(TempDirCase):
 
     def positions(self, path):
         mesh, _ = mp.read_glb(path)
-        return {bytes(mesh.xyz[3 * i:3 * i + 3]) for i in range(mesh.vertex_count)}
+        return {tuple(mesh.xyz[3 * i:3 * i + 3]) for i in range(mesh.vertex_count)}
 
-    def extracted_positions(self, work="work"):
-        raw = (self.tmp / work / "spirula" / "mesh.positions").read_bytes()
-        return {raw[i:i + 12] for i in range(0, len(raw), 12)}
+    def calls_to(self, command):
+        return [line for line in self.calls.read_text(encoding="utf-8").splitlines() if line.startswith(command)]
 
     def test_builds_both_files(self):
         seen = []
@@ -760,95 +1084,143 @@ class PipelineTests(TempDirCase):
         self.assertEqual(result["mesh_bytes"], mesh["bytes"])
         self.assertEqual(result["collision_faces"], collision["faces"])
         self.assertEqual(result["collision_vertices"], collision["vertices"])
+        self.assertEqual(result["collision_bytes"], collision["bytes"])
         self.assertTrue(mesh["has_uv"] and mesh["has_normals"])
         self.assertTrue(collision["has_normals"])
         self.assertFalse(collision["has_uv"])
-        self.assertEqual(result["texture_size"], 1024)
+        # a square power-of-two texture no larger than asked for
         self.assertEqual((mesh["texture_width"], mesh["texture_height"]), (1024, 1024))
+        self.assertEqual(result["texture_size"], 1024)
         self.assertEqual(result["texture_format"], "png")
-        self.assertEqual(result["texture_charts"], 32)
+        self.assertGreater(result["texture_scale"], 0.0)
+        self.assertLessEqual(result["texture_scale"], mp.TEXTURE_MAX_SCALE)
+        self.assertGreater(result["texture_patches"], 0)
+        self.assertGreater(result["faces_flat_coloured"], 0)    # the band the stand-in leaves out
+        self.assertEqual(result["faces_unseen_dropped"], 0)
+        self.assertEqual(result["masked_photos"], 0)
+        self.assertEqual(result["geometry"], "colmap-dense")
+        self.assertEqual(result["dense_photos"], 1)
+        self.assertEqual(result["dense_points"], 4321)
         self.assertEqual(result["raw_faces"], 3260)
+        self.assertEqual(result["faces_shards_removed"], 0)
         self.assertEqual(result["raw_components"], 31)
         self.assertEqual(result["mesh_components_kept"], 1)   # the 30 floaters are gone
         self.assertEqual(result["collision_components_kept"], 1)
-        self.assertEqual(result["merge_factor"], mp.MERGE_FACTOR)
-        self.assertEqual(result["merge_factor"], 1.0)
-        self.assertEqual(result["chart_angle_deg"], mp.CHART_ANGLE_DEG)
-        self.assertEqual(result["gaussians"], 5)
-        self.assertGreater(result["texture_area_kept"], 0.9)
-        self.assertLess(result["faces_texture_stretched"], 0.1 * mesh["faces"])
-        self.assertNotIn("faces_flat_coloured", result)
         self.assertGreaterEqual(result["seconds"], 0)
+        self.assertEqual(set(result["timings"]), {"dense", "simplify", "texture", "visual_glb",
+                                                  "collision_simplify", "collision_glb", "validate"})
+        for gone in ("texture_charts", "faces_texture_stretched", "texture_area_kept", "chart_angle_deg",
+                     "merge_factor", "gaussians"):
+            self.assertNotIn(gone, result)
         # floaters sat at x >= 10; nothing of them may survive
         self.assertLess(mesh["bbox_max"][0], 5)
         self.assertLess(collision["bbox_max"][0], 5)
-        # every vertex of either file is a vertex Spirula wrote, at the numbers it wrote
-        source = self.extracted_positions()
-        self.assertLessEqual(self.positions(result["mesh"]), source)
-        self.assertLessEqual(self.positions(result["collision"]), source)
+        # dense matching on the photo, with the configured number of source photos
+        cfg = (self.tmp / "work" / "dense" / "stereo" / "patch-match.cfg").read_text().splitlines()
+        self.assertEqual(cfg, ["photos/a.jpg", "__auto__, %d" % mp.MVS_SOURCE_IMAGES])
+        self.assertIn("--max_image_size %d" % mp.MVS_IMAGE_SIZE, self.calls_to("image_undistorter")[0])
+        self.assertEqual(len(self.calls_to("patch_match_stereo")), 1)
+        self.assertEqual(self.calls_to("image_deleter"), [])   # every photo used: nothing to drop
+        # the scale was found by probes that stopped early, then one full run
+        texturer = self.calls_to("mesh_texturer")
+        self.assertGreaterEqual(len(texturer), 2)
+        self.assertIn("--MeshTextureMapping.texture_scale_factor %r" % result["texture_scale"], texturer[-1])
         fractions = [f for f, _ in seen]
         self.assertEqual(fractions, sorted(fractions))
         self.assertEqual(fractions[-1], 1.0)
         self.assertTrue(all(0.0 <= f <= 1.0 for f in fractions))
-        self.assertLessEqual({"提取表面", "生成贴图", "清除零散碎片", "写出带贴图网格", "简化碰撞网格",
-                              "写出碰撞网格", "检查文件", "网格完成"}, {m for _, m in seen})
+        self.assertLessEqual({"准备照片", "计算深度图", "融合点云", "重建表面", "清除零散碎片", "简化网格",
+                              "处理遮罩", "估算贴图尺寸", "生成贴图", "整理贴图", "写出带贴图网格",
+                              "简化碰撞网格", "写出碰撞网格", "检查文件", "网格完成"},
+                             {m for _, m in seen})
         log = (self.tmp / "mesh.log").read_text(encoding="utf-8", errors="replace")
-        for word in ("--data", "--color texture", "--merge-factor 1.0", "--chart-angle-deg",
-                     "[meshpost] wrote mesh.glb"):
+        for word in ("patch_match_stereo", "stereo_fusion", "delaunay_mesher", "mesh_simplifier",
+                     "mesh_texturer", "[meshpost] texture scale probes", "[meshpost] wrote mesh.glb"):
             self.assertIn(word, log)
-        self.assertNotIn("colmap", log.lower())
+        self.assertNotIn("spirula", log.lower().replace("spirula-train", ""))
 
-    def test_no_face_of_the_result_is_one_flat_colour(self):
-        result = self.build(self.make_run(), visual_faces=400)
-        mesh, _ = mp.read_glb(result["mesh"])
-        self.assertLessEqual(mesh.face_count, 400)
-        for f in range(mesh.face_count):
-            (u0, v0), (u1, v1), (u2, v2) = (tuple(mesh.uv[2 * i:2 * i + 2]) for i in mesh.tris[3 * f:3 * f + 3])
-            self.assertNotEqual((u1 - u0) * (v2 - v0) - (v1 - v0) * (u2 - u0), 0.0)
-        self.assertGreaterEqual(result["faces_texture_stretched"], 0)
-        self.assertLessEqual(result["faces_texture_stretched"], mesh.face_count)
+    def test_dense_matching_uses_a_spread_of_the_photos(self):
+        names = ["photos/p_%03d.jpg" % k for k in range(9)] + ["v1/f_%03d.jpg" % k for k in range(3)]
+        self.add_photos(names)
+        with unittest.mock.patch.object(mp, "MVS_MAX_IMAGES", 4):
+            result = self.build(self.make_run())
+        chosen = mp.mvs_images([(0, n, None, None, 1) for n in names], 4)
+        self.assertEqual(len(chosen), 4)
+        self.assertEqual(len(set(chosen)), 4)
+        self.assertEqual(result["dense_photos"], 4)
+        cfg = (self.tmp / "work" / "dense" / "stereo" / "patch-match.cfg").read_text().splitlines()
+        self.assertEqual(cfg[0::2], chosen)
+        listed = (self.tmp / "work" / "dense_images.txt").read_text().split()
+        self.assertEqual(listed, chosen)
+        self.assertEqual(len(self.calls_to("image_deleter")), 1)
+        kept = [n for _, n, _, _, _ in mp.read_images_bin(self.tmp / "work" / "dense" / "sparse" / "images.bin")]
+        self.assertEqual(sorted(kept), sorted(chosen))
+        # ...while the texture is made from every photo
+        textured = [n for _, n, _, _, _ in mp.read_images_bin(self.tmp / "work" / "undistorted" / "sparse" / "images.bin")]
+        self.assertEqual(len(textured), 12)
+        self.assertEqual(mp.mvs_images([(0, n, None, None, 1) for n in names], 50), sorted(names))
 
-    def test_a_very_large_splat_is_extracted_coarser(self):
-        result = self.build(self.make_run("run_big", gaussians=mp.LARGE_SPLAT_GAUSSIANS + 1))
-        self.assertEqual(result["merge_factor"], mp.LARGE_SPLAT_MERGE_FACTOR)
-        self.assertEqual(result["gaussians"], mp.LARGE_SPLAT_GAUSSIANS + 1)
-        log = (self.tmp / "mesh.log").read_text(encoding="utf-8", errors="replace")
-        self.assertIn("--merge-factor %r" % mp.LARGE_SPLAT_MERGE_FACTOR, log)
+    def test_shards_are_removed(self):
+        with unittest.mock.patch.dict(os.environ, {"FAKE_SHARD": "1"}):
+            result = self.build(self.make_run())
+        self.assertEqual(result["faces_shards_removed"], 1)
+        self.assertEqual(result["raw_faces"], 3261)
+        self.assertEqual(result["mesh_components_kept"], 1)
+        mesh = mp.validate_glb(result["mesh"])
+        self.assertLess(mesh["bbox_max"][2], 0.1)               # the grid, not the shard above it
+        self.assertGreater(mesh["bbox_min"][0], -0.01)
+        self.assertGreater(mesh["faces"], 900)
 
-    def test_gaussian_count_and_merge_factor(self):
-        run = self.make_run("run_n", gaussians=123456)
-        self.assertEqual(mp.count_gaussians(run / "step-000000100.ckpt" / "splat.ply"), 123456)
-        self.assertEqual(mp.count_gaussians(self.tmp / "no_such.ply"), 0)
-        (self.tmp / "odd.ply").write_bytes(b"ply\n")
-        self.assertEqual(mp.count_gaussians(self.tmp / "odd.ply"), 0)
-        self.assertEqual(mp.merge_factor_for(0), 1.0)                # unknown size: the full surface
-        self.assertEqual(mp.merge_factor_for(1_000_000), 1.0)
-        self.assertEqual(mp.merge_factor_for(2_000_000), 1.0)        # the high preset's cap
-        self.assertEqual(mp.merge_factor_for(mp.LARGE_SPLAT_GAUSSIANS), mp.MERGE_FACTOR)
-        self.assertEqual(mp.merge_factor_for(mp.LARGE_SPLAT_GAUSSIANS + 1), mp.LARGE_SPLAT_MERGE_FACTOR)
-        self.assertGreater(mp.LARGE_SPLAT_MERGE_FACTOR, mp.MERGE_FACTOR)
-
-    def test_a_mesh_inside_its_budget_is_passed_through_untouched(self):
+    def test_texture_coordinates_point_into_the_atlas(self):
         result = self.build(self.make_run(), visual_faces=5000, collision_faces=5000)
-        self.assertEqual(result["mesh_faces"], 3200)          # all of the scene, none of the floaters
-        self.assertEqual(result["faces_texture_stretched"], 0)
-        self.assertEqual(result["texture_area_kept"], 1.0)
         mesh, image = mp.read_glb(result["mesh"])
-        self.assertEqual(mesh.vertex_count, 2 * 21 * 41)      # seam vertices still present twice
-        source = self.extracted_positions()
-        self.assertEqual(len(self.positions(result["mesh"])), 41 * 41)
-        self.assertLessEqual(self.positions(result["mesh"]), source)
+        self.assertEqual(result["mesh_faces"], 3200)          # all of the scene, none of the floaters
         self.assertEqual(mp.image_size(image), ("image/png", 1024, 1024))
-        self.assertGreaterEqual(min(mesh.uv), 0.02 - 1e-6)
-        self.assertLessEqual(max(mesh.uv[0::2]), 0.78 + 1e-6)
+        w, h, channels, rows = decode_png(image)
+        atlas_h = max(i for i, r in enumerate(rows) if r[:3] == bytes([200, 100, 50])) + 1
+        self.assertLess(atlas_h, 1024)                        # COLMAP's atlas, padded below
+        flat = 0
+        for f in range(mesh.face_count):
+            corners = [tuple(mesh.uv[2 * i:2 * i + 2]) for i in mesh.tris[3 * f:3 * f + 3]]
+            for u, v in corners:
+                self.assertLessEqual(v * 1024, atlas_h + 1e-3)   # never into the padding
+            if len(set(corners)) == 1:
+                flat += 1
+            else:
+                (u0, v0), (u1, v1), (u2, v2) = corners
+                self.assertNotEqual((u1 - u0) * (v2 - v0) - (v1 - v0) * (u2 - u0), 0.0)
+        self.assertEqual(flat, result["faces_flat_coloured"])
+        self.assertGreater(flat, 100)                         # the band 1.0 <= x < 1.4 had no view
         self.assertEqual(result["collision_faces"], 3200)
-        self.assertEqual(result["collision_vertices"], 41 * 41)   # ...and joined for collision
+        self.assertEqual(result["collision_vertices"], 41 * 41)   # one vertex per position for collision
+        self.assertEqual(self.calls_to("mesh_simplifier"), [])   # nothing over budget, nothing simplified
+
+    def test_masked_people_become_occluders(self):
+        (self.dataset / "masks" / "photos").mkdir(parents=True)
+        person = [bytes(0 if (20 <= x < 30 and 10 <= y < 30) else 255 for x in range(64)) for y in range(48)]
+        (self.dataset / "masks" / "photos" / "a.png").write_bytes(png_bytes(64, 48, person, 1, (0, 2, 4)))
+        result = self.build(self.make_run())
+        self.assertEqual(result["masked_photos"], 1)
+        faces = [int(line.split()[1]) for line in self.calls_to("faces ")]
+        _, tris, _ = mp.read_ply(self.tmp / "work" / "texture_in.ply")
+        self.assertGreater(len(tris) // 3, result["mesh_faces"])          # occluders handed to COLMAP...
+        self.assertEqual(set(faces), {len(tris) // 3})
+        mesh = mp.validate_glb(result["mesh"])
+        self.assertLessEqual(mesh["faces"], 1000)                           # ...and none of them kept
+        self.assertGreater(mesh["bbox_min"][2], -0.01)                      # nothing near the camera
 
     def test_texture_size_is_rounded_down_to_a_power_of_two(self):
         result = self.build(self.make_run(), texture_size=1500)
         self.assertEqual(result["texture_size"], 1024)
 
-    def test_outputs_stay_in_the_splat_frame_when_the_run_was_recentred(self):
+    def test_small_scenes_are_not_magnified(self):
+        # at scale 1 the stand-in's atlas is 4096 wide: an 8192 budget is not filled up
+        result = self.build(self.make_run(), texture_size=8192)
+        self.assertEqual(result["texture_scale"], 1.0)
+        self.assertEqual(result["texture_size"], 4096)
+        self.assertEqual(len(self.calls_to("mesh_texturer")), 2)    # one probe, one run
+
+    def test_outputs_are_in_the_splat_frame_when_the_run_was_recentred(self):
         fwd = [0.5, 0, 0, 1, 0, 0, -0.5, 2, 0, 0.5, 0, 3]
         inv = [2, 0, 0, -2, 0, 0, 2, -6, 0, -2, 0, 4]
         run = self.make_run("run_t", {"train_from_world": {"matrix_3x4_flat_row_major": fwd},
@@ -858,44 +1230,68 @@ class PipelineTests(TempDirCase):
         self.assertFalse(moved["scene_transform_is_identity"])
         self.assertTrue(plain["scene_transform_is_identity"])
         self.assertEqual(moved["frame"], "spirula-train")
-        # Spirula writes the mesh in the frame of the splat whatever the dataset frame is, so
-        # the transform must change nothing: same numbers out as Spirula put in.
-        self.assertEqual(self.positions(moved["mesh"]), self.positions(plain["mesh"]))
-        self.assertLessEqual(self.positions(moved["mesh"]), self.extracted_positions("work_t"))
+        # COLMAP reconstructs in the dataset frame; the files hold the same points in the splat's
+        world = self.positions(plain["mesh"])
+        train = self.positions(moved["mesh"])
+        self.assertEqual(len(world), len(train))
+        want = {tuple(array.array("f", [fwd[0] * x + fwd[1] * y + fwd[2] * z + fwd[3],
+                                        fwd[4] * x + fwd[5] * y + fwd[6] * z + fwd[7],
+                                        fwd[8] * x + fwd[9] * y + fwd[10] * z + fwd[11]]))
+                for x, y, z in world}
+        self.assertEqual(train, want)
         doc_raw = Path(moved["mesh"]).read_bytes()
         doc = json.loads(doc_raw[20:20 + struct.unpack_from("<I", doc_raw, 12)[0]])
         self.assertEqual(doc["nodes"], [{"mesh": 0, "name": "mesh"}])     # no transform on the node
         self.assertEqual(mp.validate_glb(moved["mesh"])["extras"]["frame"],
                          "spirula-train (same numbers as splat.ply)")
+        # ...and the texturer was given them back in the dataset frame, where the cameras are
+        a, _, _ = mp.read_ply(self.tmp / "work_p" / "texture_in.ply")
+        b, _, _ = mp.read_ply(self.tmp / "work_t" / "texture_in.ply")
+        self.assertEqual(len(a), len(b))
+        self.assertLess(max(abs(p - q) for p, q in zip(a, b)), 1e-5)
 
-    def test_oversized_texture_is_refused(self):
-        with unittest.mock.patch.dict(os.environ, {"FAKE_TEXTURE_SIZE": "2048"}):
-            with self.assertRaisesRegex(mp.MeshError, "2048 x 2048 texture"):
+    def test_an_atlas_other_than_planned_is_refused(self):
+        with unittest.mock.patch.dict(os.environ, {"FAKE_ATLAS_HEIGHT": "4096"}):
+            with self.assertRaisesRegex(mp.MeshError, "texture"):
                 self.build(self.make_run())
         self.assertFalse((self.tmp / "out" / "mesh.glb").exists())
 
-    def test_mesh_without_texture_is_refused(self):
-        with unittest.mock.patch.dict(os.environ, {"FAKE_NO_TEXTURE": "1"}):
-            with self.assertRaisesRegex(mp.MeshError, "without a texture"):
+    def test_nothing_textured_is_refused(self):
+        with unittest.mock.patch.dict(os.environ, {"FAKE_NO_VIEWS": "1"}):
+            with self.assertRaisesRegex(mp.MeshError, "No camera saw"):
                 self.build(self.make_run())
+
+    def test_a_simplifier_that_stalls_is_reported(self):
+        with unittest.mock.patch.dict(os.environ, {"FAKE_SIMPLIFY_STUCK": "1"}):
+            with self.assertRaisesRegex(mp.MeshError, "could not be simplified"):
+                self.build(self.make_run())
+        self.assertEqual(len(self.calls_to("mesh_simplifier")), mp.SIMPLIFY_PASSES)
+
+    def test_tool_failures_are_explained(self):
+        for command, words in (("image_undistorter", "image_undistorter"),
+                               ("patch_match_stereo", "NVIDIA GPU"),
+                               ("stereo_fusion", "stereo_fusion"),
+                               ("delaunay_mesher", "delaunay_mesher"),
+                               ("mesh_simplifier", "mesh_simplifier"),
+                               ("mesh_texturer", "mesh_texturer")):
+            with self.subTest(command), unittest.mock.patch.dict(os.environ, {"FAKE_FAIL": command}):
+                with self.assertRaisesRegex(mp.MeshError, words):
+                    self.build(self.make_run("run_" + command))
+                self.assertFalse((self.tmp / "out" / "mesh.glb").exists())
 
     def test_stale_outputs_do_not_survive_a_failed_run(self):
         out = self.tmp / "out"
         out.mkdir()
         (out / "mesh.glb").write_bytes(b"old")
         (out / "collision.glb").write_bytes(b"old")
-        with self.assertRaises(mp.MeshError):
-            self.build(self.make_run("run--boom"))
+        (self.tmp / "work" / "dense").mkdir(parents=True)
+        (self.tmp / "work" / "dense_mesh.ply").write_bytes(b"old")
+        with unittest.mock.patch.dict(os.environ, {"FAKE_FAIL": "stereo_fusion"}):
+            with self.assertRaises(mp.MeshError):
+                self.build(self.make_run())
         self.assertFalse((out / "mesh.glb").exists())
         self.assertFalse((out / "collision.glb").exists())
-
-    def test_tool_failure_is_explained(self):
-        with self.assertRaisesRegex(mp.MeshError, "out of memory"):
-            self.build(self.make_run("run--boom"))
-
-    def test_extraction_without_cameras_is_refused(self):
-        with self.assertRaisesRegex(mp.MeshError, "could not read the cameras"):
-            self.build(self.make_run("run--nocam"))
+        self.assertFalse((self.tmp / "work" / "dense_mesh.ply").exists())
 
     def test_cancel_stops_the_tool(self):
         cancel = self.tmp / "cancel"
@@ -905,7 +1301,7 @@ class PipelineTests(TempDirCase):
         self.assertFalse((self.tmp / "out" / "mesh.glb").exists())
 
     def test_cancel_between_steps_is_honoured(self):
-        # The cancel file appears while this module, not the tool, is at work.
+        # The cancel file appears while this module, not a tool, is at work.
         cancel = self.tmp / "cancel"
 
         def on_progress(fraction, message):
@@ -915,18 +1311,21 @@ class PipelineTests(TempDirCase):
             self.build(self.make_run(), cancel_file=cancel, on_progress=on_progress)
         self.assertFalse((self.tmp / "out" / "mesh.glb").exists())
         self.assertFalse((self.tmp / "out" / "collision.glb").exists())
+        self.assertEqual(self.calls_to("mesh_simplifier") + self.calls_to("mesh_texturer"), [])
 
-    def test_hung_tool_is_stopped(self):
-        with unittest.mock.patch.object(mp, "SPIRULA_STALL", 2):
-            with self.assertRaisesRegex(mp.MeshError, "stopped making progress"):
-                self.build(self.make_run("run--hang"))
+    def test_hung_tools_are_stopped(self):
+        for command in ("patch_match_stereo", "mesh_texturer"):
+            with self.subTest(command), unittest.mock.patch.object(mp, "COLMAP_STALL", 2), \
+                    unittest.mock.patch.dict(os.environ, {"FAKE_HANG": command}):
+                with self.assertRaisesRegex(mp.MeshError, "stopped making progress"):
+                    self.build(self.make_run("run_" + command))
 
     def test_bad_arguments(self):
         run = self.make_run()
-        with self.assertRaisesRegex(mp.MeshError, "tools"):
-            self.build(run, tools={"spirula": "nope.exe"})
-        with self.assertRaisesRegex(mp.MeshError, "tools"):
-            self.build(run, tools={})
+        with self.assertRaisesRegex(mp.MeshError, "colmap"):
+            self.build(run, tools={"spirula": self.tools["spirula"]})
+        with self.assertRaisesRegex(mp.MeshError, "colmap"):
+            self.build(run, tools={"colmap": str(self.tmp / "nope.exe")})
         with self.assertRaisesRegex(mp.MeshError, "config.json"):
             self.build(self.tmp / "no_such_run")
         empty = self.tmp / "empty_run"
@@ -936,25 +1335,32 @@ class PipelineTests(TempDirCase):
             self.build(empty)
         with self.assertRaisesRegex(mp.MeshError, "images/"):
             self.build(run, dataset_dir=self.tmp)
+        bare = self.tmp / "bare"
+        (bare / "images").mkdir(parents=True)
+        (bare / "sparse").mkdir()
+        with self.assertRaisesRegex(mp.MeshError, "camera model"):
+            self.build(run, dataset_dir=bare)
         with self.assertRaisesRegex(mp.MeshError, "visual_faces"):
             self.build(run, visual_faces=3)
         with self.assertRaisesRegex(mp.MeshError, "collision_faces"):
             self.build(run, collision_faces=20.5)
         with self.assertRaisesRegex(mp.MeshError, "texture_size"):
             self.build(run, texture_size=10)
+        self.assertFalse(self.calls.exists())                 # nothing was started
 
 
-@unittest.skipUnless(os.environ.get("SCAN3D_MESH_ITEST") == "1", "set SCAN3D_MESH_ITEST=1 to run the real tool")
+@unittest.skipUnless(os.environ.get("SCAN3D_MESH_ITEST") == "1", "set SCAN3D_MESH_ITEST=1 to run the real tools")
 class RealToolsTest(TempDirCase):
-    """Runs Spirula for real. SCAN3D_MESH_RUN and SCAN3D_MESH_DATASET choose the input; the
-    default is the south-building scan made by the pipeline itself (runs/sb-std)."""
+    """Runs COLMAP for real (uses the GPU, about 20 minutes). SCAN3D_MESH_RUN and
+    SCAN3D_MESH_DATASET choose the input; the default is the south-building scan (runs/sb-v2)."""
 
     def test_default_budgets(self):
-        run = Path(os.environ.get("SCAN3D_MESH_RUN", ROOT / "runs" / "sb-std" / "train" / "run"))
-        dataset = Path(os.environ.get("SCAN3D_MESH_DATASET", ROOT / "runs" / "sb-std" / "dataset"))
+        run = Path(os.environ.get("SCAN3D_MESH_RUN", ROOT / "runs" / "sb-v2" / "train" / "run"))
+        dataset = Path(os.environ.get("SCAN3D_MESH_DATASET", ROOT / "runs" / "sb-v2" / "dataset"))
         if not run.is_dir() or not dataset.is_dir():
             self.skipTest(f"no training run at {run}")
-        tools = {"spirula": str(ROOT / "tools" / "spirula" / "spirula.exe")}
+        tools = {"spirula": str(ROOT / "tools" / "spirula" / "spirula.exe"),
+                 "colmap": str(ROOT / "tools" / "colmap" / "bin" / "colmap.exe")}
         result = mp.build_meshes(run_dir=run, dataset_dir=dataset, out_dir=self.tmp / "out",
                                  work_dir=self.tmp / "work", tools=tools, log_path=self.tmp / "mesh.log")
         self.assertLessEqual(result["mesh_faces"], 300_000)

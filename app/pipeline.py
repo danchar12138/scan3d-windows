@@ -275,13 +275,18 @@ def _extract_frames(job: Job, video: Path, out_dir: Path, target: int, settings:
 
     Handheld video has motion blur in a good share of its frames. The extractor keeps the
     sharpest frame of each window, spaces frames by how much the view changes instead of by
-    time, and leaves out frames where the camera stood still.
+    time, leaves out frames that are still blurred and frames where the camera stood still.
     """
     info = _video_info(job, video)
     skip = max(1, round(info["frames"] / max(target, 1)))
     args = ["sam", "extract", video, "-o", out_dir, "-s", skip, "-k", "-1", "--adaptive",
             "--similar", settings["similar_bits"], "--max-frames", int(target * 1.5),
             "--decoder", "builtin", "--lang", "en"]
+    # Frames whose edges are smeared wider than this (in pixels, beyond the clip's sharpest
+    # frames) are left out; the tool never drops more than two in a row. On the sample clip
+    # 2 px removed 20 of 120 frames, all visibly motion-blurred.
+    if settings.get("blur_reject_px"):
+        args += ["--blur-reject", settings["blur_reject_px"]]
     long_side = max(info["width"], info["height"])
     if long_side > settings["max_long_side"]:
         args += ["--scale", f"{settings['max_long_side'] / long_side:.4f}"]
@@ -778,7 +783,8 @@ def stage_mesh(job: Job, dataset: dict, train: dict, preset: dict, settings: dic
         with GpuLock(job, settings["timeouts_seconds"]["gpu_lock_wait"]):
             result = meshpost.build_meshes(
                 run_dir=Path(train["run"]), dataset_dir=Path(dataset["dataset"]), out_dir=out,
-                work_dir=job.dir / "mesh", tools={"spirula": TOOL_PATHS["spirula"]},
+                work_dir=job.dir / "mesh",
+                tools={k: TOOL_PATHS[k] for k in ("spirula", "colmap")},
                 visual_faces=mesh_cfg["visual_faces"],
                 collision_faces=mesh_cfg["collision_faces"],
                 texture_size=mesh_cfg["texture_size"], log_path=job.logs / "mesh.log",

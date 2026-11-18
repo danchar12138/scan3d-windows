@@ -22,9 +22,12 @@ $programs = @(
     # Runs the code in .\app; the embeddable build needs no installation.
     @{ name = 'python'
        url = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip' },
-    # Spirula Studio does every reconstruction step.
+    # Spirula Studio: frames, masks, camera poses, priors, splat training, surface extraction.
     @{ name = 'spirula'
-       url = 'https://github.com/harry7557558/spirula-studio/releases/download/v2026.11.12/spirula-2026.11.12-windows-vulkan-x86_64.zip' }
+       url = 'https://github.com/harry7557558/spirula-studio/releases/download/v2026.11.12/spirula-2026.11.12-windows-vulkan-x86_64.zip' },
+    # COLMAP (CUDA build): undistorted image workspace and mesh texturing from the photos.
+    @{ name = 'colmap'
+       url = 'https://github.com/colmap/colmap/releases/download/4.2.1/colmap-x64-windows-cuda.zip' }
 )
 
 New-Item -ItemType Directory -Force -Path $cache | Out-Null

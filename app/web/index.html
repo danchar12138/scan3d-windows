@@ -208,6 +208,7 @@
         <a class="tab" data-view="mesh" href="#/">网格</a>
         <a class="tab" data-view="collision" href="#/">碰撞网格</a>
         <a class="tab" data-view="overlay" href="#/">叠加对齐</a>
+        <a class="tab" data-view="coverage" href="#/">拍摄覆盖</a>
       </nav>
 
       <div id="v-3d" hidden>
@@ -226,6 +227,13 @@
             </div>
           </div>
           <button type="button" class="viewer-expand" id="v-expand" aria-pressed="false">全屏</button>
+          <!-- colours of the "拍摄覆盖" view: the same three as viewer3d.js COVERAGE_COLOURS -->
+          <ul class="coverage-legend" id="v-legend" aria-label="颜色说明" hidden>
+            <li><span class="swatch swatch-strong" aria-hidden="true"></span>拍得充分</li>
+            <li><span class="swatch swatch-medium" aria-hidden="true"></span>一般</li>
+            <li><span class="swatch swatch-weak" aria-hidden="true"></span>不足</li>
+            <li><span class="swatch swatch-none" aria-hidden="true"></span>未判断</li>
+          </ul>
         </div>
         <div class="viewer-tools">
           <fieldset class="seg" id="v-quality" hidden>
@@ -246,6 +254,13 @@
           </div>
         </div>
         <p class="hint" id="v-note"></p>
+        <div class="coverage" id="v-coverage" hidden>
+          <p id="v-coverage-summary"></p>
+          <h3 id="v-coverage-title">拍得不足的地方</h3>
+          <ol class="coverage-list" id="v-coverage-list"></ol>
+          <p id="v-coverage-none" hidden>没有发现成片拍得不足的地方。</p>
+          <p class="hint">“从这里补拍”会把视角移到建议的拍摄位置，朝着白色标出的地方，照着这个方向补拍几张；把视角拉远可以看到这个位置（白色线框）。没拍到的东西无法凭空补出来：补拍后，把新照片和原来的照片放在一起重新扫描，这些地方才会变好。</p>
+        </div>
         <p class="hint">拖动旋转，滚轮或双指缩放，右键拖动或双指平移。开始时的视角是其中一张照片的拍摄位置；高斯在拍摄位置附近看最清楚，离得越远越模糊。</p>
       </div>
 

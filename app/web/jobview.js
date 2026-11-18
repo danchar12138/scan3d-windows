@@ -8,7 +8,8 @@
 (function () {
   "use strict";
 
-  var TABS = ["report", "splat", "mesh", "collision", "overlay"];
+  var TABS = ["report", "splat", "mesh", "collision", "overlay", "coverage"];
+  var SPLAT_TABS = ["splat", "overlay", "coverage"];      // the tabs that show the splat
   var STAGE_LABEL = {
     ingest: "采集数据", sfm: "相机位姿", dataset: "几何先验",
     train: "训练高斯", mesh: "生成网格", export: "导出"
@@ -16,6 +17,7 @@
   var QUALITY_LABEL = { preview: "预览", standard: "标准", high: "高质量" };
   var FILE_LABEL = { splat: "高斯点云", mesh: "网格模型", collision: "碰撞网格" };
   var PREVIEW_POLL_MS = 1000;
+  var COVERAGE_POLL_MS = 1000;
   var SMALL_SCREEN = "(max-width: 640px), (max-height: 480px)";   // same idea as the CSS breakpoint
 
   var current = {
@@ -28,7 +30,8 @@
     cameras: [],
     report: null,         // parsed report.json of this job, once loaded
     reportFor: null,
-    previews: null
+    previews: null,
+    coverage: null        // {job, size, data}: the coverage map last loaded
   };
   // Choices the user makes stay for the whole visit of the page.
   var choice = {
@@ -500,6 +503,98 @@
     return step();
   }
 
+  // Resolves with the coverage map (app/coverage.py), asking the server to compute it first
+  // when the job has none. Like the previews: the server never keeps a request waiting, so
+  // this polls, and stops as soon as the user moves on.
+  function ensureCoverage(job, run) {
+    var asked = false, started = Date.now();
+    function step() {
+      if (run !== current.run) { return Promise.reject(new Error("cancelled")); }
+      return request("GET", jobUrl(job.job, "/coverage")).then(function (result) {
+        if (run !== current.run) { throw new Error("cancelled"); }
+        var state = result.data || {};
+        if (state.state === "ready") {
+          var have = current.coverage;
+          if (have && have.job === job.job && have.size === state.size) { return have.data; }
+          setStatus("正在读取拍摄覆盖…", 0, 0);
+          return request("GET", jobUrl(job.job, "/coverage/data") + "?s=" + state.size).then(function (got) {
+            if (!got.data || !got.data.voxels || !got.data.grid) { throw new Error("拍摄覆盖的数据格式不对"); }
+            current.coverage = { job: job.job, size: state.size, data: got.data };
+            return got.data;
+          });
+        }
+        if (state.state === "unavailable") {
+          var err = new Error(state.message || "这个任务无法计算拍摄覆盖。");
+          err.final = true;
+          throw err;
+        }
+        if (state.state === "failed" && asked) { throw new Error(state.error || "无法计算拍摄覆盖。"); }
+        var seconds = Math.round((Date.now() - started) / 1000);
+        setStatus("正在计算拍摄覆盖（每个任务只需一次，通常不到半分钟）…" + (seconds >= 3 ? " 已用 " + seconds + " 秒" : ""), 0, 0);
+        if (state.state === "missing" || state.state === "failed") {
+          asked = true;
+          return request("POST", jobUrl(job.job, "/coverage")).then(step);
+        }
+        asked = true;
+        return sleep(COVERAGE_POLL_MS).then(step);
+      });
+    }
+    return step();
+  }
+
+  function percent(part, whole) {
+    if (!(whole > 0)) { return "0%"; }
+    var p = 100 * part / whole;
+    return (p > 0 && p < 1 ? "不到 1" : Math.round(p)) + "%";
+  }
+
+  // The panel under the picture: what the colours say, and the weak regions to re-shoot.
+  // The shares come from the map (by amount of surface in the part the photos aimed at; see
+  // app/coverage.py), so they do not depend on which quality of the splat is loaded.
+  function renderCoverage(data) {
+    var share = data.surface_share || data.levels || {};
+    var judged = (share.weak || 0) + (share.medium || 0) + (share.strong || 0);
+    var cameras = Array.isArray(data.cameras) ? data.cameras.length : 0;
+    $("v-coverage-summary").textContent = "按 " + fmtCount(cameras) + " 张照片计算。" + (judged > 0
+      ? "照片对准的范围里：拍得充分 " + percent(share.strong || 0, judged) + "，一般 " +
+        percent(share.medium || 0, judged) + "，不足 " + percent(share.weak || 0, judged) +
+        "。范围外的远景是灰色，不做判断。"
+      : "");
+    var list = $("v-coverage-list");
+    list.textContent = "";
+    var regions = Array.isArray(data.regions) ? data.regions : [];
+    $("v-coverage-none").hidden = regions.length > 0;
+    $("v-coverage-title").hidden = regions.length === 0;
+    regions.forEach(function (region) {
+      if (!region || typeof region.number !== "number") { return; }
+      var item = el("li", "coverage-item");
+      item.setAttribute("data-region", String(region.number));
+      item.appendChild(el("p", "coverage-text", "第 " + region.number + " 处：" + String(region.text || "")));
+      var buttons = el("div", "coverage-buttons");
+      var go = el("button", "btn small", region.suggest ? "从这里补拍" : "看看这里");
+      go.type = "button";
+      go.setAttribute("data-go", "suggest");
+      buttons.appendChild(go);
+      if (region.suggest) {
+        var look = el("button", "btn small", "从最近的照片看");
+        look.type = "button";
+        look.setAttribute("data-go", "photo");
+        buttons.appendChild(look);
+      }
+      item.appendChild(buttons);
+      list.appendChild(item);
+    });
+    markPicked(0);
+  }
+
+  function markPicked(number) {
+    var items = $("v-coverage-list").querySelectorAll(".coverage-item");
+    for (var i = 0; i < items.length; i++) {
+      var on = items[i].getAttribute("data-region") === String(number);
+      items[i].classList.toggle("is-picked", on);
+    }
+  }
+
   // The line under the picture: what is being shown, and what this quality leaves out.
   function splatNote(tier, info) {
     if (!(info.splats > 0)) { return ""; }
@@ -523,10 +618,13 @@
   }
 
   function show3d(job, tab, run) {
-    var needSplat = tab === "splat" || tab === "overlay";
+    var needSplat = SPLAT_TABS.indexOf(tab) >= 0;
     var needCollision = tab === "collision" || tab === "overlay";
+    var needCoverage = tab === "coverage";
     $("v-quality").hidden = !needSplat;
     $("v-style").hidden = !needCollision;
+    $("v-coverage").hidden = true;
+    $("v-legend").hidden = !needCoverage;
     $("v-note").textContent = "";
     hideConfirm();
     var tier = quality();
@@ -537,7 +635,7 @@
     renderQualityLabels();
     setStatus("正在加载三维查看器…", 0, 0);
 
-    var mod = null, report = null;
+    var mod = null, report = null, coverage = null;
     loadModule().then(function (loaded) {
       mod = loaded;
       if (run !== current.run) { throw new Error("cancelled"); }
@@ -553,6 +651,9 @@
       report = results[0];
       current.cameras = results[1];
       renderQualityLabels();
+      return needCoverage ? ensureCoverage(job, run) : null;
+    }).then(function (map) {
+      coverage = map;
       if (!needSplat) { return null; }
       return tier === "original" ? ensureOriginal(job, run) : ensurePreview(job, tier, run);
     }).then(function (splat) {
@@ -565,7 +666,13 @@
           },
           onReady: function (info) {
             $("v-status").hidden = true;
-            $("v-note").textContent = splatNote(quality(), info);
+            if (current.tab === "coverage" && info.coverage && current.coverage) {
+              $("v-note").textContent = "颜色表示每一处被多少张照片、从多宽的角度拍到（看得见背景的空洞不会上色）。白点是拍照的位置。" + splatNote(quality(), info);
+              renderCoverage(current.coverage.data);
+              $("v-coverage").hidden = false;
+            } else {
+              $("v-note").textContent = splatNote(quality(), info);
+            }
           },
           onError: function (message) { showFailure(message, true); }
         });
@@ -582,6 +689,7 @@
         },
         rotation: orientation && orientation.rotation_to_y_up_xyzw,
         cameras: current.cameras,
+        coverage: coverage,
         style: choice.style[tab] || "wire"
       });
     }).catch(function (err) {
@@ -620,7 +728,8 @@
     var available = {
       report: !!(files.report || files["report.json"] || files["scene_transform.json"]),
       splat: !!files.splat, mesh: !!files.mesh, collision: !!files.collision,
-      overlay: !!(files.splat && files.collision)
+      overlay: !!(files.splat && files.collision),
+      coverage: !!files.splat
     };
     var any = TABS.some(function (tab) { return available[tab]; });
     var visible = job.state === "done" && any;
@@ -642,6 +751,7 @@
       current.reportFor = null;
       current.previews = null;
       current.cameras = [];
+      current.coverage = null;
     }
     current.job = job.job;
     current.signature = signature;
@@ -683,6 +793,16 @@
       }
     });
     $("v-reset").addEventListener("click", function () { if (current.viewer) { current.viewer.resetView(); } });
+    $("v-coverage-list").addEventListener("click", function (event) {
+      var button = event.target && event.target.closest ? event.target.closest("button[data-go]") : null;
+      var item = button ? button.closest(".coverage-item") : null;
+      if (!item || !current.viewer || current.tab !== "coverage") { return; }
+      var number = parseInt(item.getAttribute("data-region"), 10);
+      current.viewer.pickRegion(number, button.getAttribute("data-go"));
+      markPicked(number);
+      var stage = $("v-stage");
+      if (stage.getBoundingClientRect().top < 0) { stage.scrollIntoView({ block: "start", behavior: "smooth" }); }
+    });
     $("v-next-camera").addEventListener("click", function () { if (current.viewer) { current.viewer.nextCamera(); } });
     $("v-expand").addEventListener("click", function () { setExpanded(!$("v-3d").classList.contains("is-expanded")); });
     document.addEventListener("keydown", function (event) {

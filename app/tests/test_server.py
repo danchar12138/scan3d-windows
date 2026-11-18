@@ -1241,11 +1241,20 @@ class TraversalTests(ServerCase):
                      "preview/full/../../../secret.txt", "cameras/..%2f..%2fsecret.txt",
                      "cameras/x", "cameras%2f..%2f..%2fsecret.txt", "preview%2ffull",
                      "web-preview/preview.spz", "download/web-preview/preview.spz",
-                     "download/dataset/sparse/images.bin"):
+                     "download/dataset/sparse/images.bin", "coverage/..%2f..%2fsecret.txt",
+                     "coverage/data/..%2f..%2f..%2fsecret.txt", "coverage/data/extra",
+                     "coverage/DATA", "coverage/coverage.json", "coverage/..", "coverage%2fdata",
+                     "coverage/data%00", "coverage/data:stream", "web-preview/coverage.json",
+                     "download/web-preview/coverage.json"):
             self.assert_refused("GET", "/api/jobs/victim/" + path)
             self.assert_refused("POST", "/api/jobs/victim/" + path, b"{}")
+        # the coverage map: no splat (it points outside), so nothing is computed
+        state = self.api("GET", "/api/jobs/victim/coverage")[1]
+        self.assertEqual((state["state"], state["reason"]), ("unavailable", "no_splat"))
+        self.assertEqual(self.api("POST", "/api/jobs/victim/coverage")[0], 409)
+        self.assertIsNone(self.app.coverage._thread)
         for name in ("..", "%2e%2e", "..%2fvictim", "CON", ".server-token", "victim%00", "a%2fb"):
-            for rest in ("preview", "preview/full", "cameras"):
+            for rest in ("preview", "preview/full", "cameras", "coverage", "coverage/data"):
                 self.assert_refused("GET", "/api/jobs/%s/%s" % (name, rest))
                 self.assert_refused("POST", "/api/jobs/%s/%s" % (name, rest), b"{}")
 
@@ -1294,7 +1303,14 @@ class TraversalTests(ServerCase):
         self.assertEqual((outside / "preview.spz").read_bytes(), b"private preview")
         self.assertEqual(sorted(p.name for p in outside.iterdir()),
                          ["images.bin", "preview.spz", "preview.spz.json"])
+        self.assertIsNone(self.app.coverage._thread)
         self.assertEqual(self.api("GET", "/api/jobs/victim/cameras")[1], {"count": 0, "cameras": []})
+        write_cameras_bin(outside / "cameras.bin")
+        state = self.api("GET", "/api/jobs/victim/coverage")[1]
+        self.assertEqual((state["state"], state["reason"]), ("unavailable", "no_cameras"))
+        self.assertEqual(self.api("POST", "/api/jobs/victim/coverage")[0], 409)
+        self.assertEqual(self.request("GET", "/api/jobs/victim/coverage/data")[0], 404)
+        self.assertFalse((outside / "coverage.json").exists())
 
     def test_junction_inside_a_job_is_not_followed(self):
         if os.name != "nt":
@@ -1897,6 +1913,8 @@ class PreviewTests(ServerCase):
         self.remote()
         for method, path in (("GET", "/api/jobs/shared/preview"), ("POST", "/api/jobs/shared/preview/lite"),
                              ("GET", "/api/jobs/shared/preview/lite"), ("GET", "/api/jobs/shared/cameras"),
+                             ("GET", "/api/jobs/shared/coverage"), ("POST", "/api/jobs/shared/coverage"),
+                             ("GET", "/api/jobs/shared/coverage/data"),
                              ("GET", "/static/viewer3d.js"), ("GET", "/static/jobview.js"),
                              ("GET", "/static/vendor/spark/spark.module.js"),
                              ("GET", "/static/vendor/three/three.module.js"),
@@ -1915,6 +1933,12 @@ class PreviewTests(ServerCase):
         cookie = {"Cookie": "scan3d_token=" + TOKEN, "Origin": "http://evil.example"}
         status, error = self.api("POST", "/api/jobs/shared/preview/full", None, cookie)
         self.assertEqual((status, error["error"]), (403, "bad_origin"))
+        status, error = self.api("POST", "/api/jobs/shared/coverage", None, cookie)
+        self.assertEqual((status, error["error"]), (403, "bad_origin"))
+        self.assertIsNone(self.app.coverage._thread)
+        # with the token a phone may ask for the coverage map like for a preview
+        state = self.api("GET", "/api/jobs/shared/coverage", None, header)[1]
+        self.assertEqual((state["state"], state["reason"]), ("unavailable", "no_cameras"))
 
 
 def write_images_bin(path: Path, poses) -> None:
@@ -1981,6 +2005,252 @@ class CameraTests(ServerCase):
         self.assertGreater(len(xs), 100)
         self.assertEqual(xs[:3], [0.0, 6.0, 12.0])                     # evenly spread, in order
         self.assertEqual(xs, sorted(xs))
+
+
+# =========================================================================== coverage map
+
+def write_cameras_bin(path: Path, width=640, height=480, focal=500.0) -> None:
+    """A COLMAP cameras.bin with one PINHOLE camera (id 1)."""
+    with open(path, "wb") as f:
+        f.write(struct.pack("<Q", 1))
+        f.write(struct.pack("<IiQQ", 1, 1, width, height))
+        f.write(struct.pack("<4d", focal, focal, width / 2, height / 2))
+
+
+SLOW_COVERAGE = ("import sys, time; open(sys.argv[2] + '.started', 'w').close(); "
+                 "time.sleep(float(sys.argv[1]))")
+
+
+class CoverageTests(ServerCase):
+    def make_scene(self, name, sparse=("dataset", "sparse")):
+        """A finished job with a splat and training cameras that see it."""
+        out = self.make_done_job(name, gaussians=60)
+        folder = self.runs / name
+        for part in sparse:
+            folder = folder / part
+        folder.mkdir(parents=True)
+        # looking along +Z from z = -5 and from a little to either side
+        write_images_bin(folder / "images.bin", [(1, 0, 0, 0, dx, 0, 5) for dx in (-1, 0, 1)])
+        write_cameras_bin(folder / "cameras.bin")
+        return out, folder
+
+    def coverage(self, job, headers=None):
+        status, body = self.api("GET", "/api/jobs/%s/coverage" % job, None, headers)
+        self.assertEqual(status, 200, body)
+        return body
+
+    def wait_coverage(self, job, states=("ready",), timeout=60.0):
+        box = {}
+
+        def reached():
+            box["state"] = self.coverage(job)
+            return box["state"]["state"] in states
+        try:
+            wait_until(reached, timeout, message="the coverage of %s" % job)
+        except AssertionError:
+            raise AssertionError("coverage of %s never became %s: %r" % (job, states, box.get("state")))
+        return box["state"]
+
+    def record_commands(self, slow=None):
+        """Remember every coverage command; with `slow`, run a sleeper instead of coverage.py."""
+        real = server.build_coverage_command
+        seen = []
+
+        def fake(splat, images, cameras, out, transform=None, up=None):
+            seen.append({"splat": Path(splat), "images": Path(images), "cameras": Path(cameras),
+                         "out": Path(out), "transform": transform, "up": up})
+            if slow is not None:
+                return [sys.executable, "-c", SLOW_COVERAGE, str(slow), str(out)]
+            return real(splat, images, cameras, out, transform, up)
+        server.build_coverage_command = fake
+        self.addCleanup(setattr, server, "build_coverage_command", real)
+        return seen
+
+    def test_command(self):
+        cmd = server.build_coverage_command(Path("a") / "splat.ply", "i.bin", "c.bin", "out.json")
+        self.assertEqual(cmd, [sys.executable, str(APP_DIR / "coverage.py"), str(Path("a") / "splat.ply"),
+                               "i.bin", "c.bin", "out.json"])
+        cmd = server.build_coverage_command("s", "i", "c", "o", Path("t.json"), [0, 0, 1])
+        self.assertEqual(cmd[-4:], ["--transform", "t.json", "--up", "0.0,0.0,1.0"])
+
+    def test_computed_on_demand_and_cached_in_the_job_folder(self):
+        out, sparse = self.make_scene("scene")
+        seen = self.record_commands()
+        self.assertEqual(self.coverage("scene"), {"state": "missing"})
+        status, error = self.api("GET", "/api/jobs/scene/coverage/data")
+        self.assertEqual((status, error["error"]), (404, "coverage_missing"))
+        self.assertFalse((self.runs / "scene" / "web-preview").exists())     # asking computes nothing
+        began = time.monotonic()
+        status, state = self.api("POST", "/api/jobs/scene/coverage")
+        self.assertLess(time.monotonic() - began, 5)                         # answered at once
+        self.assertIn((status, state["state"]), ((202, "queued"), (202, "building"), (200, "ready")))
+        state = self.wait_coverage("scene")
+        cache = self.runs / "scene" / "web-preview"
+        self.assertEqual(sorted(p.name for p in cache.iterdir()), ["coverage.json", "coverage.source.json"])
+        self.assertEqual(sorted(p.name for p in out.iterdir()), ["splat.ply"])   # output/ untouched
+        self.assertEqual(state["size"], (cache / "coverage.json").stat().st_size)
+        self.assertEqual(len(seen), 1)
+        self.assertEqual((seen[0]["images"], seen[0]["cameras"]), (sparse / "images.bin", sparse / "cameras.bin"))
+        self.assertEqual((seen[0]["transform"], seen[0]["up"]), (None, None))   # neither file exists
+
+        url = "/api/jobs/scene/coverage/data"
+        status, headers, body = self.request("GET", url)
+        self.assertEqual((status, body), (200, (cache / "coverage.json").read_bytes()))
+        self.assertEqual(headers["content-type"], "application/json; charset=utf-8")
+        data = json.loads(body.decode("utf-8"))
+        self.assertEqual(data["format"], "scan3d-coverage")
+        self.assertEqual(len(data["cameras"]), 3)
+        self.assertGreater(data["voxels"]["count"], 0)
+        status, _headers, nothing = self.request("GET", url, headers={"If-None-Match": headers["etag"]})
+        self.assertEqual((status, nothing), (304, b""))
+        status, headers, nothing = self.request("HEAD", url)
+        self.assertEqual((status, nothing, int(headers["content-length"])), (200, b"", len(body)))
+        noted = json.loads((cache / "coverage.source.json").read_text(encoding="utf-8"))
+        self.assertEqual(noted["version"], server._coverage.FORMAT_VERSION)
+
+        # asking again computes nothing new
+        mtime = (cache / "coverage.json").stat().st_mtime_ns
+        status, state = self.api("POST", "/api/jobs/scene/coverage")
+        self.assertEqual((status, state["state"]), (200, "ready"))
+        time.sleep(0.3)
+        self.assertEqual(((cache / "coverage.json").stat().st_mtime_ns, len(seen)), (mtime, 1))
+
+        # the job is run again: a new splat, cameras or frame make the cached map stale
+        transform = {"train_from_world": {"scale": 1, "translation": [0, 0, 0],
+                                          "rotation": {"matrix_3x3": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]}}}
+        report = {"orientation": {"up_in_file_coordinates": [0.0, -1.0, 0.0]}}
+        (out / "scene_transform.json").write_text(json.dumps(transform), encoding="utf-8")
+        (out / "report.json").write_text(json.dumps(report), encoding="utf-8")
+        self.assertEqual(self.coverage("scene")["state"], "missing")
+        self.assertEqual(self.request("GET", url)[0], 404)
+        self.api("POST", "/api/jobs/scene/coverage")
+        self.wait_coverage("scene")
+        self.assertEqual((seen[1]["transform"], seen[1]["up"]), (out / "scene_transform.json", [0.0, -1.0, 0.0]))
+        self.assertEqual(json.loads(self.request("GET", url)[2])["up"], [0.0, -1.0, 0.0])
+        write_splat_ply(out / "splat.ply", 50)
+        self.assertEqual(self.coverage("scene")["state"], "missing")
+        self.api("POST", "/api/jobs/scene/coverage")
+        self.wait_coverage("scene")
+        self.assertEqual(json.loads(self.request("GET", url)[2])["gaussians"], 50)
+        write_images_bin(sparse / "images.bin", [(1, 0, 0, 0, 0, 0, 5)])
+        self.assertEqual(self.coverage("scene")["state"], "missing")
+
+    def test_the_newer_dataset_layout_and_the_report_named_in_the_status(self):
+        out, sparse = self.make_scene("newer", sparse=("dataset", "sparse", "0"))
+        seen = self.record_commands()
+        (self.runs / "newer" / "train" / "run").mkdir(parents=True)
+        transform = {"train_from_world": {"scale": 2, "translation": [0, 0, 0],
+                                          "rotation": {"matrix_3x3": [[1, 0, 0], [0, 1, 0], [0, 0, 1]]}}}
+        (self.runs / "newer" / "train" / "run" / "scene_transform.json").write_text(json.dumps(transform))
+        status = self.disk_status("newer")
+        status["outputs"]["report"] = "output/r.json"
+        (self.runs / "newer" / "status.json").write_text(json.dumps(status), encoding="utf-8")
+        (out / "r.json").write_text(json.dumps({"orientation": {"up_in_file_coordinates": [0, 0, 1]}}))
+        (out / "report.json").write_text(json.dumps({"orientation": {"up_in_file_coordinates": [1, 0, 0]}}))
+        wait_until(lambda: self.app.read_status("newer", fresh=True)["outputs"].get("report") == "output/r.json")
+        self.api("POST", "/api/jobs/newer/coverage")
+        self.wait_coverage("newer")
+        self.assertEqual(seen[0]["images"], sparse / "images.bin")
+        self.assertEqual(seen[0]["transform"], self.runs / "newer" / "train" / "run" / "scene_transform.json")
+        self.assertEqual(seen[0]["up"], [0.0, 0.0, 1.0])
+        # a report outside the job, or an unusable up direction, is not used (and without
+        # output/report.json to fall back on there is none)
+        (out / "report.json").unlink()
+        for rel, up in (("../../secret.json", [0, 0, 1]), ("output/r.json", [0, 0, 0]),
+                        ("output/r.json", ["x", 0, 1]), ("output/r.json", [float("1e300"), 0, 1])):
+            (self.tmp / "secret.json").write_text(json.dumps({"orientation": {"up_in_file_coordinates": [0, 1, 0]}}))
+            (out / "r.json").write_text(json.dumps({"orientation": {"up_in_file_coordinates": up}}))
+            status["outputs"]["report"] = rel
+            (self.runs / "newer" / "status.json").write_text(json.dumps(status), encoding="utf-8")
+            wait_until(lambda: self.app.read_status("newer", fresh=True)["outputs"].get("report") == rel)
+            inputs, _missing = self.app.coverage.inputs("newer", self.app.read_status("newer", fresh=True))
+            self.assertIsNone(inputs["up"], (rel, up))
+            (self.tmp / "secret.json").unlink()
+
+    def test_unavailable_without_a_finished_job_a_splat_or_cameras(self):
+        self.create(name="fresh")
+        state = self.coverage("fresh")
+        self.assertEqual((state["state"], state["reason"]), ("unavailable", "not_done"))
+        self.assertIn("任务完成之后", state["message"])
+        status, error = self.api("POST", "/api/jobs/fresh/coverage")
+        self.assertEqual((status, error["error"]), (409, "not_done"))
+        self.make_done_job("nocams")
+        state = self.coverage("nocams")
+        self.assertEqual((state["state"], state["reason"]), ("unavailable", "no_cameras"))
+        status, error = self.api("POST", "/api/jobs/nocams/coverage")
+        self.assertEqual((status, error["error"]), (409, "no_cameras"))
+        # images.bin alone is not enough (the camera intrinsics are in cameras.bin)
+        (self.runs / "nocams" / "dataset" / "sparse").mkdir(parents=True)
+        write_images_bin(self.runs / "nocams" / "dataset" / "sparse" / "images.bin", [(1, 0, 0, 0, 0, 0, 5)])
+        self.assertEqual(self.coverage("nocams")["reason"], "no_cameras")
+        out, _sparse = self.make_scene("nosplat")
+        (out / "splat.ply").unlink()
+        self.assertEqual(self.coverage("nosplat")["reason"], "no_splat")
+        self.assertEqual(self.api("POST", "/api/jobs/nosplat/coverage")[1]["error"], "no_splat")
+        for job in ("fresh", "nocams", "nosplat"):
+            self.assertEqual(self.api("GET", "/api/jobs/%s/coverage/data" % job)[1]["error"], "coverage_missing")
+        for path in ("/api/jobs/nobody/coverage", "/api/jobs/nobody/coverage/data"):
+            self.assertEqual(self.api("GET", path)[0], 404)
+        self.assertEqual(self.api("POST", "/api/jobs/nobody/coverage")[0], 404)
+        for method, path in (("DELETE", "/api/jobs/nosplat/coverage"), ("PUT", "/api/jobs/nosplat/coverage"),
+                             ("POST", "/api/jobs/nosplat/coverage/data"),
+                             ("DELETE", "/api/jobs/nosplat/coverage/data")):
+            status, _headers, _ = self.request(method, path, b"x" if method == "PUT" else None)
+            self.assertEqual(status, 405, "%s %s" % (method, path))
+        self.assertIsNone(self.app.coverage._thread)
+
+    def test_a_failed_computation_is_reported_and_can_be_retried(self):
+        out, _sparse = self.make_scene("broken")
+        (out / "splat.ply").write_bytes(b"this is not a ply file at all")
+        self.assertEqual(self.api("POST", "/api/jobs/broken/coverage")[0], 202)
+        state = self.wait_coverage("broken", ("failed",))
+        self.assertIn("无法计算拍摄覆盖", state["error"])
+        self.assertIn("PLY", state["error"])
+        self.assertEqual(self.api("GET", "/api/jobs/broken/coverage/data")[0], 404)
+        self.assertEqual(list((self.runs / "broken" / "web-preview").iterdir()), [])
+        write_splat_ply(out / "splat.ply", 30)
+        self.assertEqual(self.api("POST", "/api/jobs/broken/coverage")[0], 202)
+        self.wait_coverage("broken")
+
+    def test_one_at_a_time_never_waited_for_and_stopped_by_delete_time_limit_and_shutdown(self):
+        self.record_commands(slow=600)
+        self.make_scene("job-a")
+        self.make_scene("job-b")
+        self.assertEqual(self.api("POST", "/api/jobs/job-a/coverage")[0], 202)
+        started = self.runs / "job-a" / "web-preview" / "coverage.json.started"
+        wait_until(started.exists, 20, message="the first computation to start")
+        self.assertEqual(self.coverage("job-a")["state"], "building")
+        status, state = self.api("POST", "/api/jobs/job-b/coverage")
+        self.assertEqual((status, state["state"]), (202, "queued"))
+        self.assertEqual(self.api("POST", "/api/jobs/job-a/coverage")[1]["state"], "building")
+        self.assertEqual(list(self.app.coverage.pending), [("job-b", "coverage")])
+        # previews have their own queue: not held up by the coverage map
+        self.assertEqual(self.api("POST", "/api/jobs/job-b/preview/lite")[0], 202)
+        self.wait_preview("job-b", "lite")
+        child = self.app.coverage.child
+        self.assertTrue(server.pid_alive(child.pid))
+        # deleting the job stops its computation; the next one starts
+        self.assertEqual(self.api("DELETE", "/api/jobs/job-a")[0], 200)
+        self.assertFalse((self.runs / "job-a").exists())
+        wait_until(lambda: not server.pid_alive(child.pid), 10, message="the computation to die")
+        wait_until((self.runs / "job-b" / "web-preview" / "coverage.json.started").exists, 20,
+                   message="the next computation to start")
+        # the time limit
+        self.app.coverage.time_limit = 1.0
+        state = self.wait_coverage("job-b", ("failed",), timeout=30)
+        self.assertIn("已被停止", state["error"])
+        wait_until(lambda: self.app.coverage.child is None, 10, message="the child to be reaped")
+        # shutting down kills a running computation
+        self.app.coverage.time_limit = 600.0
+        self.api("POST", "/api/jobs/job-b/coverage")
+        wait_until(lambda: self.app.coverage.child is not None, 20, message="the computation to start")
+        pid = self.app.coverage.child.pid
+        began = time.monotonic()
+        self.httpd.shutdown()
+        self.app.shutdown()
+        self.assertLess(time.monotonic() - began, 20)
+        wait_until(lambda: not server.pid_alive(pid), 10, message="the computation to die")
+        self.assertFalse(self.app.coverage._thread.is_alive())
 
 
 # =========================================================================== models and licences

@@ -319,6 +319,7 @@ class PipelineTest(unittest.TestCase):
         # 400 source frames, 240 wanted: every 2nd frame is a candidate.
         self.assertEqual(self.spirula.value(extract, "-s"), "2")
         self.assertNotIn("--scale", extract)
+        self.assertEqual(self.spirula.value(extract, "--blur-reject"), "2.0")
         track = self.spirula.commands("sam", "track")[0]
         self.assertEqual(self.spirula.value(track, "--mask-mode"), "image")
         sfm = self.spirula.commands("sfm", "auto")[0]
@@ -486,7 +487,7 @@ class PipelineTest(unittest.TestCase):
         import meshpost
 
         def build(*, out_dir, on_progress=None, **kw):
-            self.assertEqual(set(kw["tools"]), {"spirula"})
+            self.assertEqual(set(kw["tools"]), {"spirula", "colmap"})
             self.assertTrue((config.RUNS / ".gpu.lock").exists())
             write_glb(out_dir / "mesh.glb")
             write_glb(out_dir / "collision.glb")

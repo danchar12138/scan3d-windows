@@ -1310,7 +1310,7 @@
   }
 
   function applyRoute() {
-    // #/job/<name> or #/job/<name>/view/<tab> (report, splat, mesh, collision, overlay)
+    // #/job/<name> or #/job/<name>/view/<tab> (report, splat, mesh, collision, overlay, coverage)
     var match = /^#\/job\/([^/?#]+)(?:\/view\/([a-z]+))?\/?$/.exec(location.hash);
     var job = null;
     if (match) {

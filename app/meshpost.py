@@ -1,86 +1,123 @@
-"""Game-engine meshes from a finished Spirula training run.
+"""Game-engine meshes from a finished Spirula training run, textured from the photos.
 
 `build_meshes` writes two files next to each other:
 
-    mesh.glb        textured visual mesh, at most `visual_faces` triangles
+    mesh.glb        textured visual mesh, at most `visual_faces` triangles, one square PNG texture
     collision.glb   untextured mesh for physics and shadow receiving, at most `collision_faces`
 
-Only two things run: `spirula.exe` and this file, which uses the standard library alone (it
-runs on the embeddable Python). How the meshes are made; the numbers are from the
-south-building scene (runs/sb-std: 1 M Gaussians, 128 photos) on an RTX 5070 Ti Laptop:
+Only two things run: `colmap.exe` (the CUDA build) and this file, which uses the standard
+library alone (it runs on the embeddable Python). The splat itself is not meshed; the run folder
+only says which frame the files are written in. How the meshes are made, with the times of the
+south-building scan (runs/sb-v2: 128 photos of 3072 x 2304, masks for passers-by) at the
+default budgets on an RTX 5070 Ti Laptop:
 
-1. `spirula mesh --format glb --color texture --merge-factor 1 --chart-angle-deg 10` extracts
-   the surface from the splat, carved by the dataset cameras, and textures it in the same run:
-   2.06 M faces with a 4096 atlas of 133 k charts in 142 s. Spirula can only texture the mesh
-   it has just extracted, so everything after this step has to keep that atlas.
-2. Here, in plain Python: the GLB is read back, connected components are found (vertices are
-   welded by position first: Spirula splits them along texture seams) and the small ones are
-   dropped, by surface area relative to the largest component (4 s).
-3. `collapse_to` brings the visual mesh down to its budget by quadric edge collapse without
-   touching the atlas: a face keeps pointing into the chart it came from. A corner that moves
-   takes the coordinates its new vertex has in that chart; where the vertex is not part of
-   the chart, the chart's own mapping is carried on to it, as far as the gutter around the
-   chart goes; beyond that the corner stays where it was in the atlas and the face shows its
-   patch pulled out of shape (2.04 M to 300 k faces: 56 s, 12 % of the faces stretched like
-   that, 86 % of the atlas area still shown).
-4. The collision mesh is the visual mesh without its seams and its smaller pieces, collapsed
-   further by the same routine (300 k to 20 k faces: 6 s), then cleaned of the slivers and
-   zero-area faces a collapse can leave behind.
+1. Geometry by COLMAP's dense reconstruction, in the dataset frame:
+   `image_undistorter` (pinhole photos of at most MVS_IMAGE_SIZE px, at most MVS_MAX_IMAGES of
+   them), `patch_match_stereo` (depth and normal maps on the GPU, a photometric and then a
+   geometric pass, MVS_SOURCE_IMAGES photos matched against each), `stereo_fusion` (points
+   with the cameras that saw them) and `delaunay_mesher` (a surface carved out of the
+   tetrahedralised points by the rays that saw them, by graph cut). 28 min on sb-v2 (24 of them dense matching), 1.24 M faces.
+2. Here: faces wider than SHARD_MAX_PIXELS in every photo that sees them and far behind what
+   the photos show are dropped (the graph cut's shards, see below), the mesh is moved into the
+   splat's frame, components smaller than
+   VISUAL_MIN_AREA_FRACTION of the largest by area are dropped, and `colmap mesh_simplifier`
+   (quadric edge collapse with optimal vertex placement) brings it to the visual budget.
+3. Texture from the photos: `colmap mesh_texturer` on undistorted photos at full resolution
+   (made smaller only beyond PHOTO_PIXEL_BUDGET). It gives each face the photo that sees it
+   largest, unoccluded by the mesh, smooths that choice over neighbours, levels colour across
+   patch seams and packs the patches into an atlas. Its atlas size cannot be set, only the
+   scale of the patches, so the scale is found by short probe runs that stop as soon as COLMAP
+   prints the atlas size (3 probes on sb-v2); the atlas is then padded to a square. Faces no
+   photo could texture take the colour of a textured neighbour; pieces no camera saw from the
+   front are left out. Masked pixels (masks/<image path>.png, black = leave out) are kept off
+   the texture by occluder triangles: before texturing, the masked area of each photo is
+   covered, as seen from its camera, by small triangles between the camera and the scene,
+   which the texturer's occlusion test then respects; they are removed afterwards.
+4. The collision mesh is the visual geometry, welded, without its smaller pieces, brought to
+   its budget by the same simplifier.
 5. Both files are packed as binary glTF 2.0 and checked by `validate_glb`.
 
-That is 3.5 minutes for the default budgets, of which 2.4 are Spirula's; this module peaks at
-2.3 GB of memory for 2 M extracted faces.
+After the dense step the rest takes about a minute (texturing 45 s at 4096, 73 s at 8192).
 
-Why it is done this way (measured; "kept" is the share of the well-sampled surface of the
-earlier COLMAP-based output that a mesh still covers in six of the training views):
+Why it is done this way. Measured on sb-v2 by rendering the meshes from the dataset's cameras
+next to the photos ("solid cover": share of the photo's non-sky pixels the mesh covers; "sky
+cover": share of its sky pixels, all of them junk; colour error: mean absolute difference per
+channel over 8 x 8 px blocks, on pixels every compared mesh covers; sharpness: mean gradient of
+the render over that of the photo; flatness: RMS distance from a fitted plane of the surface
+inside three window-free patches of brick wall, in thousandths of the camera spread):
 
-* Spirula cannot be made to extract at a face budget, and trying costs surface.
-  `--merge-factor` levels off (2.06 M faces at 1, 0.89 M at 1.5, 0.70 M at 2, 0.63 M at 4)
-  and, because its merge runs before the pass that drops what no camera saw, thin walls are
-  fused with their unseen back and go with it: kept 98.8 % at factor 1, 95.1 % at 1.5,
-  91.3 % at 2, 88.7 % at 4. `--cull-unseen 0` is no way round it (the result is a closed
-  shell around the cameras), nor are `--merge-max-flip-deg` (420 k faces at factor 4 with the
-  guard off, a visibly worse surface), `--grid-cell-factor` and `--max-grid-res` (an
-  acceleration grid only) or `--bisection-iters 0` (the surface stays where the first guess
-  put it). So the extraction runs at factor 1 and the way down is made here, where it costs
-  0.5 %: kept 98.3 % at 300 k faces, 98.1 % at 150 k.
-* `--chart-angle-deg` is worth changing. Spirula's default of 60 gives 150 k charts at factor
-  1, a texturing step of 128 s and 0.058 of the texels the photos could fill; 30 gives 140 k,
-  104 s, 0.067; 10 gives 133 k, 60 s, 0.088, with no difference to be seen in the renders
-  (at factor 1.5: 85 k / 77 k / 69 k / 65 k charts at 60 / 30 / 15 / 8 degrees).
-  `--tex-gutter-px 1` instead of 4 would add another 11 % of texels; it is left alone
-  because the gutter is what step 3 reaches into.
-* A collapse that keeps every face strictly inside its chart is not possible: the charts are
-  a dozen faces each and nearly every vertex lies on a chart border. Giving a face that
-  leaves its chart one flat colour, which is what this module did first, showed as a mosaic
-  of plain triangles over a third of the faces (2 M to 300 k); carrying the chart on into
-  its gutter and stretching the patch beyond that leaves 12 % of the faces affected, and a
-  render that is hard to tell from the undecimated mesh.
-* The texture is as sharp as Spirula bakes it, which is visibly softer than a projection of
-  the photos (the COLMAP texturer this module used before), and in the renders no sharper at
-  8192 than at 4096, although the larger atlas holds four times the texels.
-* Vertex colours instead of a texture were not needed.
+* Geometry: COLMAP's dense reconstruction, not the splat. The surface Spirula extracts from the
+  splat (`spirula mesh`, merge factor 1, 1.16 M faces, then decimated) covers 88.9 % of the
+  solid pixels of 16 views and 80.5 % of the sky, with walls shaded as lumps, thin structures
+  fused and slabs of junk hanging in the sky; the dense mesh covers 94.1 % of the solid pixels
+  and 21 % of the sky (tree crowns and roof edges against it), with windows, cornices, columns,
+  steps and the ground in their place, and 10 pieces instead of 29. On three patches of brick
+  wall the dense surface is not flatter in the large (plane-fit RMS 10.1 / 4.3 / 3.8 against
+  8.1 / 3.5 / 3.4 thousandths of the camera spread; the first patch straddles a step in the
+  wall) and is rougher in the small: neighbouring faces meet at 30 / 19 / 22 degrees on
+  average against 17 / 14 / 14, because each Delaunay facet is tilted a little by depth noise
+  where Spirula relaxes its mesh. That shows under flat shading only; with the smooth vertex
+  normals engines use, the dense walls shade evenly and the splat surface shows its lumps. A splat trained with Spirula's `meshing` preset
+  (30,000 steps, 16 more minutes) meshed worse than the standard splat: walls broken into
+  holes (frame coverage 72-88 % against 85-98 %), 68 components against 29. Poisson meshing of
+  the fused points (23 M faces, 6 min, plus 6 min to simplify) gave blobs and an 82 % cover;
+  `delaunay_mesher` (3 M faces from 2000 px depth maps, 7 min) the sharpest surface; it is used.
+* Dense matching cost and settings: COLMAP's defaults at 2000 px took 56 min for the 128 photos
+  (GPU partly shared), at 1200 px 30 min. MVS_IMAGE_SIZE 1600 with MVS_SOURCE_IMAGES 10 and 3
+  iterations instead of 20 and 5 took 24 min and is not to be told apart from the 2000 px
+  default in the renders (colour error 16.62 against 16.75, sharpness 0.910 against 0.908);
+  1200 px with the defaults gives slightly rounder windows. Fusion and meshing then take
+  3.5 min. Scratch space: about 9 GB of depth and normal maps for 128 photos.
+* Texture: COLMAP's texturer on the photos, not Spirula's bake. Spirula bakes each surface
+  point's colour from a render of the splat, which is visibly softer than the photos. Same
+  300 k-face mesh, 4096 atlas, 16 views whose photos the texturer was NOT given (the splat had
+  been trained on them): colour error 18.13 (photos) against 18.12 (bake), sharpness 0.95
+  against 0.56; brick joints and window bars show in the photo texture and not in the bake.
+* Atlas scale: COLMAP samples the photos bilinearly at the chosen scale. Shrinking the photos
+  first (with a proper filter, by giving the texturer smaller cameras) gave a softer texture
+  (sharpness 0.59 against 0.87) for the same atlas and was dropped.
+* Colour levelling across patch seams (COLMAP's colour correction) lowers the colour error
+  from 16.33 to 15.99; regularisation 0.1 and 1.0 are the same.
+* Faces without a photo: COLMAP leaves them at texture coordinate (0, 0), which renders as black
+  specks wherever the mesh hides a vertex from every camera (6 % of the faces on sb-v2, mostly
+  in window reveals). Taking the colour of a textured neighbour removes the specks and brings
+  the colour error from 17.50 to 16.99.
+* Masks: COLMAP's texturer has no notion of masks; it chooses photos by geometry alone. A test
+  photo with a magenta block painted over a wall and masked put 1,150 magenta texels into the
+  atlas without the occluders and none with them.
+* Shards: where there are no points the Delaunay mesher's graph cut closes the volume with
+  triangles tens to hundreds of pixels long. In the sky and the far background (seen past the
+  edge of an object) these are junk that the texturer paints with whatever lies behind; on plain
+  walls and ceilings they are the real surface. Faces of the dense surface measure 1.9 px
+  (median), 5.5 px (90 %) and 22.6 px (99 %) along their longest edge in the photo that sees them
+  best (truck video, runs/accept-std, 100 frames of 978 x 546; edges measured as projected, so
+  ground seen at a grazing angle is not penalised). Of the faces over 30 px, those on the truck
+  lie at a median 2.9 times the median distance of what that photo shows (90 % beyond 1.35);
+  those in the room (white walls) at 1.0, none beyond 2. Dropping faces over 30 px that are also
+  beyond 2 times took the truck's sky cover from 0.586 to 0.283 (4 views; 1,315 of 281 k faces,
+  every large slab in the sky and over the street) and removed nothing in the room and 23 of
+  1.24 M faces on sb-v2. Without the distance condition the room lost half its walls (cover 0.999
+  to 0.540). Shards near the camera stay. COLMAP's own limit (max_side_length_factor, relative to
+  the 95th percentile side) removed only 579 of 930 k faces on sb-v2 when lowered from 25 to 10.
+* Decimation: `colmap mesh_simplifier` and the earlier pure-Python collapse give renders that
+  cannot be told apart (to 300 k and to 20 k faces); COLMAP's places vertices optimally (one
+  wall patch 2.1 against 8.1), and takes 7 s instead of 25 s for 1 M to 300 k faces.
 
 Coordinate frame
 ----------------
 Both GLBs are written in the frame of the splat file (`step-*.ckpt/splat.ply`), which is
-Spirula's training frame, with the numbers untouched: no node transform, no axis swap, no unit
-change. A vertex (x, y, z) in either GLB is the same point as a Gaussian centre (x, y, z) in
-splat.ply, so the splat and the meshes overlay exactly in any engine whose glTF importer and
-splat loader agree on how to treat raw coordinates. glTF nominally means "+Y up, metres"; a
-photo reconstruction has no metric scale and no gravity direction, so that reading does not hold
-here and whatever rotation and scale the engine applies to the splat must be applied to the two
-meshes as well, as one rigid group.
+Spirula's training frame: no node transform, no axis swap, no unit change. A vertex (x, y, z)
+in either GLB is the same point as a Gaussian centre (x, y, z) in splat.ply, so the splat and
+the meshes overlay exactly in any engine whose glTF importer and splat loader agree on how to
+treat raw coordinates. glTF nominally means "+Y up, metres"; a photo reconstruction has no
+metric scale and no gravity direction, so that reading does not hold here and whatever rotation
+and scale the engine applies to the splat must be applied to the two meshes as well.
 
-`spirula mesh` writes its GLB in the frame of the splat.ply it reads, without a node transform
-(measured: the vertices of mesh.glb lie a median 0.06 % of the scene size from the nearest
-Gaussian centre, and 0.4 % once the mesh is shifted by 1 %; and when a splat was moved by a
-known scale, rotation and shift, its mesh moved with it, to a median 0.04 % of the scene
-size). Nothing here moves a vertex: both meshes are made by removing vertices
-from what Spirula wrote, so every coordinate in either file is one Spirula wrote, bit for bit.
-A GLB from Spirula that carried a node transform would break this, so `read_glb` refuses one.
-The dataset frame (where the cameras are) can differ from the training frame by
-`scene_transform.json`; Spirula deals with that itself, and nothing here needs it.
+COLMAP works in the dataset frame, where the cameras are. The training frame can differ from it
+by `scene_transform.json` in the run folder: the dense mesh is moved into the training frame
+with `train_from_world` as soon as it is read, and everything handed back to COLMAP for
+texturing is moved into the dataset frame with `world_from_train`; only texture coordinates come
+back from that, never positions.
 """
 from __future__ import annotations
 
@@ -92,9 +129,11 @@ import math
 import operator
 import os
 import re
+import shutil
 import struct
 import sys
 import time
+import zlib
 from collections import Counter
 from pathlib import Path
 from typing import Callable, Optional
@@ -112,45 +151,67 @@ __all__ = ["build_meshes", "validate_glb", "MeshError"]
 # Area, not face count: it does not depend on how finely a region happens to be triangulated.
 VISUAL_MIN_AREA_FRACTION = 0.001
 COLLISION_MIN_AREA_FRACTION = 0.01
-# Spirula's own floater filter, in faces. The help text gives 100 as the default, but the flag
-# has to be passed to get it: without it the same scene came out with 11,782 components, with
-# it 937. It costs no time and saves the Python pass most of its work.
-SPIRULA_FLOATER_MIN_FACES = 100
+# --- geometry (COLMAP dense reconstruction) ---
+# Dense matching runs on at most MVS_MAX_IMAGES photos (spread evenly in name order), each made
+# at most MVS_IMAGE_SIZE pixels on its long side, with MVS_SOURCE_IMAGES photos matched against
+# each. Its cost grows with all three; these values are settled in the module docstring.
+MVS_MAX_IMAGES = 200
+MVS_IMAGE_SIZE = 1600
+MVS_SOURCE_IMAGES = 10
+PATCH_MATCH_OPTIONS = ("--PatchMatchStereo.geom_consistency", "1",
+                       "--PatchMatchStereo.num_iterations", "3")
+FUSION_OPTIONS = ()
+DELAUNAY_OPTIONS = ()
+# A face of the dense surface wider than this (longest edge, in pixels of the photos dense
+# matching ran on) in every photo that sees it is a shard of the graph cut, not surface, when it
+# is also far behind what the photos show (see `drop_shards` and the module docstring)...
+SHARD_MAX_PIXELS = 30.0
+# ...and further away, in the photo where it is smallest, than this many times the median
+# distance of the surface that photo shows (estimated from this many vertices).
+SHARD_MIN_DEPTH = 2.0
+SHARD_DEPTH_SAMPLES = 20_000
+# colmap mesh_simplifier usually lands on the budget in one pass; it is run again on what it
+# returns, at most this often in all, when its collapse queue runs dry above the budget.
+SIMPLIFY_PASSES = 3
 
-# `--merge-factor` for the extraction: how far Spirula merges short edges. 1 is its default and
-# the only value that keeps the whole surface: its merge runs before it throws away what no
-# camera saw, and takes real surface along (see the module docstring). The way down to a face
-# budget is done here, by `collapse_to`, which loses next to nothing.
-MERGE_FACTOR = 1.0
-# The one exception, for time and memory: a splat with more Gaussians than this is extracted
-# at the coarser factor. Factor 1 gives about 2.1 faces per Gaussian, and every million faces
-# costs this module about 1.1 GB and half a minute.
-LARGE_SPLAT_GAUSSIANS = 2_500_000
-LARGE_SPLAT_MERGE_FACTOR = 1.5
-# `--chart-angle-deg`: Spirula's default is 60. Smaller is better on every count that was
-# measured (see the module docstring): fewer charts, more texels, a much shorter run.
-CHART_ANGLE_DEG = 10
-# How Spirula stores the atlas in its GLB: "png" (lossless) or "jpg" (JPEG, quality 95).
-TEXTURE_ENCODING = "png"
+# --- texturing (colmap mesh_texturer) ---
+# Options passed to the texturer besides the scale; the rest are COLMAP's defaults (one photo
+# per face, chosen by projected area and an occlusion test against the mesh, three rounds of
+# neighbour smoothing, per-vertex colour levelling across patch seams, 2 px gutters).
+TEXTURER_OPTIONS = ("--MeshTextureMapping.apply_color_correction", "1",
+                    "--MeshTextureMapping.color_correction_regularization", "0.1")
+# Atlas texels per photo pixel: never more than 1 (magnifying the photos adds nothing).
+TEXTURE_MAX_SCALE = 1.0
+MIN_TEXTURE_SCALE = 0.005
+# COLMAP sizes its atlas itself: a power of two wide, as tall as its shelf packing needs, from
+# the patches' size at the given scale. The scale is found by probing (a probe stops as soon
+# as COLMAP prints the atlas size). The search aims at an atlas this full, stops once one is
+# at least ATLAS_GOOD_FILL full or the bracket is this tight, and makes at most ATLAS_PROBES
+# probes. COLMAP only picks a width when the patches fill at most 1/1.3 of the square.
+ATLAS_FILL = 0.76
+ATLAS_GOOD_FILL = 0.70
+ATLAS_SCALE_TOLERANCE = 0.03
+ATLAS_PROBES = 8
+# The texturer holds every photo in memory at once: above this many pixels in all, the photos
+# are made smaller when they are undistorted (a 4096 atlas uses a fifth of the photos'
+# resolution on a typical scan, so this costs no texture detail).
+PHOTO_PIXEL_BUDGET = 1_500_000_000
+# Masks: the masked area of a photo is covered with occluder triangles on a grid of this many
+# cells across the mask's short side, grown by one cell. They stand at half the distance to
+# the nearest surface the camera sees (a sample of OCCLUDER_SAMPLE_VERTICES vertices), but no
+# nearer than OCCLUDER_MIN_DEPTH and no further than OCCLUDER_MAX_DEPTH of the scene's size.
+MASK_CELLS_ACROSS = 96
+OCCLUDER_SAMPLE_VERTICES = 20_000
+OCCLUDER_MIN_DEPTH = 0.001
+OCCLUDER_MAX_DEPTH = 0.02
+OCCLUDER_FOV_SLOPE = 10.0
 
-# Collapsing an edge may not turn a face by more than this (cosine), and may not eat into an
-# open border more cheaply than this weight allows (relative to a face of the same size).
-COLLAPSE_MAX_TURN_COS = 0.2
-COLLAPSE_BORDER_WEIGHT = 1.0
-# Price of pulling a face's patch of the atlas out of shape (a corner left where it was in the
-# atlas while it moves in space): as if a face of its size had been moved by
-# sqrt(TEXTURE_LOSS_WEIGHT) times its own size; less, in proportion, for a face with fewer than
-# TEXTURE_LOSS_TEXELS texels, which has little to lose.
-TEXTURE_LOSS_WEIGHT = 1.0
-TEXTURE_LOSS_TEXELS = 8.0
-# How far outside its chart a texture coordinate may be put, in texels. Spirula leaves a gutter
-# of 4 texels between charts and fills it with the colours of the nearest chart edge, so half
-# of that belongs to each chart.
-TEXTURE_REACH_TEXELS = 2.0
-
-SPIRULA_TIMEOUT = 2400
-# The longest silence of a healthy run is the chart parameterisation: 50 s for 2 M faces.
-SPIRULA_STALL = 900
+# Dense matching: 2 x 200 photos at about 7 s each on an RTX 5070 Ti Laptop is under an hour.
+MVS_TIMEOUT = 4 * 3600
+COLMAP_TIMEOUT = 3600
+# The longest silences: the texturer loading the photos and choosing views, and the Delaunay
+# mesher's triangulation and graph cut (a minute or two each on large scans).
+COLMAP_STALL = 1200
 
 _F32 = array.array("f")
 _I32 = array.array("i")
@@ -241,8 +302,8 @@ def _vertex_roots(n_vertices: int, tris: array.array) -> list:
 def _weld_map(mesh: Mesh) -> Optional[list]:
     """Map each vertex to the first vertex at exactly the same position, or None if all differ.
 
-    Spirula duplicates vertices where it splits non-manifold fans; without welding, the two
-    sides of such a split would be counted as separate components.
+    Meshes duplicate vertices along texture seams and where non-manifold fans were split;
+    without welding, the two sides of such a split would be counted as separate components.
     """
     raw = mesh.xyz.tobytes()
     first = {}
@@ -470,586 +531,6 @@ def seamless_normals(mesh: Mesh) -> array.array:
 
 
 # =============================================================================================
-# Simplification
-# =============================================================================================
-
-def collapse_to(mesh: Mesh, target_faces: int, *, texels: float = 0.0,
-                tick: Optional[Callable[[int], None]] = None):
-    """Bring a mesh down to at most `target_faces` triangles by quadric-error edge collapse.
-
-    Returns (mesh, stats). Only half-edge collapses are made: a vertex is merged into one of
-    its neighbours, cheapest first by the summed squared distance to the planes of the faces the
-    vertex has stood for (Garland and Heckbert's measure). No vertex is ever moved, so every
-    vertex of the result is a vertex of the input at its original position.
-
-    A scan is not a clean manifold: the extracted surface is full of handles and tunnels a few
-    faces across, and a collapse that respected the topology stalls on them (measured: a
-    strictly topology-preserving version stopped at 528 k of 1.75 M faces, with a third of the
-    remaining vertices unable to move). So a collapse may pinch such a handle shut. When it
-    folds two faces onto each other, both are removed; a collapse that would turn a face over
-    is refused, and a vertex on an open border only moves along the border.
-
-    Vertices at the same position are treated as one, so the two sides of a texture seam never
-    come apart. When the mesh has texture coordinates (`mesh.uv`, with `texels` the number of
-    texels in the atlas) the atlas is kept as it is and every face keeps pointing into the
-    chart it came from. A corner that moves takes the coordinates its new vertex has in that
-    chart. Where the new vertex is not part of the chart, it is given coordinates there: the
-    place the faces' own mapping puts it when carried on past the edge of the chart, which is
-    in the gutter Spirula fills with the colours of the chart's edge. Such a coordinate may
-    lie at most TEXTURE_REACH_TEXELS outside the chart. What does not fit is cut short, or, if
-    the triangle would turn over in the atlas, the corner keeps the coordinate it had: the
-    face then shows its patch of the texture pulled out of shape, which costs detail in
-    proportion to the texels the face had and is priced into the collapse accordingly
-    (TEXTURE_LOSS_WEIGHT), so collapses inside a chart and along a seam go first. No face is
-    ever reduced to a single colour.
-
-    stats: faces_before, faces_after, collapses, faces_stretched (faces showing a patch that
-    was cut short or left behind) and atlas_shown (area of the atlas the faces still show,
-    relative to the start).
-
-    `tick(faces_left)` is called every few thousand collapses and may raise to stop the work.
-    """
-    if target_faces < 4:
-        raise MeshError(f"a face budget must be at least 4, got {target_faces}")
-    xyz = mesh.xyz
-    n = mesh.vertex_count
-    textured = mesh.uv is not None
-    same = _weld_map(mesh)
-    # The quadrics square the coordinates, and a scan can sit far from the origin: centre them.
-    centre = [(min(xyz[k::3]) + max(xyz[k::3])) / 2.0 for k in range(3)]
-    X = [v - centre[0] for v in xyz[0::3]]
-    Y = [v - centre[1] for v in xyz[1::3]]
-    Z = [v - centre[2] for v in xyz[2::3]]
-    # Faces by position (F: the first vertex at each position stands for all of them) and, for
-    # a textured mesh, by texture coordinate (T: an index into U and V).
-    T0 = mesh.tris[0::3].tolist()
-    T1 = mesh.tris[1::3].tolist()
-    T2 = mesh.tris[2::3].tolist()
-    if same is None:
-        F0, F1, F2 = list(T0), list(T1), list(T2)
-    else:
-        F0 = list(map(same.__getitem__, T0))
-        F1 = list(map(same.__getitem__, T1))
-        F2 = list(map(same.__getitem__, T2))
-    alive = 0
-    VF = [[] for _ in range(n)]          # faces around each position
-    for f, (a, b, c) in enumerate(zip(F0, F1, F2)):
-        if a == b or b == c or a == c:
-            F0[f] = -1                   # two corners at one position: no face at all
-            continue
-        alive += 1
-        VF[a].append(f)
-        VF[b].append(f)
-        VF[c].append(f)
-    stats = {"faces_before": alive, "collapses": 0, "faces_stretched": 0, "atlas_shown": 1.0}
-    if textured:
-        U = mesh.uv[0::2].tolist()
-        V = mesh.uv[1::2].tolist()
-        chart = _vertex_roots(n, mesh.tris)      # per texture coordinate: the chart it is in
-        stray = [0.0] * n                        # per texture coordinate: how far outside its chart
-        stretched = bytearray(len(T0))           # faces whose patch is no longer the true one
-        reach = TEXTURE_REACH_TEXELS / math.sqrt(texels) if texels > 0.0 else 0.0
-    else:
-        del T0, T1, T2
-
-    # One quadric per face (its plane, weighted by its area), summed into its three corners.
-    sqrt = math.sqrt
-    zero = (0.0,) * 10
-    planes = []
-    add = planes.append
-    total_area = 0.0
-    for a, b, c in zip(F0, F1, F2):
-        if a < 0:
-            add(zero)
-            continue
-        ax = X[a]
-        ay = Y[a]
-        az = Z[a]
-        ux = X[b] - ax
-        uy = Y[b] - ay
-        uz = Z[b] - az
-        vx = X[c] - ax
-        vy = Y[c] - ay
-        vz = Z[c] - az
-        nx = uy * vz - uz * vy
-        ny = uz * vx - ux * vz
-        nz = ux * vy - uy * vx
-        l2 = nx * nx + ny * ny + nz * nz
-        if l2 < 1e-60:
-            add(zero)
-            continue
-        w = 0.5 / sqrt(l2)                # area / |n|^2, for the un-normalised n
-        total_area += l2 * w
-        d = -(nx * ax + ny * ay + nz * az)
-        wx = w * nx
-        wy = w * ny
-        wz = w * nz
-        add((wx * nx, wx * ny, wx * nz, wx * d, wy * ny, wy * nz, wy * d, wz * nz, wz * d, w * d * d))
-    Q = [list(map(sum, zip(*[planes[f] for f in fs]))) if fs else None for fs in VF]
-    del planes
-
-    def ring_of(u: int) -> dict:
-        """Neighbours of u, each with the number of faces on the edge to it."""
-        ring = {}
-        get = ring.get
-        for f in VF[u]:
-            a = F0[f]
-            b = F1[f]
-            c = F2[f]
-            if a != u:
-                ring[a] = get(a, 0) + 1
-            if b != u:
-                ring[b] = get(b, 0) + 1
-            if c != u:
-                ring[c] = get(c, 0) + 1
-        return ring
-
-    # Open borders get a plane of their own through each border edge, at right angles to its
-    # face, so that sliding a border vertex along a straight border is free and cutting a
-    # corner off the outline is not.
-    for u in range(n):
-        if not VF[u]:
-            continue
-        for w, faces_on_edge in ring_of(u).items():
-            if faces_on_edge != 1 or w < u:
-                continue
-            for f in VF[u]:
-                if F0[f] == w or F1[f] == w or F2[f] == w:
-                    break
-            a = F0[f]
-            b = F1[f]
-            c = F2[f]
-            ux = X[b] - X[a]
-            uy = Y[b] - Y[a]
-            uz = Z[b] - Z[a]
-            vx = X[c] - X[a]
-            vy = Y[c] - Y[a]
-            vz = Z[c] - Z[a]
-            nx = uy * vz - uz * vy
-            ny = uz * vx - ux * vz
-            nz = ux * vy - uy * vx
-            ex = X[w] - X[u]
-            ey = Y[w] - Y[u]
-            ez = Z[w] - Z[u]
-            mx = ey * nz - ez * ny
-            my = ez * nx - ex * nz
-            mz = ex * ny - ey * nx
-            l2 = mx * mx + my * my + mz * mz
-            if l2 < 1e-60:
-                continue
-            wgt = COLLAPSE_BORDER_WEIGHT * (ex * ex + ey * ey + ez * ez) / l2
-            d = -(mx * X[u] + my * Y[u] + mz * Z[u])
-            wx = wgt * mx
-            wy = wgt * my
-            wz = wgt * mz
-            plane = (wx * mx, wx * my, wx * mz, wx * d, wy * my, wy * mz, wy * d, wz * mz, wz * d,
-                     wgt * d * d)
-            Q[u] = [s + t for s, t in zip(Q[u], plane)]
-            Q[w] = [s + t for s, t in zip(Q[w], plane)]
-
-    INF = math.inf
-    FROZEN = 255
-    spent = [0.0] * n            # error already accumulated at each vertex
-    queued = [INF] * n           # cost of the live queue entry of each vertex; INF = not queued
-    tries = bytearray(n)         # failed attempts; FROZEN = never ask again
-    turn_limit = COLLAPSE_MAX_TURN_COS * COLLAPSE_MAX_TURN_COS
-    if textured:
-        # A face's size in texels is twice its atlas area times this; its size in space is
-        # that over the atlas's average density. Both go into the price of flattening it.
-        atlas_area = 0.0
-        for f, (a, b, c) in enumerate(zip(T0, T1, T2)):
-            if F0[f] >= 0:
-                atlas_area += abs((U[b] - U[a]) * (V[c] - V[a]) - (V[b] - V[a]) * (U[c] - U[a]))
-        half_texels = 0.5 * texels
-        space_per_texel = total_area / (half_texels * atlas_area) if half_texels * atlas_area > 0.0 else 0.0
-
-    def moves(u: int):
-        """Possible targets for u as [(cost, target)], cheapest first; None when u may not move."""
-        ring = ring_of(u)
-        border = [w for w, faces_on_edge in ring.items() if faces_on_edge == 1]
-        if border:
-            if len(border) != 2:
-                return None              # several borders meet here: leave it alone
-            targets = border             # a border vertex only slides along its border
-        else:
-            targets = ring
-        q0, q1, q2, q3, q4, q5, q6, q7, q8, q9 = Q[u]
-        out = []
-        for v in targets:
-            x = X[v]
-            y = Y[v]
-            z = Z[v]
-            out.append((x * (q0 * x + 2.0 * (q1 * y + q2 * z + q3))
-                        + y * (q4 * y + 2.0 * (q5 * z + q6)) + z * (q7 * z + 2.0 * q8) + q9
-                        + spent[v], v))
-        out.sort()
-        return out
-
-    def allowed(u: int, v: int) -> bool:
-        """True unless merging u into v would turn one of the faces around u over."""
-        x = X[v]
-        y = Y[v]
-        z = Z[v]
-        ox = X[u]
-        oy = Y[u]
-        oz = Z[u]
-        for f in VF[u]:
-            a = F0[f]
-            b = F1[f]
-            c = F2[f]
-            if a == v or b == v or c == v:
-                continue                 # this face disappears
-            if a == u:
-                p = b
-                q = c
-            elif b == u:
-                p = c
-                q = a
-            else:
-                p = a
-                q = b
-            px = X[p]
-            py = Y[p]
-            pz = Z[p]
-            ex = X[q] - px
-            ey = Y[q] - py
-            ez = Z[q] - pz
-            ax = ox - px
-            ay = oy - py
-            az = oz - pz
-            n0x = ey * az - ez * ay
-            n0y = ez * ax - ex * az
-            n0z = ex * ay - ey * ax
-            ax = x - px
-            ay = y - py
-            az = z - pz
-            n1x = ey * az - ez * ay
-            n1y = ez * ax - ex * az
-            n1z = ex * ay - ey * ax
-            dot = n0x * n1x + n0y * n1y + n0z * n1z
-            if dot <= 0.0 or dot * dot < turn_limit * (n0x * n0x + n0y * n0y + n0z * n0z) \
-                    * (n1x * n1x + n1y * n1y + n1z * n1z):
-                return False
-        return True
-
-    def retexture(u: int, v: int):
-        """What merging u into v does to the texture: (price, plan, fresh).
-
-        `plan` lists (face, coordinate, stretched) for the faces around u that survive: the
-        texture coordinate their corner at u gets at v. A coordinate >= 0 is one that exists; a
-        negative one, -1 - k, is `fresh[k]`, a new (u, v, chart, stray) to be made when the merge
-        goes ahead.
-        """
-        at_v = {}                        # chart -> the coordinate v has in it
-        for g in VF[v]:
-            t = T0[g] if F0[g] == v else (T1[g] if F1[g] == v else T2[g])
-            at_v[chart[t]] = t
-        price = 0.0
-        plan = []
-        fresh = []
-        fans = None                      # coordinate at u -> the faces that have to leave their chart
-        for f in VF[u]:
-            a = F0[f]
-            b = F1[f]
-            c = F2[f]
-            if a == v or b == v or c == v:
-                continue
-            if a == u:
-                tu = T0[f]
-                tp = T1[f]
-                tq = T2[f]
-                p = b
-                q = c
-            elif b == u:
-                tu = T1[f]
-                tp = T2[f]
-                tq = T0[f]
-                p = c
-                q = a
-            else:
-                tu = T2[f]
-                tp = T0[f]
-                tq = T1[f]
-                p = a
-                q = b
-            pu = U[tp]
-            pv = V[tp]
-            eu = U[tq] - pu
-            ev = V[tq] - pv
-            before = eu * (V[tu] - pv) - ev * (U[tu] - pu)
-            tv = at_v.get(chart[tu], -1)
-            if tv >= 0:
-                after = eu * (V[tv] - pv) - ev * (U[tv] - pu)
-                # Same way round in the atlas as before, and not squeezed to a sliver of it.
-                if before * after > 0.0 and 16.0 * abs(after) > abs(before):
-                    plan.append((f, tv, 0))
-                    continue
-            if fans is None:
-                fans = {}
-            fans.setdefault(tu, []).append((f, p, q, tp, tq, before, tv < 0))
-        if fans is None:
-            return 0.0, plan, fresh
-        ox = X[u]
-        oy = Y[u]
-        oz = Z[u]
-        wx = X[v] - ox
-        wy = Y[v] - oy
-        wz = Z[v] - oz
-        for tu, fan in fans.items():
-            # v is not part of this chart. Carry the chart's own mapping on to where v is: each
-            # face of the fan says where v would lie in the atlas if its patch went on beyond
-            # its edge, and the fan takes the mean, weighted by the size of the face.
-            uu = U[tu]
-            vv = V[tu]
-            su = 0.0
-            sv = 0.0
-            sw = 0.0
-            for f, p, q, tp, tq, before, outside in fan:
-                if not outside:
-                    continue             # v has a place in this chart, only not one this face can use
-                e1x = X[p] - ox
-                e1y = Y[p] - oy
-                e1z = Z[p] - oz
-                e2x = X[q] - ox
-                e2y = Y[q] - oy
-                e2z = Z[q] - oz
-                d11 = e1x * e1x + e1y * e1y + e1z * e1z
-                d12 = e1x * e2x + e1y * e2y + e1z * e2z
-                d22 = e2x * e2x + e2y * e2y + e2z * e2z
-                det = d11 * d22 - d12 * d12
-                if det <= 1e-12 * d11 * d22:
-                    continue
-                w1 = wx * e1x + wy * e1y + wz * e1z
-                w2 = wx * e2x + wy * e2y + wz * e2z
-                ca = (d22 * w1 - d12 * w2) / det
-                cb = (d11 * w2 - d12 * w1) / det
-                weight = sqrt(det)
-                su += weight * (ca * (U[tp] - uu) + cb * (U[tq] - uu))
-                sv += weight * (ca * (V[tp] - vv) + cb * (V[tq] - vv))
-                sw += weight
-            kept = 0.0                   # the share of that step the atlas has room for
-            k = 0
-            if sw > 0.0:
-                su /= sw
-                sv /= sw
-                step = sqrt(su * su + sv * sv)
-                room = reach - stray[tu]
-                if step <= room:
-                    kept = 1.0
-                    off = stray[tu] + step
-                elif room > 0.0:
-                    kept = room / step
-                    su *= kept
-                    sv *= kept
-                    off = reach
-                if kept > 0.0:
-                    nu = uu + su
-                    nv = vv + sv
-                    nu = 0.0 if nu < 0.0 else 1.0 if nu > 1.0 else nu
-                    nv = 0.0 if nv < 0.0 else 1.0 if nv > 1.0 else nv
-                    fresh.append((nu, nv, chart[tu], off))
-                    k = -len(fresh)
-            for f, p, q, tp, tq, before, outside in fan:
-                size = abs(before) * half_texels
-                space = size * space_per_texel
-                loss = TEXTURE_LOSS_WEIGHT * space * space * (size / TEXTURE_LOSS_TEXELS
-                                                           if size < TEXTURE_LOSS_TEXELS else 1.0)
-                if k < 0:
-                    pu = U[tp]
-                    pv = V[tp]
-                    after = (U[tq] - pu) * (nv - pv) - (V[tq] - pv) * (nu - pu)
-                    if before * after > 0.0 and 16.0 * abs(after) > abs(before):
-                        plan.append((f, k, kept < 1.0))
-                        price += loss * (1.0 - kept)
-                        continue
-                # The corner keeps the coordinate it had: the face goes on showing the patch
-                # it showed, pulled over to where it now lies.
-                plan.append((f, tu, 1))
-                price += loss
-        return price, plan, fresh
-
-    heap = []
-    pop = heapq.heappop
-    push = heapq.heappush
-    steps = 0
-    for turn_limit in (turn_limit, -1.0):
-        # Queue every vertex at the cost of its cheapest move; whether that move is allowed,
-        # and what it does to the texture, is only worked out when the entry reaches the top.
-        # The second round, entered only when the first one runs dry above the budget, lifts
-        # the limit on how far a face may turn (it still may not flip): the budget is a
-        # promise, a smooth fold is not.
-        if alive <= target_faces:
-            break
-        heap.clear()
-        for u in range(n):
-            if not VF[u]:
-                continue
-            found = moves(u)
-            if not found:
-                queued[u] = INF
-                tries[u] = FROZEN
-                continue
-            tries[u] = 0
-            queued[u] = found[0][0]
-            heap.append((found[0][0], u))
-        heapq.heapify(heap)
-        while alive > target_faces and heap:
-            cost, u = pop(heap)
-            if cost != queued[u]:
-                continue                 # an older entry of a vertex that was queued again
-            found = moves(u)
-            v = -1
-            now = INF
-            plan = None
-            if found:
-                looked = 0
-                for geometric, w in found:
-                    if geometric >= now:
-                        break            # the rest can only be dearer
-                    if not allowed(u, w):
-                        continue
-                    if textured:
-                        price, changes, made = retexture(u, w)
-                        if geometric + price < now:
-                            now = geometric + price
-                            v = w
-                            plan = changes
-                            fresh = made
-                    else:
-                        now = geometric
-                        v = w
-                    looked += 1
-                    if looked == 3:
-                        break
-            if v < 0:
-                # Nothing it may do for now. A collapse next to it puts it back in the queue.
-                queued[u] = INF
-                tries[u] = tries[u] + 1 if tries[u] < 3 else FROZEN
-                continue
-            if now > cost and heap and now > heap[0][0]:
-                queued[u] = now          # dearer than when it was queued: not its turn yet
-                push(heap, (now, u))
-                continue
-            # --- merge u into v
-            if plan:
-                if fresh:
-                    base = len(U) + len(fresh)       # fresh[k] becomes coordinate base - 1 - k
-                    for nu, nv, ch, off in reversed(fresh):
-                        U.append(nu)
-                        V.append(nv)
-                        chart.append(ch)
-                        stray.append(off)
-                for f, t, pulled in plan:
-                    if t < 0:
-                        t += base
-                    if pulled:
-                        stretched[f] = 1
-                    if F0[f] == u:
-                        T0[f] = t
-                    elif F1[f] == u:
-                        T1[f] = t
-                    else:
-                        T2[f] = t
-            around_v = VF[v]
-            ring_v = ring_of(v)          # as it was before the merge; only used as a quick filter
-            for f in VF[u]:
-                a = F0[f]
-                b = F1[f]
-                c = F2[f]
-                if a == v or b == v or c == v:
-                    alive -= 1
-                    F0[f] = -1
-                    around_v.remove(f)
-                    VF[a if (a != u and a != v) else (b if (b != u and b != v) else c)].remove(f)
-                    continue
-                if a == u:
-                    p = b
-                    q = c
-                elif b == u:
-                    p = c
-                    q = a
-                else:
-                    p = a
-                    q = b
-                if p in ring_v and q in ring_v:
-                    twin = -1
-                    for g in around_v:
-                        ga = F0[g]
-                        gb = F1[g]
-                        gc = F2[g]
-                        if (ga == p or gb == p or gc == p) and (ga == q or gb == q or gc == q):
-                            twin = g
-                            break
-                    if twin >= 0:
-                        # The moved face lands on one v already has: a flap with nothing
-                        # inside, the two walls of a pinched handle. Both go. (Keeping one
-                        # of them was tried, for the sake of thin two-sided shells: the mesh
-                        # covered the same pixels of six test views to within 0.2 %, and one
-                        # collapse in two left such a fin behind.)
-                        alive -= 2
-                        F0[f] = -1
-                        F0[twin] = -1
-                        around_v.remove(twin)
-                        VF[p].remove(f)
-                        VF[p].remove(twin)
-                        VF[q].remove(f)
-                        VF[q].remove(twin)
-                        continue
-                if a == u:
-                    F0[f] = v
-                elif b == u:
-                    F1[f] = v
-                else:
-                    F2[f] = v
-                around_v.append(f)
-            VF[u] = ()
-            queued[u] = INF
-            Q[v] = [s + t for s, t in zip(Q[v], Q[u])]
-            Q[u] = None
-            spent[v] = now
-            for f in around_v:
-                for w in (F0[f], F1[f], F2[f]):
-                    if queued[w] == INF and tries[w] != FROZEN:
-                        queued[w] = now
-                        push(heap, (now, w))
-            steps += 1
-            if tick is not None and not steps & 0xFFF:
-                tick(alive)
-    stats["collapses"] = steps
-    stats["faces_after"] = alive
-
-    # --- pack what is left
-    keep = [a >= 0 for a in F0]
-    corners = []
-    for column in (F0, F1, F2):
-        corners.append(list(itertools.compress(column, keep)))
-    if not textured:
-        tris = array.array("i", bytes(12 * alive))
-        for k in range(3):
-            tris[k::3] = array.array("i", corners[k])
-        return select_faces(Mesh(xyz, tris), [True] * alive), stats
-    # One output vertex per (position, texture coordinate) pair in use.
-    pairs = {}
-    number = pairs.setdefault
-    tris = array.array("i", bytes(12 * alive))
-    span = len(U)
-    for k, column in enumerate((T0, T1, T2)):
-        tris[k::3] = array.array("i", [number(p * span + t, len(pairs))
-                                       for p, t in zip(corners[k], itertools.compress(column, keep))])
-    source = [key // span for key in pairs]
-    coords = [key % span for key in pairs]
-    shown = 0.0
-    for a, b, c in zip(*(itertools.compress(column, keep) for column in (T0, T1, T2))):
-        shown += abs((U[b] - U[a]) * (V[c] - V[a]) - (V[b] - V[a]) * (U[c] - U[a]))
-    stats["faces_stretched"] = sum(itertools.compress(stretched, keep))
-    stats["atlas_shown"] = shown / atlas_area if atlas_area > 0.0 else 0.0
-    uv = array.array("f", bytes(8 * len(pairs)))
-    uv[0::2] = array.array("f", map(U.__getitem__, coords))
-    uv[1::2] = array.array("f", map(V.__getitem__, coords))
-    return Mesh(_take3(xyz, source), tris, uv), stats
-
-
-# =============================================================================================
 # Frames
 # =============================================================================================
 
@@ -1059,10 +540,10 @@ IDENTITY = (1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0)
 def read_scene_transform(run_dir) -> dict:
     """Read Spirula's scene_transform.json. Returns row-major 3x4 matrices for both directions.
 
-    A run without the file was trained in the dataset frame, so both are the identity. Nothing
-    here applies these matrices: the meshes are written in the training frame, which is the
-    frame of the splat, whatever its relation to the dataset frame. The result only tells the
-    caller whether the two frames differ.
+    A run without the file was trained in the dataset frame, so both are the identity. The
+    meshes are made and written in the training frame (the frame of the splat); only what is
+    handed to COLMAP, which works in the dataset frame where the cameras are, is moved there
+    with `world_from_train`.
     """
     path = Path(run_dir) / "scene_transform.json"
     if not path.exists():
@@ -1080,6 +561,19 @@ def read_scene_transform(run_dir) -> dict:
             f"cannot read the scene transform {path} ({e}). It is written by Spirula when "
             f"training finishes; train the splat again if the file is damaged.") from e
     out["identity"] = all(abs(a - b) < 1e-9 for a, b in zip(out["train_from_world"], IDENTITY))
+    return out
+
+
+def transform_points(xyz: array.array, m) -> array.array:
+    """Apply a row-major 3x4 matrix to every point (3 floats each)."""
+    a, b, c, d, e, f, g, h, i, j, k, l = m
+    xs = xyz[0::3]
+    ys = xyz[1::3]
+    zs = xyz[2::3]
+    out = array.array("f", bytes(4 * len(xyz)))
+    out[0::3] = array.array("f", [a * x + b * y + c * z + d for x, y, z in zip(xs, ys, zs)])
+    out[1::3] = array.array("f", [e * x + f * y + g * z + h for x, y, z in zip(xs, ys, zs)])
+    out[2::3] = array.array("f", [i * x + j * y + k * z + l for x, y, z in zip(xs, ys, zs)])
     return out
 
 
@@ -1437,7 +931,7 @@ def validate_glb(path) -> dict:
 
 
 def read_glb(path):
-    """Read the one textured triangle mesh of a GLB written by `spirula mesh`.
+    """Read the one triangle mesh of a GLB such as `write_glb` writes (for checks and tests).
 
     Returns (mesh, image): positions, triangles and texture coordinates exactly as stored, and
     the embedded texture file (PNG or JPEG bytes), or None when the mesh has no texture.
@@ -1447,7 +941,7 @@ def read_glb(path):
     path = Path(path)
 
     def fail(msg: str):
-        raise MeshError(f"cannot use the mesh Spirula wrote ({path}): {msg}")
+        raise MeshError(f"cannot use the mesh in {path}: {msg}")
 
     try:
         raw = path.read_bytes()
@@ -1507,7 +1001,7 @@ def read_glb(path):
             if len(image) != view["byteLength"]:
                 fail("the texture runs past the end of the file")
     except (KeyError, IndexError, TypeError) as e:
-        fail(f"its structure is not what `spirula mesh` is known to write ({e!r})")
+        fail(f"its structure is not a single indexed triangle mesh ({e!r})")
     if len(index) % 3 or not len(index):
         fail("the index count is not a positive multiple of 3")
     if max(index) >= len(xyz) // 3:
@@ -1520,7 +1014,549 @@ def read_glb(path):
 
 
 # =============================================================================================
-# Spirula
+# COLMAP camera model, PNG masks, PLY
+# =============================================================================================
+
+# model id -> (name, number of parameters)
+CAMERA_MODELS = {0: ("SIMPLE_PINHOLE", 3), 1: ("PINHOLE", 4), 2: ("SIMPLE_RADIAL", 4), 3: ("RADIAL", 5),
+                 4: ("OPENCV", 8), 5: ("OPENCV_FISHEYE", 8), 6: ("FULL_OPENCV", 12)}
+
+
+def read_cameras_bin(path) -> dict:
+    data = Path(path).read_bytes()
+    n = struct.unpack_from("<Q", data, 0)[0]
+    pos = 8
+    out = {}
+    for _ in range(n):
+        cid, model, w, h = struct.unpack_from("<iiQQ", data, pos)
+        pos += 24
+        if model not in CAMERA_MODELS:
+            raise MeshError(f"camera model {model} in {path} is not supported")
+        k = CAMERA_MODELS[model][1]
+        params = struct.unpack_from("<%dd" % k, data, pos)
+        pos += 8 * k
+        out[cid] = (model, w, h, params)
+    return out
+
+
+def read_images_bin(path) -> list:
+    """[(image_id, name, R row-major 9-tuple (cam_from_world), t, camera_id)]."""
+    data = Path(path).read_bytes()
+    n = struct.unpack_from("<Q", data, 0)[0]
+    pos = 8
+    out = []
+    for _ in range(n):
+        iid = struct.unpack_from("<i", data, pos)[0]
+        qw, qx, qy, qz = struct.unpack_from("<4d", data, pos + 4)
+        t = struct.unpack_from("<3d", data, pos + 36)
+        cid = struct.unpack_from("<i", data, pos + 60)[0]
+        pos += 64
+        end = data.index(b"\x00", pos)
+        name = data[pos:end].decode("utf-8")
+        pos = end + 1
+        m = struct.unpack_from("<Q", data, pos)[0]
+        pos += 8 + 24 * m
+        s = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz) or 1.0
+        qw, qx, qy, qz = qw / s, qx / s, qy / s, qz / s
+        R = (1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy),
+             2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx),
+             2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy))
+        out.append((iid, name, R, t, cid))
+    return out
+
+
+def distort(model: int, p, x: float, y: float):
+    """Normalised undistorted (x, y) -> pixel (u, v) in the distorted image."""
+    if model == 0:
+        f, cx, cy = p
+        return f * x + cx, f * y + cy
+    if model == 1:
+        fx, fy, cx, cy = p
+        return fx * x + cx, fy * y + cy
+    if model in (2, 3):
+        f, cx, cy, k1 = p[:4]
+        k2 = p[4] if model == 3 else 0.0
+        r2 = x * x + y * y
+        d = 1 + k1 * r2 + k2 * r2 * r2
+        return f * x * d + cx, f * y * d + cy
+    if model in (4, 6):
+        fx, fy, cx, cy, k1, k2, p1, p2 = p[:8]
+        r2 = x * x + y * y
+        if model == 4:
+            d = 1 + k1 * r2 + k2 * r2 * r2
+        else:
+            k3, k4, k5, k6 = p[8:12]
+            d = (1 + r2 * (k1 + r2 * (k2 + r2 * k3))) / (1 + r2 * (k4 + r2 * (k5 + r2 * k6)))
+        xd = x * d + 2 * p1 * x * y + p2 * (r2 + 2 * x * x)
+        yd = y * d + p1 * (r2 + 2 * y * y) + 2 * p2 * x * y
+        return fx * xd + cx, fy * yd + cy
+    if model == 5:
+        fx, fy, cx, cy, k1, k2, k3, k4 = p
+        r = math.sqrt(x * x + y * y)
+        if r < 1e-12:
+            return fx * x + cx, fy * y + cy
+        th = math.atan(r)
+        t2 = th * th
+        thd = th * (1 + t2 * (k1 + t2 * (k2 + t2 * (k3 + t2 * k4))))
+        return fx * x * thd / r + cx, fy * y * thd / r + cy
+    raise MeshError(f"camera model {model} is not supported")
+
+
+def undistort(model: int, p, u: float, v: float):
+    """Pixel (u, v) in the distorted image -> normalised undistorted (x, y), by Newton steps."""
+    if model == 0:
+        f, cx, cy = p
+        fx = fy = f
+    elif model == 2 or model == 3:
+        f, cx, cy = p[:3]
+        fx = fy = f
+    else:
+        fx, fy, cx, cy = p[:4]
+    xd = (u - cx) / fx
+    yd = (v - cy) / fy
+    if model in (0, 1):
+        return xd, yd
+    x, y = xd, yd
+    for _ in range(30):
+        uu, vv = distort(model, p, x, y)
+        ex = (uu - u) / fx
+        ey = (vv - v) / fy
+        if ex * ex + ey * ey < 1e-24:
+            break
+        h = 1e-7
+        ux, vx = distort(model, p, x + h, y)
+        uy, vy = distort(model, p, x, y + h)
+        a = (ux - uu) / (fx * h)
+        b = (uy - uu) / (fx * h)
+        c = (vx - vv) / (fy * h)
+        d = (vy - vv) / (fy * h)
+        det = a * d - b * c
+        if abs(det) < 1e-12:
+            break
+        x -= (d * ex - b * ey) / det
+        y -= (-c * ex + a * ey) / det
+    return x, y
+
+
+def _png_chunks(data: bytes):
+    if data[:8] != b"\x89PNG\r\n\x1a\n":
+        raise MeshError("not a PNG file")
+    pos = 8
+    while pos + 8 <= len(data):
+        length, kind = struct.unpack_from(">I4s", data, pos)
+        yield kind, data[pos + 8:pos + 8 + length]
+        pos += 12 + length
+        if kind == b"IEND":
+            break
+
+
+def _unfilter(raw: bytes, height: int, row_bytes: int, bpp: int) -> list:
+    """Undo PNG row filters. Returns a list of `height` bytes objects."""
+    rows = []
+    prev = bytes(row_bytes)
+    stride = row_bytes + 1
+    if len(raw) < height * stride:
+        raise MeshError("the PNG image data is truncated")
+    for y in range(height):
+        kind = raw[y * stride]
+        line = raw[y * stride + 1:(y + 1) * stride]
+        if kind == 0:
+            cur = line
+        elif kind == 2:
+            if not any(line):
+                cur = prev
+            else:
+                cur = bytes((a + b) & 255 for a, b in zip(line, prev))
+        elif kind == 1:
+            out = bytearray(line)
+            for i in range(bpp, row_bytes):
+                out[i] = (out[i] + out[i - bpp]) & 255
+            cur = bytes(out)
+        elif kind == 3:
+            out = bytearray(line)
+            for i in range(row_bytes):
+                left = out[i - bpp] if i >= bpp else 0
+                out[i] = (out[i] + ((left + prev[i]) >> 1)) & 255
+            cur = bytes(out)
+        elif kind == 4:
+            out = bytearray(line)
+            for i in range(row_bytes):
+                a = out[i - bpp] if i >= bpp else 0
+                b = prev[i]
+                c = prev[i - bpp] if i >= bpp else 0
+                pa = abs(b - c)
+                pb = abs(a - c)
+                pc = abs(a + b - 2 * c)
+                pred = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                out[i] = (out[i] + pred) & 255
+            cur = bytes(out)
+        else:
+            raise MeshError(f"unknown PNG filter {kind}")
+        rows.append(cur)
+        prev = cur
+    return rows
+
+
+def read_mask_png(path):
+    """A mask PNG as (width, height, rows): one bytes object per row, one byte per pixel, where
+    0 means masked (the pixel value was below half) and 1 means kept."""
+    data = Path(path).read_bytes()
+    ihdr = None
+    idat = []
+    for kind, body in _png_chunks(data):
+        if kind == b"IHDR":
+            ihdr = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            idat.append(body)
+    if ihdr is None:
+        raise MeshError(f"{path} has no PNG header")
+    w, h, depth, ctype, _, _, interlace = ihdr
+    if interlace:
+        raise MeshError(f"{path} is an interlaced PNG, which is not supported for masks")
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(ctype)
+    if channels is None or depth not in (1, 2, 4, 8, 16) or (depth < 8 and ctype not in (0, 3)):
+        raise MeshError(f"{path}: unsupported PNG format (bit depth {depth}, colour type {ctype})")
+    if ctype == 3:
+        raise MeshError(f"{path}: palette masks are not supported; write it as greyscale")
+    bits = depth * channels
+    row_bytes = (w * bits + 7) // 8
+    rows = _unfilter(zlib.decompress(b"".join(idat)), h, row_bytes, max(1, bits // 8))
+    out = []
+    if depth == 8:
+        step = channels
+        table = bytes(1 if v >= 128 else 0 for v in range(256))
+        for r in rows:
+            out.append(r[0::step].translate(table) if step > 1 else r.translate(table))
+    elif depth == 16:
+        step = 2 * channels
+        table = bytes(1 if v >= 128 else 0 for v in range(256))
+        for r in rows:
+            out.append(r[0::step].translate(table))
+    else:
+        per = 8 // depth
+        half = 1 << (depth - 1)
+        mask = (1 << depth) - 1
+        for r in rows:
+            vals = bytearray(w)
+            for x in range(w):
+                byte = r[x // per]
+                shift = 8 - depth * (x % per + 1)
+                vals[x] = 1 if ((byte >> shift) & mask) >= half else 0
+            out.append(bytes(vals))
+    return w, h, out
+
+
+def pad_png_rows(data: bytes, new_height: int) -> bytes:
+    """Return the PNG with rows of zeros added at the bottom up to `new_height` (8-bit RGB/RGBA/grey)."""
+    ihdr = None
+    idat = []
+    other_before = []
+    for kind, body in _png_chunks(data):
+        if kind == b"IHDR":
+            ihdr = body
+        elif kind == b"IDAT":
+            idat.append(body)
+    w, h, depth, ctype, comp, filt, interlace = struct.unpack(">IIBBBBB", ihdr)
+    if interlace or depth != 8 or ctype not in (0, 2, 4, 6):
+        raise MeshError("the texture atlas is not a plain 8-bit PNG")
+    if new_height <= h:
+        return data
+    channels = {0: 1, 2: 3, 4: 2, 6: 4}[ctype]
+    raw = zlib.decompress(b"".join(idat))
+    raw += bytes((w * channels + 1) * (new_height - h))
+    body = zlib.compress(raw, 6)
+
+    def chunk(kind, payload):
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
+    head = struct.pack(">IIBBBBB", w, new_height, depth, ctype, comp, filt, 0)
+    out = [b"\x89PNG\r\n\x1a\n", chunk(b"IHDR", head)]
+    step = 1 << 24
+    for i in range(0, len(body), step):
+        out.append(chunk(b"IDAT", body[i:i + step]))
+    out.append(chunk(b"IEND", b""))
+    return b"".join(out)
+
+
+def masked_cells(mw: int, mh: int, rows: list, cell: int) -> set:
+    """Grid cells (cx, cy) of `cell` mask pixels that hold at least one masked pixel, grown by one cell."""
+    found = set()
+    for y, r in enumerate(rows):
+        if 0 not in r:
+            continue
+        cy = y // cell
+        x = r.find(0)
+        while x >= 0:
+            cx = x // cell
+            found.add((cx, cy))
+            nxt = (cx + 1) * cell
+            x = r.find(0, nxt) if nxt < mw else -1
+    grown = set()
+    for cx, cy in found:
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                grown.add((cx + dx, cy + dy))
+    nx = (mw + cell - 1) // cell
+    ny = (mh + cell - 1) // cell
+    return {(cx, cy) for cx, cy in grown if 0 <= cx < nx and 0 <= cy < ny}
+
+
+def occluder_triangles(cells: set, cell: int, mw: int, mh: int, camera, R, t, depth: float,
+                       max_run: int = 8) -> list:
+    """Triangles (9 floats each, world frame) just in front of the camera that cover the masked
+    cells as seen from it, turned so that their front faces away from the camera."""
+    model, cw, ch, params = camera
+    sx = cw / mw
+    sy = ch / mh
+    # camera centre and the camera-to-world rotation (R transposed)
+    C = (-(R[0] * t[0] + R[3] * t[1] + R[6] * t[2]),
+         -(R[1] * t[0] + R[4] * t[1] + R[7] * t[2]),
+         -(R[2] * t[0] + R[5] * t[1] + R[8] * t[2]))
+    corner_cache = {}
+
+    def world(gx: int, gy: int):
+        key = (gx, gy)
+        p = corner_cache.get(key)
+        if p is None:
+            u = min(gx * cell, mw) * sx
+            v = min(gy * cell, mh) * sy
+            x, y = undistort(model, params, u, v)
+            dx = R[0] * x + R[3] * y + R[6]
+            dy = R[1] * x + R[4] * y + R[7]
+            dz = R[2] * x + R[5] * y + R[8]
+            p = (C[0] + depth * dx, C[1] + depth * dy, C[2] + depth * dz)
+            corner_cache[key] = p
+        return p
+
+    rows = {}
+    for cx, cy in cells:
+        rows.setdefault(cy, []).append(cx)
+    tris = []
+    for cy, xs in rows.items():
+        xs.sort()
+        start = xs[0]
+        prev = start
+        runs = []
+        for x in xs[1:] + [None]:
+            if x is not None and x == prev + 1 and x - start < max_run:
+                prev = x
+                continue
+            runs.append((start, prev + 1))
+            if x is not None:
+                start = prev = x
+        for x0, x1 in runs:
+            a = world(x0, cy)
+            b = world(x1, cy)
+            c = world(x1, cy + 1)
+            d = world(x0, cy + 1)
+            for p, q, r in ((a, b, c), (a, c, d)):
+                ux, uy, uz = q[0] - p[0], q[1] - p[1], q[2] - p[2]
+                vx, vy, vz = r[0] - p[0], r[1] - p[1], r[2] - p[2]
+                nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+                gx = C[0] - (p[0] + q[0] + r[0]) / 3
+                gy = C[1] - (p[1] + q[1] + r[1]) / 3
+                gz = C[2] - (p[2] + q[2] + r[2]) / 3
+                if nx * gx + ny * gy + nz * gz > 0:
+                    q, r = r, q
+                tris.append(p + q + r)
+    return tris
+
+
+_PLY_TYPES = {"char": ("b", 1), "int8": ("b", 1), "uchar": ("B", 1), "uint8": ("B", 1),
+              "short": ("h", 2), "int16": ("h", 2), "ushort": ("H", 2), "uint16": ("H", 2),
+              "int": ("i", 4), "int32": ("i", 4), "uint": ("I", 4), "uint32": ("I", 4),
+              "float": ("f", 4), "float32": ("f", 4), "double": ("d", 8), "float64": ("d", 8)}
+
+
+def write_ply(path, xyz: array.array, tris: array.array, extra_tris: list = ()) -> None:
+    """Binary PLY: the mesh, then `extra_tris` (9 floats each) as separate faces with their own vertices."""
+    nv = len(xyz) // 3
+    ne = len(extra_tris)
+    head = ("ply\nformat binary_little_endian 1.0\nelement vertex %d\nproperty float x\nproperty float y\n"
+            "property float z\nelement face %d\nproperty list uchar int vertex_indices\nend_header\n"
+            % (nv + 3 * ne, len(tris) // 3 + ne)).encode("ascii")
+    with open(path, "wb") as f:
+        f.write(head)
+        f.write(xyz.tobytes())
+        if ne:
+            f.write(array.array("f", [v for tri in extra_tris for v in tri]).tobytes())
+        rec = struct.Struct("<Biii")
+        body = bytearray()
+        for a, b, c in zip(tris[0::3], tris[1::3], tris[2::3]):
+            body += rec.pack(3, a, b, c)
+        for k in range(ne):
+            base = nv + 3 * k
+            body += rec.pack(3, base, base + 1, base + 2)
+        f.write(body)
+
+
+def read_ply(path):
+    """A binary little-endian triangle PLY as (xyz array('f'), tris array('i'), face_uv array('f') or None).
+
+    Vertex properties other than x, y, z are skipped; faces must be triangles, optionally with a
+    six-entry `texcoord` list (as `colmap mesh_texturer` writes)."""
+    raw = Path(path).read_bytes()
+    i = raw.find(b"end_header")
+    if not raw.startswith(b"ply") or i < 0:
+        raise MeshError(f"{path} is not a PLY file")
+    start = raw.index(b"\n", i) + 1
+    elements = []
+    for line in raw[:start].decode("ascii", "replace").replace("\r", "").split("\n"):
+        p = line.split()
+        if not p:
+            continue
+        if p[0] == "format" and p[1] != "binary_little_endian":
+            raise MeshError(f"{path} is not a binary little-endian PLY")
+        if p[0] == "element":
+            elements.append((p[1], int(p[2]), []))
+        elif p[0] == "property":
+            elements[-1][2].append(p[1:])
+    data = memoryview(raw)
+    pos = start
+    xyz = tris = uv = None
+    for name, count, props in elements:
+        if name == "vertex":
+            offsets = {}
+            size = 0
+            for p in props:
+                if p[0] == "list":
+                    raise MeshError(f"{path}: list property on vertices")
+                code, width = _PLY_TYPES[p[0]]
+                offsets[p[1]] = (size, code, width)
+                size += width
+            if any(offsets.get(k, (0, "f"))[1] != "f" for k in "xyz") or not all(k in offsets for k in "xyz"):
+                raise MeshError(f"{path}: vertices need float x, y, z")
+            xyz = array.array("f", bytes(12 * count))
+            for k, axis in enumerate("xyz"):
+                col = array.array("f")
+                col.frombytes(_gather(data, pos, size, count, offsets[axis][0], 4))
+                xyz[k::3] = col
+            pos += size * count
+        elif name == "face":
+            # fixed layout: every list holds the same number of entries as the first record
+            layout = []
+            q = pos
+            for p in props:
+                if p[0] == "list":
+                    ccode, cw = _PLY_TYPES[p[1]]
+                    icode, iw = _PLY_TYPES[p[2]]
+                    n = struct.unpack_from("<" + ccode, raw, q)[0] if count else 0
+                    layout.append((p[3], q - pos, cw, icode, iw, n))
+                    q += cw + iw * n
+                else:
+                    code, w = _PLY_TYPES[p[0]]
+                    layout.append((p[1], q - pos, 0, code, w, 1))
+                    q += w
+            rec = q - pos
+            for name_, off, cw, icode, iw, n in layout:
+                if cw:
+                    counts = bytes(data[pos + off:pos + off + rec * count:rec]) if cw == 1 else None
+                    if counts is not None and counts.count(n) != count:
+                        raise MeshError(f"{path}: faces of mixed size; only triangles are supported")
+                if name_ in ("vertex_indices", "vertex_index"):
+                    if n != 3 or icode not in ("i", "I"):
+                        raise MeshError(f"{path}: faces are not triangles with int indices")
+                    tris = array.array("i")
+                    tris.frombytes(_gather(data, pos, rec, count, off + cw, 12))
+                elif name_ == "texcoord" and n == 6 and icode == "f":
+                    uv = array.array("f")
+                    uv.frombytes(_gather(data, pos, rec, count, off + cw, 24))
+            pos += rec * count
+        else:
+            raise MeshError(f"{path}: unexpected element {name}")
+    if xyz is None or tris is None:
+        raise MeshError(f"{path} holds no triangle mesh")
+    if pos > len(raw):
+        raise MeshError(f"{path} is truncated")
+    if len(tris) and (max(tris) >= len(xyz) // 3 or min(tris) < 0):
+        raise MeshError(f"{path}: a face refers to a vertex that does not exist")
+    return xyz, tris, uv
+
+
+def assemble_textured(xyz: array.array, tris: array.array, face_uv: array.array, atlas_w: int,
+                      atlas_h: int, edge: int):
+    """Turn per-face texture coordinates from COLMAP into a vertex-indexed mesh for glTF.
+
+    Faces COLMAP could not give a view (all six coordinates 0) take one flat colour: the texel at
+    a vertex they share with a textured face, spreading ring by ring. Faces that no such ring
+    reaches (pieces that no camera saw from the front) are left out.
+    Returns (xyz, tris, uv, stats) with uv in glTF convention for an `edge` x `edge` image whose
+    top-left `atlas_w` x `atlas_h` holds the atlas.
+    """
+    n = len(tris) // 3
+    su = atlas_w / edge
+    sv = atlas_h / edge
+    # corner coordinates in glTF convention
+    U = [0.0] * (3 * n)
+    V = [0.0] * (3 * n)
+    textured = bytearray(n)
+    at_vertex = {}
+    for f in range(n):
+        o = 6 * f
+        c = face_uv[o:o + 6]
+        if not any(c):
+            continue
+        textured[f] = 1
+        for k in range(3):
+            u = c[2 * k] * su
+            v = (1.0 - c[2 * k + 1]) * sv
+            U[3 * f + k] = u
+            V[3 * f + k] = v
+            vert = tris[3 * f + k]
+            if vert not in at_vertex:
+                at_vertex[vert] = (u, v)
+    pending = [f for f in range(n) if not textured[f]]
+    filled = 0
+    while pending:
+        later = []
+        reached = []
+        for f in pending:
+            a, b, c = tris[3 * f], tris[3 * f + 1], tris[3 * f + 2]
+            uv = at_vertex.get(a) or at_vertex.get(b) or at_vertex.get(c)
+            if uv is None:
+                later.append(f)
+            else:
+                reached.append((f, uv))
+        if not reached:
+            break
+        for f, (u, v) in reached:
+            for k in range(3):
+                U[3 * f + k] = u
+                V[3 * f + k] = v
+                vert = tris[3 * f + k]
+                if vert not in at_vertex:
+                    at_vertex[vert] = (u, v)
+            textured[f] = 2
+        filled += len(reached)
+        pending = later
+    dropped = len(pending)
+    # one output vertex per (vertex, coordinate) pair
+    pairs = {}
+    number = pairs.setdefault
+    out_tris = array.array("i")
+    for f in range(n):
+        if not textured[f]:
+            continue
+        for k in range(3):
+            j = 3 * f + k
+            out_tris.append(number((tris[j], U[j], V[j]), len(pairs)))
+    out_xyz = array.array("f", bytes(12 * len(pairs)))
+    out_uv = array.array("f", bytes(8 * len(pairs)))
+    for i, (vert, u, v) in enumerate(pairs):
+        out_xyz[3 * i:3 * i + 3] = xyz[3 * vert:3 * vert + 3]
+        out_uv[2 * i] = min(1.0, max(0.0, u))
+        out_uv[2 * i + 1] = min(1.0, max(0.0, v))
+    stats = {"faces_flat_coloured": filled, "faces_unseen_dropped": dropped}
+    return out_xyz, out_tris, out_uv, stats
+
+
+_PLY_TYPES = {"char": ("b", 1), "int8": ("b", 1), "uchar": ("B", 1), "uint8": ("B", 1),
+              "short": ("h", 2), "int16": ("h", 2), "ushort": ("H", 2), "uint16": ("H", 2),
+              "int": ("i", 4), "int32": ("i", 4), "uint": ("I", 4), "uint32": ("I", 4),
+              "float": ("f", 4), "float32": ("f", 4), "double": ("d", 8), "float64": ("d", 8)}
+
+
+# =============================================================================================
+# Tools
 # =============================================================================================
 
 def _note(log_path, text: str) -> None:
@@ -1550,6 +1586,16 @@ def _find_checkpoint(run_dir: Path) -> Path:
     return found[-1]
 
 
+def _sparse_dir(dataset_dir: Path) -> Path:
+    """The folder holding the dataset's cameras.bin and images.bin (sparse/0 or sparse)."""
+    for candidate in (dataset_dir / "sparse" / "0", dataset_dir / "sparse"):
+        if (candidate / "cameras.bin").is_file() and (candidate / "images.bin").is_file():
+            return candidate
+    raise MeshError(
+        f"{dataset_dir} has no camera model (sparse/0/cameras.bin and images.bin). Pass the "
+        f"dataset folder the splat was trained on.")
+
+
 def _atlas_edge(texture_size: int) -> int:
     """Engines want power-of-two textures; the largest one that fits the requested size."""
     edge = 1
@@ -1558,116 +1604,553 @@ def _atlas_edge(texture_size: int) -> int:
     return edge
 
 
-# `spirula mesh` names the stage it is in at the start of every line. The stages in the order
-# their first line appears, with the share of the run that is over by then (measured, 1 M
-# splats, merge factor 1, chart angle 10, 4096 texture: 142 s in all).
-_SPIRULA_STAGES = (("loading", 0.0), ("point cloud", 0.02), ("Delaunay", 0.02),
-                   ("occupancy", 0.045), ("cut edges", 0.06), ("bisection", 0.07),
-                   ("marching tets", 0.11), ("merge", 0.12), ("cull unseen", 0.20),
-                   ("merge", 0.24), ("cleanup", 0.26), ("cull unseen", 0.43), ("merge", 0.44),
-                   ("cleanup", 0.45), ("quality", 0.50), ("orient", 0.56), ("stats", 0.57),
-                   ("texel density", 0.57), ("UV", 0.60), ("bake", 0.97), ("texture", 0.98),
-                   ("wrote", 0.99))
-_FIRST_TEXTURE_STAGE = 17
-_REPEATED_STAGES = ("merge", "cleanup", "cull unseen")
-# The UV stage is a third of the run and prints four lines; the one that ends its long part.
-_UV_PARAMETERIZED = 0.95
+def _tool_failure(e: Exception, what: str, log_path, detail: str = "") -> MeshError:
+    if isinstance(e, proc.ProcTimeout):
+        return MeshError(f"{what} did not finish in time and was stopped. The computer is "
+                         f"probably busy with another job; wait for it and run the mesh step "
+                         f"again. Log: {log_path}")
+    if isinstance(e, proc.ProcStalled):
+        return MeshError(f"{what} stopped making progress and was stopped. Close other "
+                         f"programs and run the mesh step again. Log: {log_path}")
+    return MeshError(f"{what} failed{detail}. Log: {log_path}")
 
 
-def count_gaussians(splat_path) -> int:
-    """Number of Gaussians a splat.ply declares in its header, or 0 if it cannot be read."""
+def _colmap_cmd(colmap, command: str, *args) -> list:
+    # COLMAP logs to stderr and, by default, also into files in the system temp folder.
+    return [str(colmap), command, "--log_target", "stderr", *[str(a) for a in args]]
+
+
+def _undistort(*, colmap, dataset_dir: Path, sparse: Path, out: Path, max_image_size: int,
+               log_path, cancel_file, image_list: Optional[Path] = None) -> None:
+    """`colmap image_undistorter`: the photos as pinhole images, the workspace the texturer reads."""
+    if out.exists():
+        shutil.rmtree(out)
+    # The undistorter crashes (0xC0000409) when the output folder's parent does not exist.
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = _colmap_cmd(colmap, "image_undistorter", "--image_path", dataset_dir / "images",
+                      "--input_path", sparse, "--output_path", out, "--output_type", "COLMAP",
+                      "--max_image_size", max_image_size,
+                      *(("--image_list_path", image_list) if image_list else ()))
     try:
-        with open(splat_path, "rb") as f:
-            head = f.read(4096)
-    except OSError:
-        return 0
-    found = re.search(rb"element vertex (\d+)", head)
-    return int(found.group(1)) if found else 0
+        proc.run(cmd, log_path=log_path, timeout=COLMAP_TIMEOUT, stall_timeout=COLMAP_STALL,
+                 cancel_file=cancel_file)
+    except proc.ProcError as e:
+        raise _tool_failure(e, "Preparing the photos for texturing (colmap image_undistorter)",
+                            log_path, f" on {dataset_dir / 'images'}; check that the photos the "
+                            f"splat was trained on are still there") from e
+    if not (out / "sparse" / "cameras.bin").is_file():
+        raise MeshError(f"colmap image_undistorter wrote no workspace in {out}. Log: {log_path}")
 
 
-def merge_factor_for(gaussians: int) -> float:
-    """The `--merge-factor` a splat of this many Gaussians is extracted at."""
-    return LARGE_SPLAT_MERGE_FACTOR if gaussians > LARGE_SPLAT_GAUSSIANS else MERGE_FACTOR
+def photo_size_limit(cameras: dict, images: list) -> int:
+    """`--max_image_size` for the undistorter: -1, or the long edge that keeps all photos together
+    within PHOTO_PIXEL_BUDGET pixels (the texturer holds every photo in memory at once)."""
+    total = 0
+    longest = 0
+    for _, _, _, _, cid in images:
+        _, w, h, _ = cameras[cid]
+        total += w * h
+        longest = max(longest, w, h)
+    if total <= PHOTO_PIXEL_BUDGET:
+        return -1
+    return max(256, int(longest * math.sqrt(PHOTO_PIXEL_BUDGET / total)))
 
 
-def _run_spirula(*, spirula, run_dir, dataset_dir, out_base: Path, texture_size: int,
-                 merge_factor: float, log_path, cancel_file, progress) -> dict:
-    """Extract and texture in one `spirula mesh` run. Returns {"path", "faces", "charts"}."""
-    encoding = {"png": "glb+png", "jpg": "glb+jpg"}[TEXTURE_ENCODING]
-    cmd = [str(spirula), "mesh", str(run_dir), "--lang", "en",
-           "--data", str(dataset_dir),
-           "--output", str(out_base),
-           "--format", encoding, "--color", "texture",
-           "--texture-size", str(texture_size),
-           "--chart-angle-deg", str(CHART_ANGLE_DEG),
-           "--merge-factor", repr(float(merge_factor)),
-           "--floater-min-faces", str(SPIRULA_FLOATER_MIN_FACES)]
-    state = {"at": 0, "last_error": "", "no_cameras": False, "faces": 0, "charts": 0}
+_ATLAS_LINE = re.compile(r"Atlas size: (\d+) x (\d+)")
+_TEXTURER_STAGES = (("Loading", 0.02), ("Selecting views", 0.25), ("faces assigned", 0.40),
+                    ("Packing", 0.45), ("Baking texture", 0.50), ("color correction", 0.65),
+                    ("Inpainting", 0.75), ("Writing texture atlas", 0.80), ("Writing textured", 0.97))
+
+
+def _run_texturer(*, colmap, workspace: Path, mesh_ply: Path, out: Path, scale: float, probe: bool,
+                  log_path, cancel_file, progress=None) -> dict:
+    """One `colmap mesh_texturer` run. A probe stops as soon as the atlas size is known."""
+    if out.exists():
+        shutil.rmtree(out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    cmd = _colmap_cmd(colmap, "mesh_texturer", "--workspace_path", workspace,
+                      "--input_path", mesh_ply, "--output_path", out,
+                      "--MeshTextureMapping.texture_scale_factor", repr(float(scale)),
+                      *TEXTURER_OPTIONS)
+    state = {"atlas": None, "regions": 0, "assigned": None, "at": -1}
 
     def on_line(line: str) -> None:
-        m = re.match(r"\[meshing\] ([A-Za-z ]+?):", line)
+        m = _ATLAS_LINE.search(line)
         if m:
-            # Only ever move forward. Stage names repeat (merge, cleanup and cull unseen run
-            # several times): those only count when they are at most a few steps ahead.
-            at = state["at"]
-            reach = 4 if m.group(1) in _REPEATED_STAGES else len(_SPIRULA_STAGES)
-            for j in range(at, min(at + reach, len(_SPIRULA_STAGES))):
-                if _SPIRULA_STAGES[j][0] == m.group(1):
-                    if j > at:
-                        state["at"] = j
-                        progress(_SPIRULA_STAGES[j][1],
-                                 "提取表面" if j < _FIRST_TEXTURE_STAGE else "生成贴图")
+            state["atlas"] = (int(m.group(1)), int(m.group(2)))
+        m = re.search(r"Found (\d+) regions", line)
+        if m:
+            state["regions"] = int(m.group(1))
+        m = re.search(r"(\d+) / (\d+) faces assigned", line)
+        if m:
+            state["assigned"] = (int(m.group(1)), int(m.group(2)))
+        if progress is not None:
+            for j in range(state["at"] + 1, len(_TEXTURER_STAGES)):
+                if _TEXTURER_STAGES[j][0] in line:
+                    state["at"] = j
+                    progress(_TEXTURER_STAGES[j][1], "生成贴图")
                     break
-            found = re.search(r"stats:.*?faces: (\d+)", line)
-            if found:
-                state["faces"] = int(found.group(1))
-            found = re.search(r"UV: charts packed: (\d+)", line)
-            if found:
-                state["charts"] = int(found.group(1))
-            if "UV: charts parameterized" in line:
-                progress(_UV_PARAMETERIZED, "生成贴图")
-        if "error" in line.lower():
-            state["last_error"] = line
-        if "No camera dataset in use" in line:
-            state["no_cameras"] = True
 
-    out_base.parent.mkdir(parents=True, exist_ok=True)
-    for stale in out_base.parent.glob(out_base.name + "*.glb"):
-        stale.unlink()
     try:
-        proc.run(cmd, log_path=log_path, timeout=SPIRULA_TIMEOUT, stall_timeout=SPIRULA_STALL,
-                 on_line=on_line, cancel_file=cancel_file)
-    except proc.ProcTimeout as e:
-        raise MeshError(
-            f"Surface extraction did not finish in {SPIRULA_TIMEOUT // 60} minutes and was "
-            f"stopped. The GPU is probably busy with another job; wait for it and run the mesh "
-            f"step again. Log: {log_path}") from e
-    except proc.ProcStalled as e:
-        raise MeshError(
-            f"Surface extraction stopped making progress and was stopped. Close other GPU "
-            f"programs and run the mesh step again. Log: {log_path}") from e
+        proc.run(cmd, log_path=log_path, timeout=COLMAP_TIMEOUT, stall_timeout=COLMAP_STALL,
+                 on_line=on_line, cancel_file=cancel_file,
+                 done_marker=_ATLAS_LINE.pattern if probe else None, done_grace=0)
     except proc.ProcError as e:
-        detail = f" ({state['last_error']})" if state["last_error"] else ""
+        raise _tool_failure(e, "Texturing from the photos (colmap mesh_texturer)", log_path) from e
+    if state["atlas"] is None:
+        raise MeshError(f"colmap mesh_texturer did not lay out a texture for the mesh. "
+                        f"Log: {log_path}")
+    if not probe and not ((out / "mesh.ply").is_file() and (out / "texture.png").is_file()):
+        raise MeshError(f"colmap mesh_texturer finished but wrote no textured mesh in {out}. "
+                        f"Log: {log_path}")
+    return state
+
+
+def fit_texture_scale(probe: Callable[[float], tuple], edge: int) -> tuple:
+    """The largest texture scale (atlas texels per photo pixel, at most TEXTURE_MAX_SCALE) whose
+    atlas is no wider than `edge`. `probe(scale)` returns the atlas (width, height) COLMAP lays
+    out at that scale: a power of two wide, as tall as the packed patches need.
+
+    Returns (scale, (width, height), probes). The patches' area grows with the square of the
+    scale plus a fixed gutter per patch, so each step aims at an atlas filled to ATLAS_FILL and
+    the search keeps a bracket around the answer.
+    """
+    lo = None                 # (scale, size) known to fit
+    hi = None                 # scale known not to fit
+    scale = TEXTURE_MAX_SCALE
+    probes = 0
+    while probes < ATLAS_PROBES:
+        w, h = probe(scale)
+        probes += 1
+        if w <= edge:
+            if lo is None or scale > lo[0]:
+                lo = (scale, (w, h))
+            if scale >= TEXTURE_MAX_SCALE or h >= ATLAS_GOOD_FILL * edge:
+                break
+        else:
+            hi = scale if hi is None else min(hi, scale)
+        if lo is not None and hi is not None and hi / lo[0] < 1.0 + ATLAS_SCALE_TOLERANCE:
+            break
+        aim = scale * math.sqrt(ATLAS_FILL * edge * edge / max(1, w * h))
+        low = lo[0] if lo is not None else 0.0
+        high = hi if hi is not None else TEXTURE_MAX_SCALE * 1.000001
+        if not low < aim < high:
+            aim = math.sqrt(low * high) if low > 0.0 else high / 4.0
+        if aim < MIN_TEXTURE_SCALE:
+            break
+        scale = min(TEXTURE_MAX_SCALE, aim)
+    if lo is None:
         raise MeshError(
-            f"Spirula could not extract a mesh from {run_dir}{detail}. Check that the dataset "
-            f"folder {dataset_dir} is the one the splat was trained on and that the GPU has "
-            f"free memory. Log: {log_path}") from e
-    if state["no_cameras"]:
-        # Without cameras Spirula still writes a mesh, from the Gaussian densities alone: about
-        # twice the faces, with the sky and every distant floater turned into geometry, and
-        # nothing to texture it from.
-        raise MeshError(
-            f"Spirula could not read the cameras in {dataset_dir} and would have meshed without "
-            f"them, which gives a much worse surface. Check that the folder holds the dataset "
-            f"the splat was trained on (images/ and sparse/). Log: {log_path}")
-    out = out_base.with_name(out_base.name + ".glb")
-    if not out.exists():
-        candidates = sorted(out_base.parent.glob(out_base.name + "*.glb"))
-        if not candidates:
-            raise MeshError(f"Spirula finished but wrote no mesh under {out_base.parent}. "
-                            f"Log: {log_path}")
-        out = candidates[0]
-    return {"path": out, "faces": state["faces"], "charts": state["charts"]}
+            f"The mesh has too many separate texture patches to fit a {edge} x {edge} texture. "
+            f"Raise texture_size or lower visual_faces.")
+    return lo[0], lo[1], probes
+
+
+def build_occluders(*, dataset_dir: Path, cameras: dict, images: list, xyz: array.array,
+                    log_path) -> tuple:
+    """Triangles that hide what the masks cover from the camera that took each masked photo.
+
+    `masks/<image path>.png` (black: a person or anything else to leave out) is matched to each
+    photo. For every photo with masked pixels, the masked area is covered, as seen from that
+    camera, by small triangles placed between the camera and the nearest surface it sees; the
+    texturer's occlusion test then refuses that photo for everything behind them. Returns
+    (triangles, number of masked photos).
+    """
+    masks_dir = dataset_dir / "masks"
+    if not masks_dir.is_dir():
+        return [], 0
+    n = len(xyz) // 3
+    if n == 0:
+        return [], 0
+    lo = [min(xyz[k::3]) for k in range(3)]
+    hi = [max(xyz[k::3]) for k in range(3)]
+    diag = math.sqrt(sum((b - a) ** 2 for a, b in zip(lo, hi))) or 1.0
+    # A sample of the surface is enough to know how near the nearest of it comes to a camera.
+    step = max(1, n // OCCLUDER_SAMPLE_VERTICES)
+    xs = xyz[0::3][::step]
+    ys = xyz[1::3][::step]
+    zs = xyz[2::3][::step]
+    tris = []
+    masked = 0
+    for _, name, R, t, cid in images:
+        path = (masks_dir / name).with_suffix(".png")
+        if not path.is_file():
+            continue
+        try:
+            mw, mh, rows = read_mask_png(path)
+        except (OSError, zlib.error) as e:
+            raise MeshError(f"cannot read the mask {path}: {e}") from e
+        cell = max(4, round(min(mw, mh) / MASK_CELLS_ACROSS))
+        cells = masked_cells(mw, mh, rows, cell)
+        if not cells:
+            continue
+        masked += 1
+        model, w, h, params = cameras[cid]
+        # nearest surface sample in front of the camera and inside its picture
+        near = math.inf
+        r0, r1, r2, r3, r4, r5, r6, r7, r8 = R
+        for x, y, z in zip(xs, ys, zs):
+            cz = r6 * x + r7 * y + r8 * z + t[2]
+            if cz <= 0.0 or cz >= near:
+                continue
+            cx = (r0 * x + r1 * y + r2 * z + t[0]) / cz
+            cy = (r3 * x + r4 * y + r5 * z + t[1]) / cz
+            if abs(cx) < OCCLUDER_FOV_SLOPE and abs(cy) < OCCLUDER_FOV_SLOPE:
+                u, v = distort(model, params, cx, cy)
+                if 0.0 <= u <= w and 0.0 <= v <= h:
+                    near = cz
+        depth = max(OCCLUDER_MIN_DEPTH * diag, min(OCCLUDER_MAX_DEPTH * diag, 0.5 * near))
+        tris.extend(occluder_triangles(cells, cell, mw, mh, cameras[cid], R, t, depth))
+    return tris, masked
+
+
+def mvs_images(images: list, limit: int) -> list:
+    """Names of the photos dense matching runs on: all of them, or `limit` spread evenly over the
+    photos in name order (consecutive video frames carry nearly the same information)."""
+    names = sorted(name for _, name, _, _, _ in images)
+    if len(names) <= limit:
+        return names
+    return [names[(2 * k + 1) * len(names) // (2 * limit)] for k in range(limit)]
+
+
+def _write_list(path: Path, names) -> Path:
+    path.write_text("".join(name + "\n" for name in names), encoding="utf-8")
+    return path
+
+
+def _mvs_workspace(*, colmap, dataset_dir: Path, sparse: Path, out: Path, names: list,
+                   all_names: list, log_path, cancel_file) -> None:
+    """An undistorted workspace holding only `names`, at MVS_IMAGE_SIZE, with its own stereo
+    configuration (MVS_SOURCE_IMAGES source photos per photo, chosen by COLMAP)."""
+    listing = _write_list(out.parent / (out.name + "_images.txt"), names)
+    _undistort(colmap=colmap, dataset_dir=dataset_dir, sparse=sparse, out=out,
+               max_image_size=MVS_IMAGE_SIZE, log_path=log_path, cancel_file=cancel_file,
+               image_list=listing)
+    dropped = sorted(set(all_names) - set(names))
+    if dropped:
+        # The undistorter writes only the listed photos but keeps every camera in the model;
+        # dense matching would look for the others' files.
+        kept = out / "sparse_kept"
+        kept.mkdir()
+        cmd = _colmap_cmd(colmap, "image_deleter", "--input_path", out / "sparse",
+                          "--output_path", kept, "--image_names_path",
+                          _write_list(out.parent / (out.name + "_dropped.txt"), dropped))
+        try:
+            proc.run(cmd, log_path=log_path, timeout=COLMAP_TIMEOUT, stall_timeout=COLMAP_STALL,
+                     cancel_file=cancel_file)
+        except proc.ProcError as e:
+            raise _tool_failure(e, "Preparing the photos for dense matching (colmap image_deleter)",
+                                log_path) from e
+        shutil.rmtree(out / "sparse")
+        kept.rename(out / "sparse")
+    stereo = out / "stereo"
+    stereo.mkdir(exist_ok=True)
+    (stereo / "patch-match.cfg").write_text(
+        "".join(f"{name}\n__auto__, {MVS_SOURCE_IMAGES}\n" for name in names), encoding="utf-8")
+    _write_list(stereo / "fusion.cfg", names)
+
+
+# The Delaunay mesher's phases and the share of the dense step that is over when each starts
+# (measured on 128 photos: triangulation, ray tracer, integration and graph cut are the long ones).
+_DELAUNAY_PHASES = (("Triangulating points", 0.79), ("Initializing ray tracer", 0.81),
+                    ("Setting up optimization", 0.91), ("Running graph-cut", 0.93),
+                    ("Extracting surface", 0.95), ("Writing surface mesh", 0.97))
+
+
+def _dense_geometry(*, colmap, dataset_dir: Path, work_dir: Path, log_path, cancel_file,
+                    progress) -> dict:
+    """Dense matching, fusion and meshing with COLMAP. Returns {"path" (PLY, dataset frame),
+    "images", "points"}."""
+    sparse = _sparse_dir(dataset_dir)
+    images = read_images_bin(sparse / "images.bin")
+    all_names = [name for _, name, _, _, _ in images]
+    names = mvs_images(images, MVS_MAX_IMAGES)
+    workspace = work_dir / "dense"
+    progress(0.0, "准备照片")
+    _mvs_workspace(colmap=colmap, dataset_dir=dataset_dir, sparse=sparse, out=workspace,
+                   names=names, all_names=all_names, log_path=log_path, cancel_file=cancel_file)
+
+    # 1. Depth and normal maps per photo (GPU), photometric pass then geometric pass.
+    _check_cancel(cancel_file)
+    progress(0.04, "计算深度图")
+    done = {"views": 0}
+    total = 2 * len(names)
+
+    def on_view(line: str) -> None:
+        if "Processing view" in line:
+            done["views"] += 1
+            progress(0.04 + 0.66 * min(1.0, done["views"] / total), "计算深度图")
+
+    cmd = _colmap_cmd(colmap, "patch_match_stereo", "--workspace_path", workspace,
+                      "--workspace_format", "COLMAP", *PATCH_MATCH_OPTIONS)
+    try:
+        proc.run(cmd, log_path=log_path, timeout=MVS_TIMEOUT, stall_timeout=COLMAP_STALL,
+                 on_line=on_view, cancel_file=cancel_file)
+    except proc.ProcError as e:
+        raise _tool_failure(
+            e, "Dense matching (colmap patch_match_stereo)", log_path,
+            " (it needs an NVIDIA GPU with free memory; close other GPU programs and run the "
+            "mesh step again)") from e
+    maps = list((workspace / "stereo" / "depth_maps").rglob("*.geometric.bin"))
+    if len(maps) < len(names):
+        raise MeshError(f"Dense matching produced depth maps for {len(maps)} of {len(names)} "
+                        f"photos. Log: {log_path}")
+
+    # 2. Fusion of the depth maps into points with visibility (CPU).
+    _check_cancel(cancel_file)
+    progress(0.70, "融合点云")
+    fused = workspace / "fused.ply"
+    cmd = _colmap_cmd(colmap, "stereo_fusion", "--workspace_path", workspace,
+                      "--workspace_format", "COLMAP", "--input_type", "geometric",
+                      "--output_path", fused, *FUSION_OPTIONS)
+    state = {"points": 0}
+
+    def on_fused(line: str) -> None:
+        m = re.search(r"Number of fused points: (\d+)", line)
+        if m:
+            state["points"] = int(m.group(1))
+        m = re.search(r"Fusing image \[(\d+)/(\d+)\]", line)
+        if m:
+            progress(0.70 + 0.08 * int(m.group(1)) / max(1, int(m.group(2))), "融合点云")
+
+    try:
+        proc.run(cmd, log_path=log_path, timeout=COLMAP_TIMEOUT, stall_timeout=COLMAP_STALL,
+                 on_line=on_fused, cancel_file=cancel_file)
+    except proc.ProcError as e:
+        raise _tool_failure(e, "Fusing the depth maps (colmap stereo_fusion)", log_path) from e
+    if not fused.is_file() or not (workspace / "fused.ply.vis").is_file():
+        raise MeshError(f"colmap stereo_fusion wrote no points. Log: {log_path}")
+
+    # 3. Surface from the points and the rays that saw them (CPU).
+    _check_cancel(cancel_file)
+    progress(0.78, "重建表面")
+    meshed = work_dir / "dense_mesh.ply"
+    cmd = _colmap_cmd(colmap, "delaunay_mesher", "--input_path", workspace,
+                      "--input_type", "dense", "--output_path", meshed, *DELAUNAY_OPTIONS)
+
+    def on_mesh(line: str) -> None:
+        m = re.search(r"Integrating image \[(\d+)/(\d+)\]", line)
+        if m:
+            progress(0.82 + 0.08 * int(m.group(1)) / max(1, int(m.group(2))), "重建表面")
+            return
+        for phase, at in _DELAUNAY_PHASES:
+            if phase in line:
+                progress(at, "重建表面")
+
+    try:
+        proc.run(cmd, log_path=log_path, timeout=COLMAP_TIMEOUT, stall_timeout=COLMAP_STALL,
+                 on_line=on_mesh, cancel_file=cancel_file)
+    except proc.ProcError as e:
+        raise _tool_failure(e, "Building the surface (colmap delaunay_mesher)", log_path) from e
+    if not meshed.is_file():
+        raise MeshError(f"colmap delaunay_mesher wrote no mesh. Log: {log_path}")
+    progress(1.0, "重建表面")
+    return {"path": meshed, "images": len(names), "points": state["points"],
+            "sparse": workspace / "sparse"}
+
+
+def face_pixel_sizes(mesh: Mesh, cameras: dict, images: list, settle: float = 0.0):
+    """How large each face appears, and how far away it is, in the photo where it is smallest.
+
+    Returns (sizes, depths). sizes[k]: face k's longest edge in pixels, in the photo where that
+    is shortest, among the photos (pinhole cameras) that have all three corners in front and the
+    face's centre in the picture; infinity where no photo sees the face. depths[k]: the face's
+    distance in that photo over the median distance of the surface the photo shows (estimated
+    from a sample of the vertices); 0 where no photo sees the face.
+
+    With `settle` > 0 a face is no longer looked at once one photo shows it at most that large
+    (its values then come from that photo, not necessarily the one where it is smallest): most
+    faces are settled by the first few photos, which makes the pass many times faster.
+    """
+    n = mesh.face_count
+    X = mesh.xyz[0::3]
+    Y = mesh.xyz[1::3]
+    Z = mesh.xyz[2::3]
+    A = mesh.tris[0::3]
+    B = mesh.tris[1::3]
+    C = mesh.tris[2::3]
+    best = [math.inf] * n
+    depths = [0.0] * n
+    limit = settle * settle
+    pending = list(range(n))
+    step = max(1, mesh.vertex_count // SHARD_DEPTH_SAMPLES)
+    for _, _, R, t, cid in images:
+        if not pending:
+            break
+        model, w, h, p = cameras[cid]
+        if model != 1:
+            raise MeshError(f"the dense workspace has a camera of model {model}, expected PINHOLE")
+        fx, fy, cx, cy = p
+        r0, r1, r2, r3, r4, r5, r6, r7, r8 = R
+        t0, t1, t2 = t
+        shown = []
+        for x, y, z in zip(X[::step], Y[::step], Z[::step]):
+            d = r6 * x + r7 * y + r8 * z + t2
+            if d > 0.0:
+                u = fx * (r0 * x + r1 * y + r2 * z + t0) / d + cx
+                v = fy * (r3 * x + r4 * y + r5 * z + t1) / d + cy
+                if 0.0 <= u <= w and 0.0 <= v <= h:
+                    shown.append(d)
+        shown.sort()
+        median = shown[len(shown) // 2] if shown else 0.0
+        seen = {}
+
+        def project(i: int):
+            q = seen.get(i)
+            if q is None:
+                x = X[i]
+                y = Y[i]
+                z = Z[i]
+                d = r6 * x + r7 * y + r8 * z + t2
+                q = (fx * (r0 * x + r1 * y + r2 * z + t0) / d + cx,
+                     fy * (r3 * x + r4 * y + r5 * z + t1) / d + cy, d) if d > 0.0 else None
+                seen[i] = q
+            return q
+
+        still = []
+        keep = still.append
+        for k in pending:
+            pi = project(A[k])
+            pj = project(B[k])
+            pl = project(C[k])
+            if pi is not None and pj is not None and pl is not None:
+                ui, vi, di = pi
+                uj, vj, dj = pj
+                ul, vl, dl = pl
+                if 0.0 <= (ui + uj + ul) / 3.0 <= w and 0.0 <= (vi + vj + vl) / 3.0 <= h:
+                    e = max((ui - uj) ** 2 + (vi - vj) ** 2, (uj - ul) ** 2 + (vj - vl) ** 2,
+                            (ul - ui) ** 2 + (vl - vi) ** 2)
+                    if e < best[k]:
+                        best[k] = e
+                        depths[k] = (di + dj + dl) / (3.0 * median) if median > 0.0 else math.inf
+                    if e <= limit:
+                        continue
+            keep(k)
+        pending = still
+    return [math.sqrt(e) for e in best], depths
+
+
+def drop_shards(mesh: Mesh, cameras: dict, images: list, max_pixels: float, min_depth: float):
+    """Remove the shards the Delaunay mesher's graph cut leaves where there are no points.
+
+    Fused depth maps put a point every pixel or two, so a face of the dense surface measures a
+    few pixels in the photos that saw it. The graph cut also closes off regions without points:
+    the sky and the far background seen past an object's edge, but also plain walls and
+    ceilings, which are real. The shards lie far behind what the photos show; the walls do not.
+    A face goes when it is larger than `max_pixels` (longest edge) in every photo that sees it
+    AND, in the photo where it is smallest, further away than `min_depth` times the median
+    distance of the surface that photo shows. Faces no photo sees are kept.
+    Returns (mesh, number of faces removed)."""
+    sizes, depths = face_pixel_sizes(mesh, cameras, images, settle=max_pixels)
+    keep = [not (max_pixels < s < math.inf and d > min_depth) for s, d in zip(sizes, depths)]
+    removed = keep.count(False)
+    return (select_faces(mesh, keep) if removed else mesh), removed
+
+
+def simplify(*, colmap, mesh: Mesh, target_faces: int, work_dir: Path, name: str, log_path,
+             cancel_file) -> Mesh:
+    """`colmap mesh_simplifier` down to at most `target_faces` (quadric edge collapse with
+    optimal vertex placement). Returns the mesh unchanged when it is already within budget."""
+    path_in = work_dir / f"{name}_in.ply"
+    path_out = work_dir / f"{name}_out.ply"
+    for _ in range(SIMPLIFY_PASSES):
+        if mesh.face_count <= target_faces:
+            return mesh
+        write_ply(path_in, mesh.xyz, mesh.tris)
+        ratio = target_faces / mesh.face_count
+        cmd = _colmap_cmd(colmap, "mesh_simplifier", "--input_path", path_in,
+                          "--output_path", path_out,
+                          "--MeshSimplification.target_face_ratio", repr(ratio))
+        try:
+            proc.run(cmd, log_path=log_path, timeout=COLMAP_TIMEOUT, stall_timeout=COLMAP_STALL,
+                     cancel_file=cancel_file)
+        except proc.ProcError as e:
+            raise _tool_failure(e, "Simplifying the mesh (colmap mesh_simplifier)", log_path) from e
+        xyz, tris, _ = read_ply(path_out)
+        mesh = drop_degenerate_faces(Mesh(xyz, tris))
+    if mesh.face_count > target_faces:
+        raise MeshError(f"The mesh could not be simplified to {target_faces} faces (it still "
+                        f"has {mesh.face_count}). Raise the face budget. Log: {log_path}")
+    return mesh
+
+
+def texture_mesh(*, colmap, dataset_dir: Path, work_dir: Path, mesh: Mesh, world_from_train,
+                 edge: int, log_path, cancel_file, progress) -> dict:
+    """Texture `mesh` (training frame) from the dataset's photos with `colmap mesh_texturer`.
+
+    Returns {"mesh": textured Mesh with uv (glTF convention), "image": PNG bytes (square),
+    "edge", "scale", "probes", "regions", "masked_photos", "occluders", "faces_flat_coloured",
+    "faces_unseen_dropped", "photo_size"}. Positions are `mesh`'s own numbers, never COLMAP's.
+    """
+    sparse = _sparse_dir(dataset_dir)
+    cameras = read_cameras_bin(sparse / "cameras.bin")
+    images = read_images_bin(sparse / "images.bin")
+    missing = [cid for *_, cid in images if cid not in cameras]
+    if missing or not images:
+        raise MeshError(f"the camera model in {sparse} is incomplete (no images, or an image "
+                        f"refers to a camera that does not exist)")
+
+    progress(0.0, "准备照片")
+    limit = photo_size_limit(cameras, images)
+    workspace = work_dir / "undistorted"
+    _undistort(colmap=colmap, dataset_dir=dataset_dir, sparse=sparse, out=workspace,
+               max_image_size=limit, log_path=log_path, cancel_file=cancel_file)
+
+    # COLMAP works in the dataset frame; the mesh is in the training frame.
+    xyz = mesh.xyz if world_from_train is None else transform_points(mesh.xyz, world_from_train)
+    _check_cancel(cancel_file)
+    progress(0.08, "处理遮罩")
+    occluders, masked = build_occluders(dataset_dir=dataset_dir, cameras=cameras, images=images,
+                                        xyz=xyz, log_path=log_path)
+    mesh_ply = work_dir / "texture_in.ply"
+    write_ply(mesh_ply, xyz, mesh.tris, occluders)
+
+    runs = []
+
+    def probe(scale: float) -> tuple:
+        _check_cancel(cancel_file)
+        progress(0.12 + 0.03 * min(len(runs), 6), "估算贴图尺寸")
+        state = _run_texturer(colmap=colmap, workspace=workspace, mesh_ply=mesh_ply,
+                              out=work_dir / "texture_probe", scale=scale, probe=True,
+                              log_path=log_path, cancel_file=cancel_file)
+        runs.append((scale, state["atlas"]))
+        return state["atlas"]
+
+    scale, planned, probes = fit_texture_scale(probe, edge)
+    _note(log_path, "texture scale probes: " + ", ".join(f"{s:.4f} -> {w}x{h}" for s, (w, h) in runs)
+          + f"; chosen {scale:.4f}")
+    _check_cancel(cancel_file)
+    out = work_dir / "texture"
+    state = _run_texturer(colmap=colmap, workspace=workspace, mesh_ply=mesh_ply, out=out,
+                          scale=scale, probe=False, log_path=log_path, cancel_file=cancel_file,
+                          progress=lambda f, m: progress(0.30 + 0.62 * f, m))
+    atlas_w, atlas_h = state["atlas"]
+    if atlas_w > edge or atlas_h > atlas_w:
+        raise MeshError(f"colmap mesh_texturer laid out a {atlas_w} x {atlas_h} texture where "
+                        f"{planned[0]} x {planned[1]} was planned. Log: {log_path}")
+    _check_cancel(cancel_file)
+    progress(0.93, "整理贴图")
+    _, tris, face_uv = read_ply(out / "mesh.ply")
+    n_faces = mesh.face_count
+    if face_uv is None or len(tris) != len(mesh.tris) + 3 * len(occluders) \
+            or tris[:len(mesh.tris)] != mesh.tris:
+        raise MeshError(f"colmap mesh_texturer returned a different mesh from the one it was "
+                        f"given ({out / 'mesh.ply'}). Log: {log_path}")
+    png = (out / "texture.png").read_bytes()
+    mime, png_w, png_h = image_size(png)
+    if (mime, png_w, png_h) != ("image/png", atlas_w, atlas_h):
+        raise MeshError(f"the texture COLMAP wrote ({png_w} x {png_h}) is not the atlas it "
+                        f"reported ({atlas_w} x {atlas_h}). Log: {log_path}")
+    xyz_out, tris_out, uv_out, fill = assemble_textured(
+        mesh.xyz, mesh.tris, face_uv[:6 * n_faces], atlas_w, atlas_h, atlas_w)
+    if not tris_out:
+        raise MeshError(f"No camera saw any part of the mesh from the front, so nothing could be "
+                        f"textured. Log: {log_path}")
+    image = pad_png_rows(png, atlas_w)
+    return {"mesh": Mesh(xyz_out, tris_out, uv_out), "image": image, "edge": atlas_w,
+            "scale": scale, "probes": probes, "regions": state["regions"],
+            "masked_photos": masked, "occluders": len(occluders),
+            "photo_size": limit, **fill}
 
 
 # =============================================================================================
@@ -1677,24 +2160,24 @@ def _run_spirula(*, spirula, run_dir, dataset_dir, out_base: Path, texture_size:
 def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces=300_000,
                  collision_faces=20_000, texture_size=4096, log_path, cancel_file=None,
                  on_progress=None) -> dict:
-    """Write `out_dir/mesh.glb` and `out_dir/collision.glb` from a Spirula training run.
+    """Write `out_dir/mesh.glb` and `out_dir/collision.glb` for a Spirula training run.
 
-    run_dir       Spirula run folder (config.json, scene_transform.json, step-*.ckpt/).
-    dataset_dir   the dataset the run was trained on (images/ and sparse/), as Spirula's own
-                  pose estimation writes it or undistorted; lens distortion may be left in the
-                  camera model.
-    work_dir      scratch folder for intermediate files; safe to delete afterwards.
-    tools         {"spirula": path to spirula.exe}; other entries are ignored.
+    run_dir       Spirula run folder (config.json, scene_transform.json, step-*.ckpt/): the
+                  meshes are written in the frame of its splat.
+    dataset_dir   the dataset the run was trained on: images/, sparse/0 (or sparse/) with any
+                  COLMAP camera model, and optionally masks/ (black = leave out of the texture).
+    work_dir      scratch folder for intermediate files (several GB on large scans); safe to
+                  delete afterwards.
+    tools         {"colmap": path to colmap.exe (the CUDA build)}; other entries are ignored.
     visual_faces, collision_faces
                   upper bounds on the triangle counts of the two meshes.
-    texture_size  upper bound on the texture's edge, in pixels. The atlas is square, with the
-                  largest power-of-two edge that fits.
-    log_path      the tool's output and a summary of each step are appended here.
+    texture_size  upper bound on the texture's edge, in pixels. The texture is square, with a
+                  power-of-two edge.
+    log_path      the tools' output and a summary of each step are appended here.
     cancel_file   if this path appears the work stops and proc.Cancelled is raised.
-    on_progress   called as on_progress(fraction 0..1, message).
+    on_progress   called as on_progress(fraction 0..1, message), never going backwards.
 
-    Both files are in the frame of the run's splat.ply (see the module docstring). Raises
-    MeshError with an actionable message when a step fails.
+    Raises MeshError with an actionable message when a step fails.
     """
     started = time.monotonic()
     run_dir = Path(run_dir).resolve()
@@ -1702,46 +2185,43 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
     out_dir = Path(out_dir).resolve()
     work_dir = Path(work_dir).resolve()
     log_path = Path(log_path).resolve()
-    if "spirula" not in tools or not Path(tools["spirula"]).is_file():
-        raise MeshError(f"tools['spirula'] must be the path to spirula.exe; "
-                        f"got {tools.get('spirula')!r}. Run setup to install the tools.")
-    spirula = Path(tools["spirula"]).resolve()
+    if "colmap" not in tools or not Path(tools["colmap"]).is_file():
+        raise MeshError(f"tools['colmap'] must be the path to colmap.exe; got "
+                        f"{tools.get('colmap')!r}. Run setup to install the tools.")
+    colmap = Path(tools["colmap"]).resolve()
     for name, value in (("visual_faces", visual_faces), ("collision_faces", collision_faces)):
-        if not isinstance(value, int) or value < 100:
+        if not isinstance(value, int) or isinstance(value, bool) or value < 100:
             raise MeshError(f"{name} must be a whole number of at least 100, got {value!r}")
     if not isinstance(texture_size, int) or not 256 <= texture_size <= 16384:
         raise MeshError(f"texture_size must be between 256 and 16384, got {texture_size!r}")
-    checkpoint = _find_checkpoint(run_dir)
+    _find_checkpoint(run_dir)
     if not (dataset_dir / "images").is_dir() or not (dataset_dir / "sparse").is_dir():
         raise MeshError(
             f"{dataset_dir} is not the dataset of this run: it needs an images/ folder and a "
             f"sparse/ folder. Pass the dataset folder the splat was trained on.")
+    _sparse_dir(dataset_dir)
     frames = read_scene_transform(run_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    work_dir.mkdir(parents=True, exist_ok=True)
+    if work_dir.exists():
+        shutil.rmtree(work_dir)   # leftovers of an earlier run must not be mistaken for results
+    work_dir.mkdir(parents=True)
     mesh_path = out_dir / "mesh.glb"
     collision_path = out_dir / "collision.glb"
     for old in (mesh_path, collision_path):
         if old.exists():
             old.unlink()   # a failed run must not leave last time's files looking like its result
 
+    last = [0.0]
+
     def report(lo: float, hi: float) -> Callable[[float, str], None]:
         def inner(fraction: float, message: str) -> None:
+            last[0] = value = max(last[0], lo + (hi - lo) * max(0.0, min(1.0, fraction)))
             if on_progress is not None:
                 try:
-                    on_progress(lo + (hi - lo) * max(0.0, min(1.0, fraction)), message)
+                    on_progress(value, message)
                 except Exception:
                     pass  # a broken progress display must not stop the meshing
         return inner
-
-    def ticker(lo: float, hi: float, first: int, last: int, message: str):
-        """Progress and cancellation for a collapse running from `first` faces down to `last`."""
-        say = report(lo, hi)
-
-        def tick(faces_left: int) -> None:
-            _check_cancel(cancel_file)
-            say((first - faces_left) / max(1, first - last), message)
-        return tick
 
     timings = {}
 
@@ -1749,91 +2229,75 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
         timings[key] = round(time.monotonic() - since, 2)
         return time.monotonic()
 
-    # 1. Surface extraction and texturing (GPU).
+    # 1. Dense geometry from the photos (GPU, then CPU), in the dataset frame.
     _check_cancel(cancel_file)
     t = time.monotonic()
-    report(0.0, 0.0)(0.0, "提取表面")
-    edge = _atlas_edge(texture_size)
-    gaussians = count_gaussians(checkpoint / "splat.ply")
-    merge_factor = merge_factor_for(gaussians)
-    extracted = _run_spirula(spirula=spirula, run_dir=run_dir, dataset_dir=dataset_dir,
-                             out_base=work_dir / "spirula" / "mesh", texture_size=edge,
-                             merge_factor=merge_factor, log_path=log_path,
-                             cancel_file=cancel_file, progress=report(0.0, 0.62))
-    t = timed("extract", t)
+    dense = _dense_geometry(colmap=colmap, dataset_dir=dataset_dir, work_dir=work_dir,
+                            log_path=log_path, cancel_file=cancel_file, progress=report(0.0, 0.70))
+    t = timed("dense", t)
 
-    # 2. Read it back and drop the fragments.
+    # 2. Into the splat's frame, without the fragments, down to the visual budget.
     _check_cancel(cancel_file)
-    report(0.62, 0.62)(0.0, "清除零散碎片")
-    raw, image = read_glb(extracted["path"])
+    report(0.70, 0.70)(0.0, "清除零散碎片")
+    xyz, tris, _ = read_ply(dense["path"])
+    raw = drop_degenerate_faces(Mesh(xyz, tris), zero_area=True)
+    del xyz, tris
     raw_faces = raw.face_count
-    if image is None:
-        raise MeshError(
-            f"Spirula wrote a mesh without a texture for {run_dir}. It textures from the photos "
-            f"in {dataset_dir / 'images'}: check that they are still there. Log: {log_path}")
-    _, tex_w, tex_h = image_size(image)
-    if max(tex_w, tex_h) > texture_size:
-        raise MeshError(f"Spirula wrote a {tex_w} x {tex_h} texture where at most {texture_size} "
-                        f"px was asked for. Log: {log_path}")
-    labels, _, comp_areas = face_components(raw)
-    raw_components = len(comp_areas)
-    largest = max(comp_areas.values())
-    total_area = sum(comp_areas.values())
-    if not largest > 0.0:
-        raise MeshError(
-            f"Spirula extracted a mesh without any surface from {run_dir}. The splat may not "
-            f"have converged; check the training result before meshing.")
-    kept = {lab for lab, a in comp_areas.items() if a >= VISUAL_MIN_AREA_FRACTION * largest}
-    visual_components = len(kept)
-    visual_area = sum(comp_areas[lab] for lab in kept) / total_area
-    visual = raw if len(kept) == raw_components else \
-        select_faces(raw, list(map(kept.__contains__, labels)))
-    del raw, labels
-    t = timed("filter", t)
-
-    # 3. Visual mesh: down to its budget, keeping the atlas.
+    if raw_faces == 0:
+        raise MeshError(f"Dense reconstruction found no surface in the photos of {dataset_dir}. "
+                        f"Check that the photos overlap and are sharp. Log: {log_path}")
+    # Shards are judged in the dataset frame, with the cameras dense matching used.
+    raw, shards = drop_shards(raw, read_cameras_bin(dense["sparse"] / "cameras.bin"),
+                              read_images_bin(dense["sparse"] / "images.bin"), SHARD_MAX_PIXELS,
+                              SHARD_MIN_DEPTH)
+    if raw.face_count == 0:
+        raise MeshError(f"Dense reconstruction found no surface in the photos of {dataset_dir} "
+                        f"that the photos resolve. Log: {log_path}")
     _check_cancel(cancel_file)
-    filtered_faces = visual.face_count
-    stretched = 0
-    atlas_shown = 1.0
-    if filtered_faces > visual_faces:
-        report(0.65, 0.65)(0.0, "简化带贴图网格")
-        visual, collapse_stats = collapse_to(
-            visual, visual_faces, texels=float(tex_w * tex_h),
-            tick=ticker(0.68, 0.90, filtered_faces, visual_faces, "简化带贴图网格"))
-        stretched = collapse_stats["faces_stretched"]
-        atlas_shown = collapse_stats["atlas_shown"]
-        # Pinching a handle shut can cut a sliver loose; the fragment rule applies to those too.
-        visual, _ = keep_large_components(visual, VISUAL_MIN_AREA_FRACTION)
-    t = timed("visual_simplify", t)
+    if not frames["identity"]:
+        raw = Mesh(transform_points(raw.xyz, frames["train_from_world"]), raw.tris)
+    surface, cut = keep_large_components(raw, VISUAL_MIN_AREA_FRACTION)
+    del raw
+    _check_cancel(cancel_file)
+    report(0.72, 0.72)(0.0, "简化网格")
+    surface = simplify(colmap=colmap, mesh=surface, target_faces=visual_faces, work_dir=work_dir,
+                       name="visual", log_path=log_path, cancel_file=cancel_file)
+    # A collapse can cut a sliver loose; the fragment rule applies to those too.
+    surface, _ = keep_large_components(surface, VISUAL_MIN_AREA_FRACTION)
+    surface = drop_degenerate_faces(surface, zero_area=True)
+    t = timed("simplify", t)
+
+    # 3. Texture from the photos.
+    _check_cancel(cancel_file)
+    textured = texture_mesh(colmap=colmap, dataset_dir=dataset_dir, work_dir=work_dir,
+                            mesh=surface, world_from_train=None if frames["identity"]
+                            else frames["world_from_train"], edge=_atlas_edge(texture_size),
+                            log_path=log_path, cancel_file=cancel_file,
+                            progress=report(0.75, 0.92))
+    t = timed("texture", t)
 
     _check_cancel(cancel_file)
-    report(0.90, 0.90)(0.0, "写出带贴图网格")
-    uvs = visual.uv
-    if min(uvs) < 0.0 or max(uvs) > 1.0:
-        # Bilinear filtering never needs coordinates outside the image; clamp away float noise.
-        uvs = array.array("f", [0.0 if c < 0.0 else 1.0 if c > 1.0 else c for c in uvs])
+    report(0.92, 0.92)(0.0, "写出带贴图网格")
+    visual = textured["mesh"]
     frame_note = {"frame": "spirula-train (same numbers as splat.ply)", "source": "scan3d"}
     write_glb(mesh_path, positions=visual.xyz, indices=array.array("I", visual.tris),
-              normals=seamless_normals(visual), uvs=uvs, image=image, name="mesh",
-              extras=frame_note)
-    del image
+              normals=seamless_normals(visual), uvs=visual.uv, image=textured["image"],
+              name="mesh", extras=frame_note)
+    del visual
+    textured["image"] = None
     t = timed("visual_glb", t)
 
-    # 4. Collision mesh: the same surface, larger pieces only, no seams, far fewer faces.
+    # 4. Collision mesh: the same surface, larger pieces only, far fewer faces.
     _check_cancel(cancel_file)
-    report(0.91, 0.91)(0.0, "简化碰撞网格")
-    collision, first_cut = keep_large_components(weld(visual), COLLISION_MIN_AREA_FRACTION)
-    del visual
+    report(0.94, 0.94)(0.0, "简化碰撞网格")
+    collision, first_cut = keep_large_components(weld(surface), COLLISION_MIN_AREA_FRACTION)
+    del surface
     collision = drop_degenerate_faces(collision, zero_area=True)
-    if collision.face_count > collision_faces:
-        collision, _ = collapse_to(
-            collision, collision_faces,
-            tick=ticker(0.91, 0.96, collision.face_count, collision_faces, "简化碰撞网格"))
-        collision, _ = keep_large_components(collision, COLLISION_MIN_AREA_FRACTION)
-        collision = drop_degenerate_faces(collision, zero_area=True)
-    if collision.face_count == 0:
-        raise MeshError("simplifying the collision mesh left nothing; raise collision_faces")
+    collision = simplify(colmap=colmap, mesh=collision, target_faces=collision_faces,
+                         work_dir=work_dir, name="collision", log_path=log_path,
+                         cancel_file=cancel_file)
+    collision, _ = keep_large_components(collision, COLLISION_MIN_AREA_FRACTION)
+    collision = drop_degenerate_faces(collision, zero_area=True)
     collision_components = len(face_components(collision)[2])
     t = timed("collision_simplify", t)
 
@@ -1854,16 +2318,20 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
             f"{mesh_info['faces']} of {visual_faces}, collision {collision_info['faces']} of "
             f"{collision_faces}). Raise the face budgets and run the mesh step again.")
     timed("validate", t)
-    _note(log_path, f"spirula mesh of {gaussians} Gaussians at merge factor {merge_factor}, chart "
-                    f"angle {CHART_ANGLE_DEG}: {raw_faces} faces in "
-                    f"{raw_components} components, {extracted['charts']} texture charts; kept "
-                    f"{visual_components} components ({filtered_faces} faces, {visual_area:.1%} of "
-                    f"the area); scene transform "
-                    f"{'identity' if frames['identity'] else 'not identity'}")
-    _note(log_path, f"wrote {mesh_path.name}: {mesh_info['faces']} faces ({stretched} of them "
-                    f"with a stretched patch of the texture, {atlas_shown:.1%} of the atlas still "
-                    f"shown), {mesh_info['vertices']} vertices, {mesh_info['bytes']} "
-                    f"bytes; {collision_path.name}: {collision_info['faces']} faces, "
+    _note(log_path, f"dense reconstruction from {dense['images']} photos: {dense['points']} "
+                    f"points, {raw_faces} faces, {shards} of them far shards wider than "
+                    f"{SHARD_MAX_PIXELS:g} px in every photo; {cut['components_before']} "
+                    f"components, kept "
+                    f"{cut['components_after']} ({cut['area_kept_fraction']:.1%} of the area); "
+                    f"scene transform {'identity' if frames['identity'] else 'not identity'}")
+    _note(log_path, f"texture: scale {textured['scale']:.4f} after {textured['probes']} probes, "
+                    f"{textured['regions']} patches, {textured['edge']} px, "
+                    f"{textured['masked_photos']} masked photos ({textured['occluders']} "
+                    f"occluder triangles), {textured['faces_flat_coloured']} faces flat-coloured, "
+                    f"{textured['faces_unseen_dropped']} unseen faces dropped")
+    _note(log_path, f"wrote {mesh_path.name}: {mesh_info['faces']} faces, "
+                    f"{mesh_info['vertices']} vertices, {mesh_info['bytes']} bytes; "
+                    f"{collision_path.name}: {collision_info['faces']} faces, "
                     f"{collision_info['vertices']} vertices, {collision_info['bytes']} bytes; "
                     f"{time.monotonic() - started:.1f} s")
     report(1.0, 1.0)(1.0, "网格完成")
@@ -1876,20 +2344,23 @@ def build_meshes(*, run_dir, dataset_dir, out_dir, work_dir, tools, visual_faces
         "collision_faces": collision_info["faces"],
         "collision_vertices": collision_info["vertices"],
         "collision_bytes": collision_info["bytes"],
-        "texture_size": max(tex_w, tex_h),
-        "texture_width": tex_w,
-        "texture_height": tex_h,
-        "texture_format": TEXTURE_ENCODING,
-        "texture_charts": extracted["charts"],
-        "faces_texture_stretched": stretched,
-        "texture_area_kept": round(atlas_shown, 4),
-        "merge_factor": merge_factor,
-        "chart_angle_deg": CHART_ANGLE_DEG,
-        "gaussians": gaussians,
+        "texture_size": mesh_info["texture_width"],
+        "texture_width": mesh_info["texture_width"],
+        "texture_height": mesh_info["texture_height"],
+        "texture_format": "png",
+        "texture_scale": round(textured["scale"], 4),
+        "texture_patches": textured["regions"],
+        "faces_flat_coloured": textured["faces_flat_coloured"],
+        "faces_unseen_dropped": textured["faces_unseen_dropped"],
+        "masked_photos": textured["masked_photos"],
+        "geometry": "colmap-dense",
+        "dense_photos": dense["images"],
+        "dense_points": dense["points"],
         "raw_faces": raw_faces,
-        "raw_components": raw_components,
-        "mesh_components_kept": visual_components,
-        "mesh_area_kept": round(visual_area, 4),
+        "faces_shards_removed": shards,
+        "raw_components": cut["components_before"],
+        "mesh_components_kept": cut["components_after"],
+        "mesh_area_kept": round(cut["area_kept_fraction"], 4),
         "collision_components_kept": collision_components,
         "collision_area_kept": round(first_cut["area_kept_fraction"], 4),
         "frame": "spirula-train",
