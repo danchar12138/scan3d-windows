@@ -1,387 +1,197 @@
-# Scan3D（电脑端）
+# Scan3D
 
-把一组照片或一段视频变成三维场景：一份高斯泼溅（3DGS，画面用）、一份带贴图的网格和一份低面数碰撞网格（游戏引擎用）。全部在本机运行，不上传任何数据。
+**Photos or a phone video in → Gaussian splat, textured mesh and collision mesh out. Runs entirely on your Windows PC.**
 
-这是一个围绕 [Spirula Studio](https://github.com/harry7557558/spirula-studio) 和 [COLMAP](https://github.com/colmap/colmap) 的整合包：取帧、抠图、相机位姿、几何先验、训练高斯由 Spirula 完成；网格由 COLMAP 的稠密重建生成，并用原始照片贴图。本项目负责把这些步骤串成一键流程，并提供网页界面和结果查看器。两个程序都是必需的。
+[English](README.md) · [简体中文](README.zh-CN.md)
 
-## 系统要求
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
+![Platform: Windows 10/11](https://img.shields.io/badge/platform-Windows%2010%2F11-0078D4)
+![GPU: NVIDIA CUDA](https://img.shields.io/badge/GPU-NVIDIA%20CUDA-76B900)
+![Python 3.12 embedded](https://img.shields.io/badge/python-3.12%20(bundled)-blue)
 
-- Windows 10 / 11，64 位
-- NVIDIA 独立显卡（在 RTX 5070 Ti 笔记本显卡、12 GB 显存上开发和测试；其他显卡未测试）
-- 磁盘：程序约 1 GB，模型全部装齐约 6 GB；每次扫描处理中临时占用约 10 GB，完成后保留 1–3 GB
-- 内存：建议 16 GB 以上（网格贴图时会把照片全部读进内存，最多约 4.5 GB）
-- 安装路径只含英文字符（不要放在带中文的文件夹下）
+![Scan3D workflow graph](docs/images/job.png)
 
-## 开始使用
+Scan3D turns a handful of photos or a short video into a 3D scene you can drop into a game
+engine or view in the browser. It wires [Spirula Studio](https://github.com/harry7557558/spirula-studio)
+(frame selection, masking, camera poses, Gaussian training) and [COLMAP](https://github.com/colmap/colmap)
+(dense reconstruction, meshing, photo texturing) into one pipeline with a web UI. No WSL, no
+Docker, no cloud upload: double-click one file.
 
-1. 从 GitHub 下载本仓库（`git clone https://github.com/danchar12138/scan3d-windows.git`，或在页面上点 Code → Download ZIP 解压），放在只含英文字符的路径下，然后双击 `Scan3D.cmd`。第一次运行会自动下载 Python、Spirula Studio 和 COLMAP（合计约 1 GB），断网后重新双击可续传。神经网络模型不用自己找：在网页里打开用到它的功能，运行到那一步时会自动下载；也可以在网页的"模型"面板里提前下载。
-2. 浏览器会打开本机页面。新建任务：把照片或视频拖进去，选一个模板（快速预览、快速预览含网格、标准、高质量、完整、只要网格），点开始。
-3. 任务页的核心是一张**工作流图**：每个阶段是一个节点，点节点看它的参数、日志和结果，决定它做不做、做到哪一步为止（见下文"工作流"）。结果在页面的"在线查看"里直接看，或下载文件，或打开 `runs\<任务名>\output` 文件夹。
+## Why Scan3D
 
-也可以把一个照片文件夹或视频文件直接拖到 `Scan3D.cmd` 上，它会用标准模板直接处理。
+- **Three outputs from one capture.** `splat.ply` (3D Gaussian splat, for looks), `mesh.glb`
+  (textured, from your original photos) and `collision.glb` (low-poly, for physics). All three share one coordinate system.
+- **Out of the box.** `git clone`, double-click `Scan3D.cmd`. It downloads Python, Spirula Studio and
+  COLMAP on first run. Neural network models are fetched when you switch the feature on, from
+  the UI.
+- **A workflow, not a black box.** Ten independent stages, each with its own switch, parameters,
+  log and result. Run up to any stage, re-run one, clear one. Change a parameter and only the
+  stages that depend on it are marked stale.
+- **See everything in the browser.** Report, splat, mesh, collision mesh, a splat/collision overlay
+  to check alignment, and a **capture coverage** view that colours the scene by how well it was photographed
+  and tells you where to shoot more.
+- **Phone friendly.** One launcher, one URL for this PC and the LAN. Scan the QR code on your
+  phone to upload photos and view results (pairing token, loopback needs none).
+- **Private.** Nothing leaves your machine except downloading the tools and models.
+- **Measured, not claimed.** Every default is backed by numbers in [docs/benchmarks.md](docs/benchmarks.md),
+  including the options that did not help and stayed off.
 
-**用手机访问。** 只有这一个启动器。启动后本机和局域网都能访问：本机直接打开，不需要任何码；手机连同一个 Wi-Fi，扫页面上"用手机访问"里的二维码（地址里带配对码，重启后不变，可以存为书签）。第一次运行时 Windows 防火墙会询问，选择允许专用网络。下载模型、打开本机文件夹、保存模板这几项只能在电脑上操作。
+## Quick start
 
-## 模型与许可
+Requirements: Windows 10/11 64-bit, an NVIDIA GPU (developed on a 12 GB RTX 5070 Ti laptop GPU;
+others untested), 16 GB RAM recommended, about 6 GB of disk for everything plus 10 GB of scratch
+space per scan.
 
-一部分功能用到第三方的神经网络模型。模型不在本仓库里，用到时自动下载到 `tools\models`。**所有模型的用法都一样：你只需要决定用不用这个功能。** 打开对应的节点，运行到那个阶段时缺的模型文件会自动下载，需要的许可由程序记录（`tools\accepted-licences.json`，注明"打开功能时自动记录"和日期，不进仓库），并传给工具。节点面板上会写明模型的许可名称和链接，使用即表示同意该许可。
+1. Get the code in a folder whose path has **only English characters**:
+   ```
+   git clone https://github.com/danchar12138/scan3d-windows.git
+   ```
+   (or Code → Download ZIP and extract it).
+2. Double-click **`Scan3D.cmd`**. First run downloads Python, Spirula Studio and COLMAP (about 1 GB;
+   re-run to resume if the network drops). Allow Windows Firewall on private networks if asked.
+3. Your browser opens. Click **New job**, drop in photos or a video, pick a template, press **Run**.
 
-| 阶段 | 模型 | 大小 | 许可（以来源页面为准） | 默认 |
+You can also drag a photo folder or a video onto `Scan3D.cmd` to process it with the standard template.
+
+![New job page](docs/images/home.png)
+
+### Templates
+
+| Template | Stages | Time on the test PC |
+|---|---|---|
+| Quick preview | splat only, 7k steps | a few minutes |
+| Quick preview + mesh | quick splat, then a cheap dense reconstruction and a small mesh | about 5 min (31–200 photos) |
+| Standard | + masking of passers-by, normal prior, capture coverage, 2M Gaussians, 30k steps | about 13–23 min |
+| High | 3M Gaussians, 50k steps | about 2× standard for almost the same score; only for close-up inspection |
+| Full | standard + dense reconstruction + mesh | 30 min to over an hour |
+| Mesh only | masking, poses, dense reconstruction, mesh (no splat) | depends on photo count |
+
+Templates are starting points; every parameter of every stage can be changed per job, and you can
+save your own. Timings are from one machine; see [docs/benchmarks.md](docs/benchmarks.md).
+
+## Outputs
+
+In `runs\<job>\output`:
+
+| File | What | Use |
+|---|---|---|
+| `splat.ply` | Gaussian splat, standard 3DGS format with view-dependent colour | The result. Open in SuperSplat, Unity/Unreal splat plugins, Blender add-ons |
+| `mesh.glb` | Textured mesh | Engines and pipelines without splat support |
+| `collision.glb` | Low-poly mesh, no texture | Collision, shadow receiving |
+| `report.json` | Timings, statistics, orientation | Debugging, aligning coordinates |
+
+The splat and both meshes use one coordinate system; the GLBs carry a root rotation that makes them
+Y-up, recorded in `report.json` as `orientation.rotation_to_y_up_xyzw`. Photos carry no real-world
+scale, so scale the model yourself after import (use the same factor for splat and mesh).
+
+## The workflow
+
+| Stage | Does | Needed | GPU |
+|---|---|---|---|
+| Ingest | order photos; pick sharp, well-spread video frames | yes | no |
+| Masks | remove moving people, or keep only the subject | no | yes |
+| Camera poses | position and lens of every photo (SIFT, then ALIKED + LightGlue if that fails) | yes | yes |
+| Normal prior | MoGe-2 surface normals for flatter splats | no | yes |
+| Dense seed | RoMa dense points as training seed (off by default) | no | yes |
+| Splat training | train the Gaussian splat (mip anti-aliasing, exposure compensation) | no | yes |
+| Dense reconstruction | COLMAP multi-view PatchMatch, the geometry of the mesh (the slow one) | no | yes |
+| Mesh | drop fragments, decimate, texture from the original photos, collision mesh | no | no |
+| Coverage | mark where photos are too few, suggest where to shoot | no | no |
+| Export | collect outputs, build web previews, write the report | yes | no |
+
+Turning a stage on locks the stages it needs. "Run to here" executes only what is missing up to that
+node. Each stage stores a fingerprint of its parameters, inputs and upstream stages, so editing the
+mesh face count does not redo the dense reconstruction. Before every run the page lists exactly what will
+run and which models will be downloaded. A failed stage stops the run; finished stages are kept, nothing is skipped silently.
+
+Every external program runs with a total time limit, a no-output watchdog and cancellation that kills
+its whole process tree. Only one GPU stage runs at a time; the rest queue.
+
+## Models and licenses
+
+Some features use third-party neural networks. They are **not** in this repository: switching a
+feature on is the only decision; the weights are downloaded when its stage starts (or earlier
+from the Models panel), and the licence you accept by enabling it is recorded in
+`tools\accepted-licences.json`. The licence name and link are shown on every node.
+**Read them before commercial use**: some are restrictive (e.g. SAM License, DINOv3 License).
+
+| Stage | Model | Size | License | Default |
 |---|---|---|---|---|
-| 抠图（抠掉走动的人） | SAM 3 | 1.75 GB | [SAM License](https://github.com/facebookresearch/sam3/blob/main/LICENSE) | 标准、高质量、完整模板开启 |
-| 抠图（备选引擎） | SAM 2.1 + Grounding DINO | 430 MB + 890 MB | 两者均为 Apache 2.0 | 关闭，在抠图节点里换引擎 |
-| 抠图（只留主体） | BiRefNet | 424 MB | [MIT](https://github.com/ZhengPeng7/BiRefNet/blob/main/LICENSE) | 抠图节点选"只留主体"时用 |
-| 法线先验 | MoGe-2 (ViT-B / ViT-L) | 400 MB / 1.3 GB | 见[模型页面](https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx) | 标准、高质量、完整模板开启 |
-| 稠密点云种子 | RoMa v2（依赖 DINOv3） | 1.05 GB | [DINOv3 License](https://github.com/facebookresearch/dinov3/blob/adc254450203739c8149213a7a69d8d905b4fcfa/LICENSE.md) 和 RoMa v2 的 MIT | 关闭（原因见"实测数据"） |
-| 位姿的学习型特征 | ALIKED + LightGlue | 47 MB | 见 [COLMAP 发布页](https://github.com/colmap/colmap/releases/tag/3.13.0) | 常规特征失败时才用 |
+| Masks (people) | SAM 3 | 1.75 GB | [SAM License](https://github.com/facebookresearch/sam3/blob/main/LICENSE) | on in Standard/High/Full |
+| Masks (alternative) | SAM 2.1 + Grounding DINO | 430 + 890 MB | Apache-2.0 | off; switch engine in the node |
+| Masks (subject only) | BiRefNet | 424 MB | [MIT](https://github.com/ZhengPeng7/BiRefNet/blob/main/LICENSE) | when "subject only" is chosen |
+| Normal prior | MoGe-2 (ViT-B / ViT-L) | 400 MB / 1.3 GB | see [model page](https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx) | on in Standard/High/Full |
+| Dense seed | RoMa v2 (uses DINOv3) | 1.05 GB | [DINOv3 License](https://github.com/facebookresearch/dinov3/blob/adc254450203739c8149213a7a69d8d905b4fcfa/LICENSE.md) + RoMa v2 MIT | off (it lowered PSNR in tests) |
+| Pose features | ALIKED + LightGlue | 47 MB | see [COLMAP release](https://github.com/colmap/colmap/releases/tag/3.13.0) | only if SIFT fails |
 
-命令行里 `scan3d.py models` 查看状态，`scan3d.py models --download 功能` 提前下载。
+`scan3d.py models` shows status, `scan3d.py models --download <feature>` downloads ahead of time.
+The full list of third-party programs and libraries is in [THIRD_PARTY.md](THIRD_PARTY.md).
 
-## 拍摄建议
+## Capture tips
 
-拍摄方式对结果的影响比任何参数都大。
+Capture matters more than any parameter.
 
-- 围绕场景慢慢移动，相邻两张照片至少七成画面重叠。
-- 同一个地方从不同高度各拍一圈（平视一圈，俯视一圈）。
-- 照片 50–300 张，或一段 1–2 分钟的视频。视频会自动挑出清晰的画面。
-- 照片格式用 JPG（PNG、BMP 也可以）。HEIC、WebP、TIFF 会被跳过。
-- 光线均匀，避免对着窗户或灯。能锁定曝光和对焦就锁定。
-- 路过的行人会被自动抠掉，但尽量在人少的时候拍。白墙、玻璃、镜子、反光的金属会重建得差，这是这类技术的共同限制。
-- 扫完后看一下"在线查看"里的"拍摄覆盖"：橙色的地方照片太少或只从一个方向拍过，按提示补拍，再把新旧照片放在一起重新扫描。
+- Move slowly around the scene; neighbouring photos should overlap at least 70%.
+- Shoot a ring at eye level and another from above.
+- 50–300 photos, or a 1–2 minute video (sharp frames are picked automatically). JPG preferred;
+  HEIC, WebP and TIFF are skipped.
+- Even light; avoid shooting into windows or lamps; lock exposure and focus if you can.
+- Passers-by are masked automatically, but fewer is better. White walls, glass, mirrors and shiny
+  metal reconstruct poorly, as with all photogrammetry-style methods.
+- After a scan, open **Capture coverage**: orange means too few photos or one direction only. Shoot there and re-scan with old and new photos together.
 
-## 工作流
-
-一次扫描不是"一键跑完"，而是十个**独立阶段**，每个都能单独运行、单独重跑、单独清除：
-
-| 阶段 | 做什么 | 必需 | 用显卡 |
-|---|---|---|---|
-| 整理素材 | 照片按顺序整理；视频挑清晰的帧，丢掉模糊的 | 是 | 否 |
-| 抠图 | 抠掉走动的人，或只留主体（物体模式，背景不重建） | 否 | 是 |
-| 相机位姿 | 每张照片的位置和镜头参数 | 是 | 是 |
-| 法线先验 | MoGe-2 估计表面法线，高斯更平整 | 否 | 是 |
-| 稠密点云种子 | RoMa 稠密点云作为训练初始点（默认关） | 否 | 是 |
-| 高斯训练 | 训练高斯泼溅 | 否 | 是 |
-| 稠密重建 | COLMAP 多视角稠密匹配，网格的几何（最慢，约半小时） | 否 | 是 |
-| 网格 | 去碎片、减面、照片贴图、碰撞网格 | 否 | 否 |
-| 拍摄覆盖 | 标出哪里照片太少，给出补拍位置 | 否 | 否 |
-| 导出 | 整理输出文件、网页预览、报告 | 是 | 否 |
-
-- **每个节点有开关**。打开一个阶段，它依赖的阶段会自动锁定为开（带锁的开关）。
-- **走到哪一步**：点某个节点的"运行到这里"，只跑它和它需要的、还没做完的阶段。比如只要高斯，就运行到"高斯训练"，之后想要网格，再打开"网格"运行，已经完成的阶段不会重做。
-- **只运行这一步 / 重新运行 / 清除结果**：重新运行会连带重做依赖它的阶段；清除结果只删这一个阶段的产物。
-- **改了参数哪些会过期**：每个阶段记录自己的"指纹"（参数、输入、上游阶段）。改一个参数，只有这个阶段和依赖它的阶段显示"需重算"。例如改网格面数，不会重做稠密重建。
-- **运行前会告诉你要做什么**：页面上方列出下一次点"运行"会执行的阶段和需要下载的模型。
-
-**模板**是起点，每个任务的每个参数都可以在节点面板里单独改（视频取帧数、抠图提示词、训练步数、高斯数量、网格面数、贴图尺寸等），改完可以"存为模板"，也可以设为默认。用户模板保存在 `user-settings.json`（不进仓库）。
-
-| 模板 | 开启的阶段 | 说明 |
-|---|---|---|
-| 快速预览 | 整理素材、相机位姿、高斯训练、导出 | 1280 像素、7000 步、50 万高斯，几分钟，只出高斯 |
-| 快速预览（含网格） | 快速预览，加稠密重建和网格 | 高斯同快速预览；稠密匹配 800 像素、最多 60 张、每张 6 张邻图、不做几何一致性检查；网格 10 万面、2048 贴图。用来先看网格能不能用。稠密点数约为完整模板的四分之一，面数三分之一，贴图小一半，用时 5 分钟左右（见"实测数据"）；网格的细节没有做定量比较，要交付请用完整模板 |
-| 标准（高斯） | + 抠图、法线先验、拍摄覆盖 | 1920 像素、3 万步、200 万高斯，不做网格 |
-| 高质量（高斯） | 同上 | 3072 像素、5 万步、300 万高斯。在 bonsai_half 上用时是标准模板的两倍多，指标几乎相同（见"实测数据"），只在需要放大细看时才值得 |
-| 完整（高斯 + 网格） | 标准 + 稠密重建、网格 | 要一个多小时 |
-| 只要网格 | 抠图、位姿、稠密重建、网格 | 不训练高斯，网格在照片坐标系里 |
-
-高斯都用 mip 抗锯齿（`--primitive mip`）。"稠密重建"的耗时不随模板变，约半小时（130 张 3072×2304 照片、200 张取样、长边 1600）；网格阶段的面数和贴图大小只影响最后的减面和贴图，几十秒。
-
-## 输出文件
-
-在 `runs\<任务名>\output` 下：
-
-| 文件 | 内容 | 用途 |
-|---|---|---|
-| `splat.ply` | 高斯泼溅，标准 3DGS 格式，含随视角变化的颜色 | 最终成品。用 SuperSplat、Unity / Unreal 的高斯插件、Blender 插件等打开 |
-| `mesh.glb` | 带贴图的网格 | 不支持高斯的引擎和传统流程 |
-| `collision.glb` | 低面数网格，无贴图 | 碰撞、接收阴影 |
-| `preview.spz`、`preview-lite.spz` | 高斯的压缩副本 | 只给网页查看器用，丢了会自动重新生成 |
-| `report.json` | 各阶段用时、统计数字、朝向信息 | 排查问题、对齐坐标 |
-
-**坐标对齐。** 三个模型文件的坐标是同一套：`splat.ply` 里的点 (x, y, z) 和两个 GLB 里的顶点 (x, y, z) 指的是同一个位置。两个 GLB 在根节点上带了一个旋转，让它们在查看器和引擎里是正立的（Y 轴朝上）。这个旋转记录在 `report.json` 的 `orientation.rotation_to_y_up_xyzw` 里，把同一个旋转加到高斯上，高斯和网格就重合。
-
-**尺寸。** 照片里没有真实尺寸信息，模型的大小是任意的。导入引擎后需要自己缩放到合适大小，高斯和网格用同一个缩放值。
-
-**网格的质量。** 网格来自 COLMAP 的多视角稠密重建（不是从高斯里提取的），贴图直接取自原始照片，所以砖缝、窗格这类细节是清楚的，天空也不会被做成网格。它仍比高斯粗糙：大面积的纯色白墙会变成几块大的平面，树叶和细栏杆会粘连；树挡在墙前的地方，墙上可能印上树叶。画面请优先用高斯。
-
-## 在线查看
-
-任务完成后，任务页的"在线查看"里有六个标签：报告、高斯、网格、碰撞网格、叠加对齐（高斯和碰撞网格叠在一起，用来确认两者重合）、拍摄覆盖。鼠标或手指拖动旋转，滚轮或双指缩放。
-
-**拍摄覆盖**把高斯按被拍到的程度染色：蓝色拍得充分（至少 8 张照片、3 个方向），黄色一般，橙色不足（少于 3 张或只从一个方向），灰色未判断。计算时考虑了遮挡。白点是每张照片的拍摄位置。下方列出最多五处不足的区域，"从这里补拍"会把视角移到建议的站位。完全没拍到的空洞没有东西可以染色，所以不会显示；天空总是显示为充分。在室外样例上，橙色区域里 22/30 的画面小块在新视角下明显损坏，蓝色区域里是 7/30。
-
-高斯有三档画质：
-
-| 档 | 内容 | 大小（100 万个高斯） | 默认用在 |
-|---|---|---|---|
-| 轻量 | 最多 30 万个高斯，不带随视角变化的颜色 | 约 5 MB | 窄屏（手机） |
-| 完整 | 全部高斯，带全部随视角变化的颜色，压缩过 | 约 40 MB | 宽屏（电脑） |
-| 原画质 | 直接加载 `splat.ply`，与成品完全一致 | 约 236 MB | 不默认；窄屏上加载前会提示 |
-
-在测试场景上，"完整"与"原画质"从同一机位渲染的差别是平均每像素 1.4/255，肉眼基本看不出。
-
-## 命令行
+## Command line
 
 ```
-tools\python\python.exe app\scan3d.py run <照片文件夹或视频> [--name 任务名] [--template 模板] [--to 阶段] [--only 阶段,阶段] [--force 阶段,阶段]
-                                            [--enable 阶段,阶段] [--disable 阶段,阶段] [--set 阶段.参数=值] [--fresh]
-tools\python\python.exe app\scan3d.py stages [--job 任务名]    各阶段的状态
+tools\python\python.exe app\scan3d.py run <photos-folder-or-video> [--name JOB] [--template T] [--to STAGE] [--only a,b] [--force a,b]
+                                           [--enable a,b] [--disable a,b] [--set stage.param=value] [--fresh]
+tools\python\python.exe app\scan3d.py stages [--job JOB]
 tools\python\python.exe app\scan3d.py serve [--port 8765] [--no-browser]
-tools\python\python.exe app\scan3d.py models [--download [功能]]
-tools\python\python.exe app\scan3d.py list | cancel <任务名> | doctor
+tools\python\python.exe app\scan3d.py models [--download [feature]]
+tools\python\python.exe app\scan3d.py list | cancel <job> | doctor
 ```
 
-- 用已有的任务名再次运行会读取这个任务的工作流，只做没完成或已过期的阶段；`--fresh` 清空这个任务的结果重来。
-- `--to train` 只跑到高斯训练；`--only mesh` 只重做网格；`--force train` 强制重训。
-- `--set 阶段.参数=值` 临时改参数，例如 `--set train.iterations=7000`、`--set masks.kind=subject`、`--set train.eval_holdout=true`（留出八分之一照片，结束后在 `report.json` 里给出 PSNR、SSIM、LPIPS，用来比较参数）。
-- 退出码：0 完成，1 失败，2 取消，64 参数或工作流不合法。
+Re-running an existing job name only does stages that are missing or stale. Exit codes: 0 done,
+1 failed, 2 cancelled, 64 invalid arguments or workflow. `--set train.eval_holdout=true` holds out
+one eighth of the photos and writes PSNR, SSIM and LPIPS to `report.json`.
 
-## 设置
+## Benchmarks
 
-简单的开关和数字都在网页里改（每个节点的参数、模板），不需要改文件。`app\settings.json` 只留不是简单开关的东西：图片数量上限、视频相似帧参数、模型文件名、位姿计算依次尝试的特征类型、各步骤的超时。
+Measured on one laptop (RTX 5070 Ti, 12 GB) with 30 public datasets, including phone videos.
+Highlights (full tables in [docs/benchmarks.md](docs/benchmarks.md), in Chinese; numbers are language-neutral):
 
-## 处理流程
+- 128 photos of 3072×2304, standard template: **about 13 minutes**, 128/128 registered, 1M Gaussians
+  plus a 289k-face textured mesh.
+- Halving photo density costs 1.1 dB PSNR; a quarter costs 6.6 dB; 30 photos is not usable. Spacing
+  between neighbouring photos matters more than the count.
+- Dense seed (RoMa) lowered PSNR by 0.6–1.3 dB in both test scenes, so it stays off. The High
+  template took 2× longer for the same score as Standard.
+- SAM 2.1 + Grounding DINO matched SAM 3 on a scene with passers-by, and was a little faster.
 
-1. **整理素材**：照片统一命名（不重新编码，保留拍摄参数）；视频由 Spirula 挑出清晰且分布均匀的画面，丢掉运动模糊的帧。
-2. **抠图**（可选）：SAM 3 按提示词抠掉走动的人，或 BiRefNet 只留主体，写出遮罩；位姿、训练、稠密重建和网格贴图都避开遮罩区域。
-3. **相机位姿**：Spirula 的位姿计算，不用照片里的 GPS 定尺度（定了尺度后模型缩到极小，COLMAP 的稠密匹配会崩溃）。注册的照片不够时，换学习型特征（ALIKED + LightGlue）再算一次。
-4. **法线先验 / 稠密点云种子**（可选）：MoGe-2 为每张图估计表面法线；RoMa 稠密点云。
-5. **高斯训练**（可选）：Spirula，mip 抗锯齿高斯，带曝光和白平衡补偿，直接使用带镜头畸变的相机模型，不做去畸变。
-6. **稠密重建**（可选）：COLMAP 去畸变，GPU 上的 PatchMatch 稠密匹配（每张图按共享点数指定参考图，与其他照片没有共享点的照片会被剔除），融合成点云，用 Delaunay 方法建面，被遮罩的像素不参与。
-7. **网格**（可选）：挪到高斯的坐标系（没有高斯则在照片坐标系），去掉碎块和远处的碎片面，减面到预算；再用原始分辨率照片贴图（带接缝颜色均衡，遮罩区域不取色），打包成 GLB。碰撞网格是同一表面减到更低面数。
-8. **拍摄覆盖**（可选）：统计每处被几张照片、从几个方向拍到，写出补拍建议。
-9. **导出**：整理输出文件，生成网页预览，写报告。只有哪个阶段做过，就导出哪个阶段的结果。
+## Known limitations
 
-每个外部程序都有三重保护：总时长上限、长时间无输出自动终止、可随时取消；终止时连同它启动的子进程一起结束。同一时间只有一个用显卡的阶段在运行，其余排队。一个阶段失败，整次运行停在那里，之前完成的阶段保留，不会被悄悄跳过。
+- Verified on a single PC and public datasets; not on your phone footage, a real phone over Wi-Fi, or other GPUs.
+- Dense reconstruction (and so the mesh) needs an NVIDIA GPU: COLMAP's dense matcher is CUDA-only.
+- Generated GLBs pass structure checks and render in the built-in viewer; they have **not** been import-tested in Unity, Unreal or Blender.
+- Masking depends on the prompt; too broad a prompt can mask static content.
+- Lighting is baked in; the scene cannot be relit. Unphotographed areas are empty.
+- The mesh is coarser than the splat: big plain walls become a few large planes, foliage and thin bars stick together. Use the splat for visuals.
+- No automatic check for pose "ghosting" on symmetric or repetitive structures.
+- Two datasets still fail pose estimation (a 500×375 low-light chair, a long forward-walking video); the cause is unknown.
 
-## 已知限制
+## Contributing
 
-- 只在一台电脑（RTX 5070 Ti 笔记本显卡）上验证过，用的是 30 套公开素材（其中有手机视频），没有用你自己的手机直接拍的素材验证过。
-- 手机端只在电脑上用手机尺寸的浏览器窗口模拟过，没有用真实手机和真实 Wi-Fi 测试；手机上"完整"和"原画质"两档的内存占用和流畅度未知。
-- 生成的 GLB 通过了结构检查并能在网页查看器里显示，但没有在 Unity、Unreal、Blender 里实际导入验证。
-- 抠图依赖提示词。提示词写得太宽（例如把"car"加进去）会把静止的场景内容也抠掉；平均遮挡超过三成时任务会给出警告。
-- 场景的光照是拍摄时固定下来的，放进引擎后不能重新打光。
-- 没拍到的地方是空的；离拍摄路径越远，高斯的画面越差。"拍摄覆盖"能指出照片不足的地方，但它建议的补拍位置是推算的，没有验证过补拍后一定能修好。
-- 稠密重建需要 NVIDIA 显卡（COLMAP 的稠密匹配只有 CUDA 版本），并且比高斯训练还慢，约 30 分钟。
-- 位姿计算没有自动检测"结构叠错"的手段：对称的建筑、重复的结构有可能被错误地叠在一起而不报错。
+Issues and pull requests are welcome, see [CONTRIBUTING.md](CONTRIBUTING.md). When reporting a bug, attach the
+output of `scan3d.py doctor` and the job's `logs` folder.
 
-## 第三方组件
+## Acknowledgements
 
-安装脚本从各项目的官方发布地址下载以下程序，本项目通过命令行调用它们，不包含也不修改它们的代码：
+Built on [Spirula Studio](https://github.com/harry7557558/spirula-studio), [COLMAP](https://github.com/colmap/colmap),
+[three.js](https://threejs.org/), [Spark](https://github.com/sparkjsdev/spark), SAM 3, SAM 2.1, Grounding DINO,
+BiRefNet, MoGe-2, RoMa v2, ALIKED and LightGlue. The test scenes come from public datasets
+(Mip-NeRF 360, Tanks and Temples, ETH3D, LLFF, Objectron and others). Thanks to all of them.
 
-| 组件 | 版本 | 用途 | 许可 |
-|---|---|---|---|
-| Spirula Studio | 2026.11.12 | 取帧、抠图、相机位姿、几何先验、训练高斯 | GPL-3.0 |
-| COLMAP（CUDA 版） | 4.2.1 | 稠密重建、建面、减面、照片贴图 | BSD-3-Clause |
-| Python | 3.12.10 embeddable | 运行本项目的代码 | PSF |
+## License
 
-网页查看器用到的脚本库放在 `app\web\vendor`（未修改的发布文件，版本、来源和校验值见该目录的 README）：three.js、Spark（`@sparkjsdev/spark`）、qrcode-generator，均为 MIT 许可。
-
-本项目自己的代码目前没有附带许可证文件。如果要把这套东西作为闭源商业软件分发，需要先确认 GPL 组件的分发方式和各模型许可是否符合要求。
-
-## 实测数据
-
-以下数字都在 RTX 5070 Ti 笔记本显卡上测得，测试期间显卡常被其他测试任务同时占用，用时偏保守。
-
-### 完整流程
-
-室外建筑样例，128 张 3072×2304 照片，标准档，开启抠除行人和法线先验，通过网页接口提交：
-
-| 阶段 | 用时 | 结果 |
-|---|---|---|
-| 采集 + 抠除行人 | 75 秒 | 22 张检测到行人，平均遮住 0.1% 的画面 |
-| 相机位姿 | 18 秒 | 128/128 张注册，重投影误差 0.52 像素 |
-| 法线先验 | 43 秒 | |
-| 训练 | 7 分 14 秒 | 100 万个高斯，236 MB |
-| 网格 | 约 2 分钟 | 28.9 万面带贴图网格 35 MB；碰撞网格 2 万面 0.5 MB |
-| 导出 | 9 秒 | 网页预览：完整 40.6 MB，轻量 5.2 MB |
-
-合计约 13 分钟（含排队等显卡的时间）。
-
-卡车样例视频（251 帧里挑出 100 张清晰帧，978×546），标准档（200 万高斯、3 万步），命令行运行，端到端 23 分钟：
-
-| 阶段 | 用时 | 结果 |
-|---|---|---|
-| 采集 + 抠除行人 | 165 秒 | 100 帧，其中 30 帧抠到了人 |
-| 相机位姿 | 12 秒 | 100/100 张注册，重投影误差 0.38 像素 |
-| 法线先验 | 26 秒 | |
-| 训练 | 9 分 18 秒 | 200 万个高斯，473 MB |
-| 网格 | 10 分钟 | 27.5 万面带贴图网格 21 MB；碰撞网格 2 万面 0.5 MB |
-| 导出 | 17 秒 | |
-
-- 这一组的视频帧很小，所以网格的稠密重建只用了 10 分钟；3072 像素级的照片集合在标准档约 30 分钟。
-- 这一组上的留出评测：校色后 PSNR 19.48、SSIM 0.711、LPIPS 0.255（13 张留出图）。它只在同一场景内可比，视频帧里有运动模糊，不要拿来和上面的照片场景比。
-- 网格的背景有缺口：远处的树、楼和天空在稠密重建里点很稀，网格不完整，而且仍有零星的碎片（近处一块大三角面没有过滤掉）。卡车本体的几何和贴图是好的。画面请用高斯。
-- 网格建面后会过滤"碎片面"：一张面在每张看见它的照片里边长都超过 30 像素，并且在看它最小的那张照片里离相机超过该照片表面中位距离的 2 倍，就删掉。卡车上这样删掉 1315 个面，天空被错误覆盖的比例从 0.59 降到 0.28，卡车本体不受影响；室外建筑和室内房间基本不变。只按尺寸过滤会把室内的白墙大平面也删掉（画面覆盖从 0.999 掉到 0.540），所以要加距离条件。
-- 室内房间的碎片过滤只在 225 张里取 60 张的稠密结果上验证过，没有用完整数据重跑。
-- 拍摄覆盖在这一组上：照片对准的范围里拍得充分 78%、一般 15%、不足 7%，范围外的街道标灰。卡车上货厢顶和车底下有薄弱点。栏杆、树叶这类透光的东西被当成实心，所以卡车上有 16% 的照片匹配被算成"被挡住"。
-
-### 训练选项
-
-留出八分之一照片评测，指标为校色后的 PSNR、SSIM（越高越好）和 LPIPS（越低越好），同一场景内可比，不同场景之间不可比。
-
-| 场景 | 选项 | PSNR | SSIM | LPIPS |
-|---|---|---|---|---|
-| 室外建筑 | 基线 | 23.61 | 0.786 | 0.232 |
-| | 法线先验 | 23.80 | 0.792 | 0.228 |
-| | 稠密点云初始化 | 22.80 | 0.778 | 0.229 |
-| | 法线 + 稠密点云 | 22.93 | 0.784 | 0.232 |
-| | 天空背景建模 | 23.47 | 0.771 | 0.249 |
-| | 精确相机校正 | 23.68 | 0.782 | 0.232 |
-| | 3DGUT 渲染 | 23.46 | 0.786 | 0.230 |
-| | 轻度杂斑抑制 | 23.68 | 0.785 | 0.233 |
-| 室内房间 | 基线 | 31.91 | 0.917 | 0.223 |
-| | 法线先验 | 32.00 | 0.918 | 0.226 |
-| | 稠密点云初始化 | 31.92 | 0.912 | 0.225 |
-| | 法线 + 稠密点云 | 32.15 | 0.915 | 0.224 |
-
-第二组，室外建筑，在"法线先验"基础上再改一项：
-
-| 选项 | 训练用时 | PSNR | SSIM | LPIPS |
-|---|---|---|---|---|
-| 法线先验（100 万、1.5 万步） | 约 7 分钟 | 23.80 | 0.792 | 0.228 |
-| mip 抗锯齿高斯 | 约 8 分钟 | 23.80 | 0.797 | 0.228 |
-| 200 万个高斯、3 万步 | 约 17 分钟 | 23.78 | 0.817 | 0.183 |
-| 球面基颜色（2 瓣） | 约 8 分钟 | 23.50 | 0.796 | 0.232 |
-| SSIM 损失 | 约 6 分钟 | 23.56 | 0.797 | 0.229 |
-| FLIP 损失 | 约 7 分钟 | 23.93 | 0.779 | 0.257 |
-| 按欠拟合程度挑视角 | 约 7 分钟 | 23.38 | 0.795 | 0.232 |
-
-- 法线先验在室外有改善、室内持平，所以默认开启。
-- 更多高斯和步数让 SSIM 和 LPIPS 都明显变好（细节更清楚、糊的地方更少），PSNR 持平，所以标准档改为 200 万 / 3 万步，高质量档 300 万 / 5 万步（高质量档的这组数字没有单独评测过）。mip 几乎不增加用时，三档都开。其余几项没有改善。
-- 稠密点云初始化在室外明显变差，室内结果有好有坏，所以默认关闭，保留开关。只测了两个场景，这个结论的依据有限。
-- 其余几项在室外场景上都没有改善，没有设为默认，可以通过 `train_args` 打开。
-
-### 不同场景和拍摄完整度（30 套样例）
-
-用 `data/samples` 里的 30 套公开素材（照片集和视频）按标准档（200 万高斯、3 万步、mip，开启抠图和法线先验）各跑一遍，留出八分之一照片评测（校色后指标）。这批测试用的是拆分工作流之前的旧流程，训练和位姿的算法与现在相同。下表只在同一行内可以互相比较：不同场景的画面难度差别很大，PSNR 不能跨场景比较，视频帧的留出图是训练帧的邻居，分数会偏高。
-
-| 场景类型 | 样例 | 注册 | PSNR | SSIM | LPIPS | 总用时 |
-|---|---|---|---|---|---|---|
-| 小物体绕拍 | bonsai_full（292 张） | 292/292 | 32.87 | 0.954 | 0.171 | 20 分 |
-| 小物体，弱光，低分辨率 | lom_bike_low（40 张，500×375） | 40/40 | 43.86 | 0.973 | 0.065 | 4 分 |
-| 局部细节（浮雕） | eth3d_relief（31 张，6048×4032） | 31/31 | 29.96 | 0.921 | 0.152 | 22 分 |
-| 大型物体绕拍 | tnt_ignatius（263 张） | 263/263 | 24.16 | 0.827 | 0.134 | 13 分 |
-| 反光车身，大物体 | refreal_sedan（158 张） | 158/158 | 25.81 | 0.727 | 0.226 | 14 分 |
-| 反光和透明物体 | refreal_gardenspheres（151 张） | 151/151 | 22.88 | 0.594 | 0.164 | 15 分 |
-| 室外全景 | mip360_garden（185 张） | 185/185 | 27.59 | 0.867 | 0.097 | 18 分 |
-| 室外建筑立面，运动模糊 | storefront_facade（200 张，竖屏 720×960） | 200/200 | 29.46 | 0.874 | 0.159 | 17 分 |
-| 整个室内房间 | mip360_room（200 张） | 200/200 | 31.57 | 0.922 | 0.180 | 22 分 |
-| 室内，大面积白墙 | eth3d_office（26 张，6048×4032） | 26/26 | 23.45 | 0.927 | 0.235 | 21 分 |
-| 朝前拍（LLFF） | llff_fern（20 张） | 20/20 | 25.16 | 0.843 | 0.173 | 23 分 |
-| 路人和移动物体 | otg_arcdetriomphe（226 张） | 226/226 | 20.89 | 0.829 | 0.213 | 23 分 |
-| 路人和移动物体（画面 16% 被抠掉） | otg_patio（125 张） | 125/125 | 18.63 | 0.739 | 0.261 | 17 分 |
-| 视频：手持绕拍物体（iPhone，15 秒） | vid_iphone_lego_orbit | 80/80 | 28.76 | 0.891 | 0.192 | 22 分 |
-| 视频：手持绕拍物体（Pixel 5，19 秒） | vid_pixel5_plant_orbit | 57/63 | 27.79 | 0.904 | 0.264 | 17 分 |
-| 视频：室内手持（13 秒） | vid_pixel5_table_indoor | 60/60 | 28.17 | 0.864 | 0.257 | 16 分 |
-| 视频：室外手持，运动模糊（12 秒） | vid_s20_bikerack_outdoor | 83/86 | 25.64 | 0.876 | 0.265 | 20 分 |
-| 视频：竖屏手机视频（13 秒） | vid_objectron_bike_portrait | 34/34 | 28.58 | 0.804 | 0.345 | 20 分 |
-| 视频：无人机环绕建筑（284 秒） | vid_telangana_drone | 90/144 | 29.55 | 0.899 | 0.157 | 21 分 |
-
-**拍摄完整度**。同一个场景（bonsai）从 292 张里抽出不同的子集，各自留出八分之一评测。子集的留出图都落在各自覆盖的范围内，所以这组数字衡量的是"这些照片能不能把自己覆盖的范围重建好"，不是"没拍到的地方能不能补出来"：
-
-| 子集 | 照片数 | PSNR | SSIM | LPIPS |
-|---|---|---|---|---|
-| 全部 | 292 | 32.87 | 0.954 | 0.171 |
-| 一半（隔张抽） | 146 | 31.75 | 0.945 | 0.177 |
-| 四分之一（隔三张抽） | 73 | 26.31 | 0.889 | 0.210 |
-| 只拍一侧的弧线 | 112 | 34.87 | 0.957 | 0.185 |
-| 只拍一个高度的一圈 | 67 | 31.89 | 0.938 | 0.159 |
-| 稀疏（30 张） | 30 | 16.10 | 0.502 | 0.541 |
-
-- 照片密度减半只掉 1.1 dB，减到四分之一掉 6.6 dB，30 张时重建基本不能用（SSIM 0.50）。相邻照片的间隔比照片总数更重要：67 张的一圈比 73 张隔三张抽的分数高得多。
-- 位姿计算对这几档都成功，重投影误差都在 0.3–0.4 像素。完整度不够时先坏的是高斯的画面，不是位姿。
-
-**观察到的规律**
-
-- 在这批素材里，位姿的注册率只在两类素材上掉下来：视频里相邻帧对不上的长视频（无人机视频 90/144），和弱光的小图（见下）。照片集全部注册成功。
-- 训练用时主要随照片分辨率走：500×375 的 40 张只要 2.5 分钟，1200 万到 2400 万像素的照片集约 20–22 分钟，其余 9–19 分钟。
-- 有人经过的两个场景在照片集里分数最低（patio 18.63，抠图遮掉了 15.8% 的画面；arcdetriomphe 20.89）。这批测试没有对比过"不抠图"，所以不能说抠图的作用有多大；能做到的话，拍摄时等人走开。
-- 大面积白墙（eth3d_office）的 LPIPS 较差（0.235），反光和透明物体（gardenspheres）的 SSIM 最低（0.594）。这批测试没有试过靠调参数改善。
-- 视频的 LPIPS 多数在 0.19–0.35，比照片集偏高（无人机视频 0.157 除外）。视频帧带运动模糊和滚动快门，竖屏视频最高（0.345，只有 34 张）。
-- 视频取帧会自动丢掉模糊帧：iPhone 视频 183 帧里留 80 张，无人机视频 144 张里有 90 张能注册。
-
-**网格**（标准档的高斯上再做稠密重建和网格，7 套）：
-
-| 样例 | 照片数 | 网格阶段用时 | 面数 | 保留的碎块数 |
-|---|---|---|---|---|
-| eth3d_relief | 31 | 7 分 | 30 万 | 2 |
-| vid_iphone_lego_orbit | 80 | 17 分 | 12.5 万 | 1 |
-| tnt_ignatius | 263 | 19 分 | 23.4 万 | 3 |
-| storefront_facade | 200 | 21 分 | 18.9 万 | 1 |
-| mip360_garden | 185 | 28 分 | 30 万 | 2 |
-| mip360_room | 200 | 38 分 | 30 万 | 1 |
-| bonsai_full | 292 | 39 分 | 30 万 | 7 |
-
-稠密重建的用时随照片数和分辨率增长，从 7 分钟到近 40 分钟。面数到上限 30 万的场景，网格是被减面到预算的，要更多细节需要提高面数预算（只重做网格阶段，不用重做稠密重建）。
-
-**这批测试里失败的素材，和用新流程重跑的结果**（标准模板，运行到高斯训练，"最少照片数"降到 5，留出八分之一评测）：
-
-| 样例 | 旧流程 | 新流程 | PSNR | SSIM | LPIPS |
-|---|---|---|---|---|---|
-| eth3d_door（7 张） | 被拒绝（不到 20 张） | 7/7 注册，重投影 0.60 像素 | 24.47 | 0.954 | 0.070 |
-| eth3d_lounge（10 张） | 被拒绝 | 6/10 注册，重投影 0.93 像素 | 18.67 | 0.783 | 0.310 |
-| eth3d_statue（11 张） | 被拒绝 | 11/11 注册，重投影 0.49 像素 | 21.95 | 0.842 | 0.289 |
-| llff_flower（34 张） | 稠密重建崩溃（GPS 定尺度使模型缩到极小） | 34/34 注册，位姿默认不再用 GPS | 27.37 | 0.841 | 0.221 |
-| lom_chair_low（48 张，500×375 弱光） | 位姿失败 | 仍失败：两种特征都是 0/48，不抠图也一样 | | | |
-| vid_senegal_house_walk（115 秒向前走的视频） | 位姿失败（146 张只有 74 张能对上） | 没有重跑，未解决；可能是向前走时相邻帧视角变化过小或画面变化大，未验证原因 | | | |
-
-- 7–11 张的稀疏照片集现在能跑：门 7 张全部注册，雕像 11 张全部注册，客厅 10 张只注册了 6 张。留出图只有一两张，指标的随机性很大，只能说明"能重建"，不能说明质量。
-- lom_chair_low 和 vid_senegal_house_walk 是新旧流程都没解决的位姿失败。同一数据集的 lom_bike_low 能注册 40/40，所以弱光小图并非一定失败，chair 失败的原因没有查明。
-
-### 功能开关实测
-
-用拆分后的新流程，一次只改一项，留出八分之一照片评测（校色后指标，同一场景内可比）。
-
-**抠图引擎**（有路人的 otg_patio，125 张，预览档高斯）：
-
-| 引擎 | 抠掉的画面 | 有抠到人的照片 | 抠图用时 | PSNR | SSIM | LPIPS |
-|---|---|---|---|---|---|---|
-| SAM 3 | 15.83% | 104 张 | 74 秒 | 18.74 | 0.739 | 0.268 |
-| SAM 2.1 + Grounding DINO | 16.34% | 113 张 | 58 秒 | 18.72 | 0.738 | 0.269 |
-
-两个引擎在这一组上结果相当，SAM 2.1 略快、多抠到 9 张照片里的人，训练指标没有差别。默认仍是 SAM 3；SAM 2.1 是 Apache 2.0 许可，要避开 SAM 3 的许可时可以换用。只测了一个场景。
-
-**稠密点云种子（RoMa）**，预览档高斯，开和关各一次：
-
-| 场景 | 种子 | 额外用时 | PSNR | SSIM | LPIPS |
-|---|---|---|---|---|---|
-| eth3d_relief（31 张） | 关 | | 30.24 | 0.901 | 0.213 |
-| | 开（78 万个点） | 83 秒 | 28.92 | 0.901 | 0.186 |
-| bonsai_quarter（73 张） | 关 | | 27.19 | 0.898 | 0.179 |
-| | 开（140 万个点） | 95 秒 | 26.62 | 0.894 | 0.180 |
-
-两个场景的 PSNR 都下降（-1.3、-0.6 dB），LPIPS 在浮雕上变好、在盆景上持平，还要多花一分半钟，所以默认仍然关闭，保留开关。和前面室外、室内两个场景的结论一致。
-
-**模板的实际用时**（同一台电脑，新流程）：
-
-| 模板 | 素材 | 总用时 | 说明 |
-|---|---|---|---|
-| 快速预览（含网格） | eth3d_relief，31 张 | 4.8 分钟 | 稠密 70 秒，网格 26 秒 |
-| 快速预览（含网格） | mip360_room，200 张 | 4.6 分钟 | 稠密 128 秒（取 60 张），网格 25 秒；同一场景旧流程的网格阶段是 38 分钟 |
-| 完整 | eth3d_relief，31 张 | 31.4 分钟 | 训练 22 分，稠密 6.7 分，网格 50 秒；101.6 万个稠密点，30 万面、4096 贴图 |
-| 高质量 | bonsai_half，146 张 | 36.6 分钟 | 训练 31 分；PSNR 31.79、SSIM 0.945、LPIPS 0.172，标准模板同一素材是 31.75、0.945、0.177（17 分钟） |
-
-### 位姿计算的特征
-
-同一组 36 张照片：常规特征（SIFT）注册 36/36，误差 0.40 像素；ALIKED + LightGlue 注册 36/36，误差 0.81 像素。常规特征更精确，所以先用它，失败时才换学习型特征。
-
-### 网格
-
-室外建筑，30 万面 / 4096 贴图，从数据集相机渲染网格和照片比较。"非天空覆盖"是照片里非天空部分被网格盖住的比例，"天空覆盖"是天空被错误盖住的比例（越低越好），"清晰度"以照片为 1：
-
-| 方案 | 保留碎块 | 非天空覆盖 | 天空覆盖 | 颜色差 | 清晰度 | 用时 |
-|---|---|---|---|---|---|---|
-| 原方案：Spirula 从高斯提取 + 高斯颜色贴图 | 29 | 88.9% | 80.5% | 16.6 | 0.55 | 约 3.5 分钟 |
-| Spirula 提取 + 照片贴图 | 23 | 88.7% | 80.8% | 17.7 | 0.93 | 约 3 分钟 |
-| **现方案：COLMAP 稠密重建 + 照片贴图** | **10** | **94.1%** | **21%** | **16.6** | **0.91** | **约 29 分钟** |
-| 同一点云改用 Poisson 建面 | 23 | — | — | 16.7 | 0.92 | 再加 12 分钟，表面发胀 |
-
-- 在 16 张贴图没用到的照片上比较，照片贴图和高斯颜色贴图的颜色差相同（18.13 对 18.12），清晰度 0.95 对 0.56。
-- 单独为网格训练一份高斯（Spirula 的 meshing 预设）反而更差：画面覆盖 72–88%，原方案是 85–98%。
-- COLMAP 的减面在渲染上和本程序原来的 Python 减面看不出差别，用时 7 秒对 25 秒，所以改用 COLMAP 的。
-- 各档位在同一份稠密结果上：15 万面 GLB 9.9 MB，30 万面 26.2 MB，60 万面 69.6 MB；稠密之后的减面和贴图约 1–1.5 分钟。室内房间（225 张照片中取 200 张）标准档网格步骤约 29 分钟，22 MB。
-
-### 抠图
-
-- SAM 3 的视频跟踪模式在样例视频上把卡车也逐渐抠掉了（个别帧只剩 9% 的画面），逐张处理则只抠到人。所以视频帧也逐张处理。
-- 网页预览"完整"档保留了全部三阶随视角变化的颜色，并用 8 位精度存储：SPZ 格式惯用的 5/4 位精度会把这些测试场景里大部分高光信息抹掉。
+[MIT](LICENSE) for this repository's code. Downloaded programs and models keep their own licenses, see
+[THIRD_PARTY.md](THIRD_PARTY.md).
