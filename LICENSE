@@ -19,9 +19,3 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
-
-This license covers the code in this repository written for Scan3D. It does not
-cover the programs and models that setup downloads (Spirula Studio, COLMAP,
-Python, neural network weights), which keep their own licenses, nor the files in
-app/web/vendor, which keep the licenses shipped next to them. See
-THIRD_PARTY.md.
