@@ -612,7 +612,7 @@ html.viewer-expanded { overflow: hidden; }
 .node-state { display: flex; align-items: center; gap: 5px; font-size: 0.8125rem; line-height: 1.3; min-height: 20px; color: var(--text-2); white-space: nowrap; }
 .node-ico { width: 16px; height: 16px; flex: 0 0 auto; }
 .node-word { overflow: hidden; text-overflow: ellipsis; font-weight: 500; }
-.node-sum { font-size: 0.75rem; line-height: 1.35; color: var(--text-2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.node-sum { font-size: 0.75rem; line-height: 1.35; color: var(--text-2); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow-wrap: anywhere; }
 .node-bar { position: absolute; left: 0; right: 0; bottom: 0; height: 5px; border-radius: 0; background: var(--neutral-soft); overflow: hidden; }
 .node-fill { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.3s ease; }
 .node-bar.is-indeterminate .node-fill { width: 35%; animation: slide 1.6s ease-in-out infinite; transition: none; }

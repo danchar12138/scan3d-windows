@@ -14,7 +14,7 @@
   var S3 = window.S3;
   var $ = S3.$, el = S3.el, setText = S3.setText;
 
-  var NODE_H = 98, GAP_X = 20, GAP_Y = 14, MIN_W = 100, MAX_W = 158, PAD = 6;
+  var NODE_H = 116, GAP_X = 20, GAP_Y = 14, MIN_W = 100, MAX_W = 158, PAD = 6;
   // Which row of the graph a stage sits in (columns come from the dependencies). A stage that is
   // not named here goes into the row of its first dependency.
   var LANE = { normals: 1, dense_seed: 2, dense: 3, mesh: 3 };
