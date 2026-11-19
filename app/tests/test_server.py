@@ -2647,12 +2647,12 @@ class TemplateTests(ServerCase):
         for stage, want in zip(schema["stages"], workflow.schema()["stages"]):
             self.assertEqual(stage, want)       # exactly workflow.schema(): no list of our own
         self.assertEqual(schema["default_template"], "standard")
-        self.assertEqual(self.ids(schema), ["preview", "standard", "high", "full", "mesh_only"])
-        standard = schema["templates"][1]
+        self.assertEqual(self.ids(schema), ["preview", "preview_mesh", "standard", "high", "full", "mesh_only"])
+        standard = schema["templates"][2]
         self.assertEqual((standard["label"], standard["builtin"]), ("标准（高斯）", True))
         self.assertEqual(standard["enabled"], ["ingest", "masks", "sfm", "normals", "train",
                                                "coverage", "export"])
-        self.assertEqual(schema["templates"][4]["enabled"],
+        self.assertEqual(schema["templates"][5]["enabled"],
                          ["ingest", "masks", "sfm", "dense", "mesh", "export"])
         self.assertEqual([f["id"] for f in schema["features"]],
                          ["masks", "normals", "dense_seed", "sfm"])
@@ -2670,7 +2670,7 @@ class TemplateTests(ServerCase):
                 "stages": {"train": {"params": {"iterations": 9000}}, "masks": {"enabled": False}}}
         status, view = self.save("mine", body)
         self.assertEqual(status, 200, view)
-        self.assertEqual(self.ids(view), ["preview", "standard", "high", "full", "mesh_only", "mine"])
+        self.assertEqual(self.ids(view), ["preview", "preview_mesh", "standard", "high", "full", "mesh_only", "mine"])
         self.assertEqual(view["default_template"], "standard")
         mine = view["templates"][-1]
         self.assertEqual({k: mine[k] for k in ("id", "label", "desc", "builtin", "base")},
@@ -2707,7 +2707,7 @@ class TemplateTests(ServerCase):
         # deleting it: jobs made from it keep their workflow, the default goes back
         status, view = self.api("DELETE", "/api/templates/mine")
         self.assertEqual(status, 200, view)
-        self.assertEqual(self.ids(view), ["preview", "standard", "high", "full", "mesh_only"])
+        self.assertEqual(self.ids(view), ["preview", "preview_mesh", "standard", "high", "full", "mesh_only"])
         self.assertEqual(view["default_template"], "standard")
         self.assertNotIn("default_template", self.user)
         view = self.job(job)
@@ -2997,8 +2997,8 @@ class WorkflowTests(ServerCase):
 
         # once everything is done there is nothing to do, unless something is forced
         self.run_to_done(job)
-        status, error = self.api("POST", "/api/jobs/%s/plan" % job, {})
-        self.assertEqual((status, error["error"]), (400, "nothing_to_do"))
+        status, empty = self.api("POST", "/api/jobs/%s/plan" % job, {})
+        self.assertEqual((status, empty["steps"], empty["nothing_to_do"]), (200, [], True))
         status, error = self.api("POST", "/api/jobs/%s/run" % job, {})
         self.assertEqual((status, error["error"]), (400, "nothing_to_do"))
         self.assertEqual(self.job(job)["state"], "done")

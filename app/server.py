@@ -174,7 +174,9 @@ the extra fields named below).
                                                is queued: {"steps": [{stage, reason (requested |
                                                needed | forced | downstream), label}],
                                                "licences": [...], "models_needed": [...]} for
-                                               the stages of the plan; the plan error as in /run
+                                               the stages of the plan; the plan error as in /run,
+                                               except that an empty plan (everything done) is a
+                                               200 with {"steps": [], "nothing_to_do": true}
     POST   /api/jobs/<job>/stages/<stage>/reset
                                                delete that stage's record and what it alone
                                                produced; stages after it show `stale`.
@@ -2049,10 +2051,10 @@ class App:
             actions.append("open_folder")
             view["input_path"] = (meta or {}).get("input_path")
         view["actions"] = actions
+        view["cancelling"] = state in ACTIVE_STATES and os.path.exists(
+            self.runs_dir / job / "cancel")
 
         if detail:
-            view["cancelling"] = state in ACTIVE_STATES and os.path.exists(
-                self.runs_dir / job / "cancel")
             count, total = self.list_uploads(job)
             view["uploads"] = {"count": count, "bytes": total}
             view["output_files"] = self.output_files(job, status)
@@ -3134,7 +3136,14 @@ class Handler(BaseHTTPRequestHandler):
             app.require_job(job)
             body = self._read_json_body()
             to, only, force = parse_run_request(body)
-            self._send_json(app.plan_run(job, to, only, force))
+            try:
+                self._send_json(app.plan_run(job, to, only, force))
+            except ApiError as exc:
+                if exc.code != "nothing_to_do":
+                    raise
+                # a plan that is empty is an answer, not a failure (/run still says 400)
+                self._send_json({"steps": [], "nothing_to_do": True, "message": exc.message,
+                                 "licences": [], "models_needed": []})
         elif rest == ["workflow"]:
             self._require_method("PUT")
             app.require_job(job)

@@ -287,7 +287,7 @@ input[type="text"]::placeholder { color: var(--text-2); opacity: 0.75; }
 }
 .job-link:hover { border-color: var(--border-strong); }
 .job-item.is-current .job-link { border-color: var(--accent); box-shadow: inset 3px 0 0 var(--accent); }
-.job-item:has(.job-act) .job-link { padding-right: 52px; }
+.job-item:has(.job-act) .job-link { padding-bottom: 50px; }
 .job-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .job-sub { grid-column: 1 / -1; color: var(--text-2); font-size: 0.8125rem; line-height: 1.45; overflow-wrap: anywhere; }
 .job-item .progress { grid-column: 1 / -1; height: 4px; margin-top: 2px; }
@@ -301,9 +301,12 @@ input[type="text"]::placeholder { color: var(--text-2); opacity: 0.75; }
 .dot.s-pending { background: var(--border); }
 .dot.s-disabled { background: transparent; box-shadow: inset 0 0 0 1px var(--border); }
 .job-act {
-  position: absolute; right: 8px; top: 8px; width: 38px; height: 38px; display: grid; place-items: center;
-  color: var(--danger); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 50%; cursor: pointer; padding: 0;
+  position: absolute; right: 8px; bottom: 8px; min-height: 34px; display: inline-flex; align-items: center; gap: 6px;
+  padding: 0 12px 0 10px; font: inherit; font-size: 0.8125rem; font-weight: 500; white-space: nowrap;
+  color: var(--danger); background: var(--surface); border: 1px solid var(--border-strong); border-radius: 999px; cursor: pointer;
 }
+.job-act:disabled { opacity: 0.7; cursor: default; }
+.job-act svg { width: 14px; height: 14px; }
 .job-act:hover { background: var(--danger-soft); }
 .job-act.is-armed { background: var(--danger); color: var(--surface); border-color: var(--danger); }
 
@@ -764,3 +767,11 @@ input[aria-invalid="true"] { border-color: var(--danger); }
 }
 .graph-card { padding-left: 18px; padding-right: 18px; }
 .quality-runs { color: var(--accent-strong); }
+
+/* the page's own tooltip (see S3.setTip): shown at once, in the page's colours */
+.s3-tip {
+  position: fixed; z-index: 1000; max-width: min(300px, calc(100vw - 16px)); padding: 7px 10px; pointer-events: none;
+  font-size: 0.8125rem; line-height: 1.45; color: var(--text); background: var(--surface); border: 1px solid var(--border-strong);
+  border-radius: var(--radius-s); box-shadow: 0 6px 22px rgba(0, 0, 0, 0.28); opacity: 0; visibility: hidden; transition: opacity 0.08s;
+}
+.s3-tip.is-on { opacity: 1; visibility: visible; }

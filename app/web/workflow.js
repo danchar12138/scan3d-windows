@@ -366,7 +366,7 @@
       setText(n.word, word);
       var sum = nodeSummary(job, s, st, info, forced ? needed : null);
       setText(n.sum, sum);
-      n.main.title = (sum ? sum + "。" : "") + meta.help;
+      S3.setTip(n.main, (sum ? sum + "。" : "") + meta.help);
       // progress bar
       var showBar = st === "running";
       n.track.hidden = !showBar;
@@ -391,7 +391,7 @@
         : forced ? "「" + S3.joinLabels(needed) + "」需要它，所以一定会运行"
         : locked ? "任务正在运行，现在不能改开关"
         : on ? "点一下关闭" : "点一下打开";
-      n.sw.title = s.label + "：" + why;
+      S3.setTip(n.sw, s.label + "：" + why);
       n.sw.setAttribute("aria-label", "运行「" + s.label + "」：" + (on ? "已打开" : "已关闭") + (lockedOn ? "（锁定：" + why + "）" : ""));
       n.state = st;
     });
@@ -453,6 +453,7 @@
     entry = ctx.plans[key] = { loading: true };
     var jobName = ctx.name;
     S3.api("POST", S3.jobUrl(jobName, "/plan"), body).then(function (res) {
+      if (res.nothing_to_do) { return { ok: false, code: "nothing_to_do", message: res.message }; }
       return { ok: true, steps: res.steps || [], licences: res.licences || [], models: res.models_needed || [] };
     }, function (err) {
       return { ok: false, code: err.code || (err.data && err.data.error) || "", message: err.message };
@@ -548,7 +549,7 @@
     var result = busy(job) ? null : planFor(PLAN_KINDS.all());
     var blocked = !busy(job) && result && !result.loading && !result.ok;
     btn.disabled = busy(job) || !!blocked;
-    btn.title = busy(job) ? "正在运行" : blocked ? result.message : "";
+    S3.setTip(btn, busy(job) ? "正在运行" : blocked ? result.message : "");
   }
 
   // ------------------------------------------------------------------ changing the workflow
@@ -1245,7 +1246,7 @@
       var li = el("li", "legend-item s-" + st);
       li.appendChild(S3.icon(meta.icon, "legend-ico"));
       li.appendChild(el("span", null, meta.word));
-      li.title = meta.help;
+      S3.setTip(li, meta.help);
       legend.appendChild(li);
     });
     $("wf-template-btn").addEventListener("click", function () { wf.toggleTemplates(!ctx.tplOpen); });

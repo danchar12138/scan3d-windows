@@ -244,6 +244,16 @@ TEMPLATES = {
             "train": {"params": {"max_image_size": 1280, "iterations": 7000, "cap_max": 500000}},
         },
     },
+    "preview_mesh": {
+        "label": "快速预览（含网格）", "desc": "快速预览的高斯，再用低配的稠密重建做一个小网格，用来先看网格能不能用。",
+        "stages": {
+            "train": {"params": {"max_image_size": 1280, "iterations": 7000, "cap_max": 500000}},
+            "dense": {"enabled": True, "params": {"image_size": 800, "max_images": 60,
+                                                  "source_images": 6, "geom_consistency": False}},
+            "mesh": {"enabled": True, "params": {"visual_faces": 100000, "collision_faces": 10000,
+                                                 "texture_size": 2048}},
+        },
+    },
     "standard": {
         "label": "标准（高斯）", "desc": "抠人 + 法线先验，200 万高斯、3 万步。不做网格。",
         "stages": {

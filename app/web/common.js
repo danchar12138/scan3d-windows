@@ -176,6 +176,55 @@
   };
 
   // First click arms the button, a second click within a few seconds runs the action.
+  // One tooltip for the whole page. The browser's own `title` tooltip waits about a second and
+  // flashes an empty dark box first, so every hint is set with S3.setTip and drawn here at once.
+  S3.setTip = function (node, text) {
+    if (text) { node.setAttribute("data-tip", text); } else { node.removeAttribute("data-tip"); }
+  };
+  (function () {
+    var tip = null, target = null, timer = null;
+    function hide() {
+      clearTimeout(timer); timer = null; target = null;
+      if (tip) { tip.classList.remove("is-on"); }
+    }
+    function place() {
+      if (!target || !tip) { return; }
+      tip.textContent = target.getAttribute("data-tip") || "";
+      if (!tip.textContent) { hide(); return; }
+      var r = target.getBoundingClientRect(), w = document.documentElement.clientWidth;
+      tip.style.left = "0px"; tip.style.top = "0px";
+      tip.classList.add("is-on");
+      var t = tip.getBoundingClientRect();
+      var left = Math.max(8, Math.min(w - t.width - 8, r.left + r.width / 2 - t.width / 2));
+      var top = r.bottom + 8;
+      if (top + t.height > window.innerHeight - 8) { top = Math.max(8, r.top - t.height - 8); }
+      tip.style.left = Math.round(left) + "px"; tip.style.top = Math.round(top) + "px";
+    }
+    function show(node, delay) {
+      if (!tip) {
+        tip = document.createElement("div");
+        tip.className = "s3-tip"; tip.setAttribute("role", "tooltip");
+        document.body.appendChild(tip);
+      }
+      if (node === target) { return; }
+      hide(); target = node;
+      timer = setTimeout(place, delay);
+    }
+    document.addEventListener("pointerover", function (e) {
+      if (e.pointerType && e.pointerType !== "mouse") { return; }
+      var n = e.target.closest ? e.target.closest("[data-tip]") : null;
+      if (n) { show(n, 120); } else { hide(); }
+    });
+    document.addEventListener("pointerdown", hide);
+    document.addEventListener("scroll", hide, true);
+    document.addEventListener("focusin", function (e) {
+      var n = e.target.closest ? e.target.closest("[data-tip]") : null;
+      if (n && e.target.matches && e.target.matches(":focus-visible")) { show(n, 0); }
+    });
+    document.addEventListener("focusout", hide);
+    document.addEventListener("keydown", function (e) { if (e.key === "Escape") { hide(); } });
+  })();
+
   S3.confirmButton = function (button, armedText, action) {
     var timer = null, label = "";
     function disarm() {

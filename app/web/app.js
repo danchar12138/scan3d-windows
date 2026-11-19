@@ -673,7 +673,7 @@
       var cls = "dot" + (st ? " s-" + st : "");
       S3.setClass(row.dotEls[i], cls);
       var tip = s.label + (st ? "：" + (S3.STAGE_STATE[st] ? S3.STAGE_STATE[st].word : st) : "");
-      if (row.dotEls[i].title !== tip) { row.dotEls[i].title = tip; }
+      if (row.dotEls[i].getAttribute("data-tip") !== tip) { S3.setTip(row.dotEls[i], tip); }
     });
   }
 
@@ -686,20 +686,28 @@
       if (kind === "stop") {
         var b = el("button", "job-act");
         b.type = "button";
+        var label = el("span", "job-act-label", "停止");
         b.appendChild(S3.icon("stop"));
-        b.appendChild(el("span", "visually-hidden", "停止任务"));
-        b.title = "停止这个任务";
+        b.appendChild(label);
         var timer = null;
+        function disarm() { timer = null; b.classList.remove("is-armed"); label.textContent = "停止"; }
         b.addEventListener("click", function () {
-          if (timer === null) {      // first click arms
+          if (b.disabled) { return; }
+          if (timer === null) {      // first click arms, and says so in words
             b.classList.add("is-armed");
-            b.title = "再点一次确认停止";
-            timer = setTimeout(function () { timer = null; b.classList.remove("is-armed"); b.title = "停止这个任务"; }, 3500);
+            label.textContent = "确认停止？";
+            timer = setTimeout(disarm, 4000);
             return;
           }
           clearTimeout(timer); timer = null;
-          api("POST", jobUrl(row.jobName, "/cancel"), {}).then(poll, function (err) { showBanner("auth", err.message); });
+          b.disabled = true; label.textContent = "正在停止…";
+          row.cancelAsked = Date.now();
+          row.sub.textContent = "正在停止，等当前这一步结束…";
+          api("POST", jobUrl(row.jobName, "/cancel"), {}).then(poll, function (err) {
+            b.disabled = false; row.cancelAsked = 0; disarm(); showBanner("auth", err.message);
+          });
         });
+        b.addEventListener("blur", function () { if (timer !== null) { clearTimeout(timer); disarm(); } });
         row.act = b;
         row.li.appendChild(b);
       }
@@ -715,7 +723,9 @@
       if (!row) { row = makeJobRow(job.job); state.rows.set(job.job, row); }
       row.jobName = job.job;
       setBadge(row.badge, job.state);
-      setText(row.sub, jobSummary(job));
+      var active = job.state === "running" || job.state === "queued";
+      if (!active) { row.cancelAsked = 0; }
+      setText(row.sub, active && (row.cancelAsked || job.cancelling) ? "正在停止，等当前这一步结束…" : jobSummary(job));
       updateDots(row, job);
       var p = stageProgressOf(job);
       S3.setClass(row.progress, "progress" + (job.state === "running" && p === null ? " is-indeterminate" : ""));
