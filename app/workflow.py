@@ -102,8 +102,8 @@ STAGES = {
         "params": [
             _param("min_images", "最少照片数", "int", 20, minimum=3, maximum=200,
                    help="少于这个数任务直接停止，位姿在照片太少时容易失败。"),
-            _param("video_frames", "视频取帧数", "int", 240, minimum=30, maximum=1000,
-                   help="视频最多挑出多少张画面。照片不受影响。"),
+            _param("video_frames", "视频取帧数", "int", 480, minimum=30, maximum=1000,
+                   help="视频最多挑出多少张画面（实际数量还取决于画面变化和清晰度）。照片不受影响。"),
             _param("blur_reject_px", "丢弃模糊画面（像素）", "float", 2.0, minimum=0, maximum=20,
                    help="运动模糊超过这个像素数的视频帧会被丢掉；0 表示不筛。"),
             _param("max_long_side", "图片长边上限", "choice", 3840,
@@ -255,17 +255,15 @@ TEMPLATES = {
         },
     },
     "standard": {
-        "label": "标准（高斯）", "desc": "抠人 + 法线先验，200 万高斯、3 万步。不做网格。",
+        "label": "标准（高斯）", "desc": "法线先验，200 万高斯、3 万步。不做网格。",
         "stages": {
-            "masks": {"enabled": True}, "normals": {"enabled": True},
-            "coverage": {"enabled": True},
+            "normals": {"enabled": True}, "coverage": {"enabled": True},
         },
     },
     "high": {
         "label": "高质量（高斯）", "desc": "300 万高斯、5 万步，3072 像素训练。不做网格。",
         "stages": {
-            "masks": {"enabled": True}, "normals": {"enabled": True},
-            "coverage": {"enabled": True},
+            "normals": {"enabled": True}, "coverage": {"enabled": True},
             "train": {"params": {"max_image_size": 3072, "iterations": 50000,
                                  "cap_max": 3000000}},
         },
@@ -273,15 +271,14 @@ TEMPLATES = {
     "full": {
         "label": "完整（高斯 + 网格）", "desc": "标准高斯，再做稠密重建和带贴图的网格，要一个多小时。",
         "stages": {
-            "masks": {"enabled": True}, "normals": {"enabled": True},
-            "coverage": {"enabled": True}, "dense": {"enabled": True}, "mesh": {"enabled": True},
+            "normals": {"enabled": True}, "coverage": {"enabled": True},
+            "dense": {"enabled": True}, "mesh": {"enabled": True},
         },
     },
     "mesh_only": {
         "label": "只要网格", "desc": "不训练高斯，只做稠密重建和网格（网格坐标是照片坐标系）。",
         "stages": {
-            "masks": {"enabled": True}, "train": {"enabled": False},
-            "dense": {"enabled": True}, "mesh": {"enabled": True},
+            "train": {"enabled": False}, "dense": {"enabled": True}, "mesh": {"enabled": True},
         },
     },
 }

@@ -9,7 +9,7 @@
 ![GPU: NVIDIA CUDA](https://img.shields.io/badge/GPU-NVIDIA%20CUDA-76B900)
 ![Python 3.12 embedded](https://img.shields.io/badge/python-3.12%20(bundled)-blue)
 
-![Scan3D workflow graph](docs/images/job.png)
+![Scan3D scan page: progress, results, downloads](docs/images/job.png)
 
 Scan3D turns a handful of photos or a short video into a 3D scene you can drop into a game
 engine or view in the browser. It wires [Spirula Studio](https://github.com/harry7557558/spirula-studio)
@@ -49,11 +49,14 @@ space per scan.
    (or Code → Download ZIP and extract it).
 2. Double-click **`Scan3D.cmd`**. First run downloads Python, Spirula Studio and COLMAP (about 1 GB;
    re-run to resume if the network drops). Allow Windows Firewall on private networks if asked.
-3. Your browser opens. Click **New job**, drop in photos or a video, pick a template, press **Run**.
+3. Your browser opens. Drop in photos or a video, pick what you want (Quick preview / Standard / Full with mesh; more options under "More options"), press **Start scan**. Masking out people or keeping only one object is optional and off by default.
+4. The scan page shows progress, then the result: Gaussian, mesh and capture coverage tabs (collision mesh, overlay and report under "More"), and a **Download** menu. Switches and parameters of every step are under "Adjust each step" at the bottom.
 
 You can also drag a photo folder or a video onto `Scan3D.cmd` to process it with the standard template.
 
-![New job page](docs/images/home.png)
+![New scan page](docs/images/home.png)
+
+![Adjust each step: the workflow graph](docs/images/advanced.png)
 
 ### Templates
 
@@ -61,10 +64,10 @@ You can also drag a photo folder or a video onto `Scan3D.cmd` to process it with
 |---|---|---|
 | Quick preview | splat only, 7k steps | a few minutes |
 | Quick preview + mesh | quick splat, then a cheap dense reconstruction and a small mesh | about 5 min (31–200 photos) |
-| Standard | + masking of passers-by, normal prior, capture coverage, 2M Gaussians, 30k steps | about 13–23 min |
+| Standard | normal prior, capture coverage, 2M Gaussians, 30k steps | about 13–23 min |
 | High | 3M Gaussians, 50k steps | about 2× standard for almost the same score; only for close-up inspection |
 | Full | standard + dense reconstruction + mesh | 30 min to over an hour |
-| Mesh only | masking, poses, dense reconstruction, mesh (no splat) | depends on photo count |
+| Mesh only | poses, dense reconstruction, mesh (no splat) | depends on photo count |
 
 Templates are starting points; every parameter of every stage can be changed per job, and you can
 save your own. Timings are from one machine; see [docs/benchmarks.md](docs/benchmarks.md).
@@ -117,7 +120,7 @@ from the Models panel), and the licence you accept by enabling it is recorded in
 
 | Stage | Model | Size | License | Default |
 |---|---|---|---|---|
-| Masks (people) | SAM 3 | 1.75 GB | [SAM License](https://github.com/facebookresearch/sam3/blob/main/LICENSE) | on in Standard/High/Full |
+| Masks (people) | SAM 3 | 1.75 GB | [SAM License](https://github.com/facebookresearch/sam3/blob/main/LICENSE) | off; used when you choose "remove moving people" |
 | Masks (alternative) | SAM 2.1 + Grounding DINO | 430 + 890 MB | Apache-2.0 | off; switch engine in the node |
 | Masks (subject only) | BiRefNet | 424 MB | [MIT](https://github.com/ZhengPeng7/BiRefNet/blob/main/LICENSE) | when "subject only" is chosen |
 | Normal prior | MoGe-2 (ViT-B / ViT-L) | 400 MB / 1.3 GB | see [model page](https://huggingface.co/Ruicheng/moge-2-vitb-normal-onnx) | on in Standard/High/Full |
@@ -129,16 +132,28 @@ The full list of third-party programs and libraries is in [THIRD_PARTY.md](THIRD
 
 ## Capture tips
 
-Capture matters more than any parameter.
+Capture matters more than any parameter: **a blurred photo cannot be repaired by any later step** (measurements in [docs/benchmarks.md](docs/benchmarks.md), "Blurred inputs").
 
-- Move slowly around the scene; neighbouring photos should overlap at least 70%.
-- Shoot a ring at eye level and another from above.
-- 50–300 photos, or a 1–2 minute video (sharp frames are picked automatically). JPG preferred;
-  HEIC, WebP and TIFF are skipped.
-- Even light; avoid shooting into windows or lamps; lock exposure and focus if you can.
-- Passers-by are masked automatically, but fewer is better. White walls, glass, mirrors and shiny
-  metal reconstruct poorly, as with all photogrammetry-style methods.
-- After a scan, open **Capture coverage**: orange means too few photos or one direction only. Shoot there and re-scan with old and new photos together.
+**Photos (recommended)**
+
+- **Plenty of light.** Indoors, switch the lights on; by day, stand near a window. In dim light the phone slows the shutter and hand shake blurs the shot.
+- **Normal photo mode, not portrait mode.** Background blur also leaves part of the object itself out of focus. Tap the object to focus, then long-press to lock focus and exposure.
+- **Step back.** The object should fill a third to a half of the frame. Very close up the depth of field is shallow and half the object is soft.
+- **One shot at a time.** Stand still, wait a second after each shot, move a small step between shots.
+- **Enough photos.** 50–150, at least one full circle around the object, one ring at eye level and one from above, neighbouring photos overlapping by 70% or more. Too few photos clearly hurts.
+- **White or shiny objects:** put a patterned sheet of paper or cloth under them so poses can be found.
+- JPG preferred (PNG and BMP also work); HEIC, WebP and TIFF are skipped.
+
+**Video**
+
+- Plenty of light, lock focus and exposure, use the main camera without zoom; choose H.264 as the video format (best compatibility).
+- Walk slowly around the object like a stroll; do not spin on the spot, stop suddenly or turn back.
+- 1–2 minutes, one circle is enough; for more coverage do another circle at a different height.
+- Hold the phone with both hands, elbows against the body. Blurry frames are dropped automatically, but a video that is blurry throughout cannot be saved.
+
+**After the scan**, open **Capture coverage**: orange means too few photos or one direction only. Shoot there and re-scan with old and new photos together. White walls, glass, mirrors and shiny metal reconstruct poorly, as with all photogrammetry-style methods. Passers-by can be masked out by choosing "remove moving people" in the new-scan form, but fewer is better.
+
+> Dim light (slow shutter), wide aperture (shallow depth of field) and too few photos were measured in this project; the rest is general 3D-capture experience that was not verified item by item here.
 
 ## Command line
 
@@ -173,6 +188,7 @@ Highlights (full tables in [docs/benchmarks.md](docs/benchmarks.md), in Chinese;
 - Verified on a single PC and public datasets; not on your phone footage, a real phone over Wi-Fi, or other GPUs.
 - Dense reconstruction (and so the mesh) needs an NVIDIA GPU: COLMAP's dense matcher is CUDA-only.
 - Generated GLBs pass structure checks and render in the built-in viewer; they have **not** been import-tested in Unity, Unreal or Blender.
+- Blurred photos cannot be repaired. Training-time deblurring, 2D deblurring and sharpening, diffusion repair and super-resolution were evaluated: none has a ready-to-use build for this Windows setup, or the licence forbids it, or it measured worse (see [docs/benchmarks.md](docs/benchmarks.md)). Avoid blur when shooting.
 - Masking depends on the prompt; too broad a prompt can mask static content.
 - Lighting is baked in; the scene cannot be relit. Unphotographed areas are empty.
 - The mesh is coarser than the splat: big plain walls become a few large planes, foliage and thin bars stick together. Use the splat for visuals.

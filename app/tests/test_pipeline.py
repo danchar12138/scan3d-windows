@@ -275,7 +275,7 @@ class StagesTest(PipelineCase):
     # ---- the whole run
 
     def test_photos_run_through_every_stage_and_leave_the_outputs(self):
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)           # masks are opt-in
         status = self.status()
         self.assertEqual((status["state"], status["stage"], status["error"]), ("done", None, None))
         self.assertEqual(self.order(), ["sam track", "sfm auto", "geometry", "train"])
@@ -311,6 +311,16 @@ class StagesTest(PipelineCase):
                 pipeline.input_signature(self.photos))[sid])
         self.assertTrue(self.job_file("logs", "pipeline.log").is_file())
 
+    def test_the_standard_template_runs_without_masks_unless_asked(self):
+        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.order(), ["sfm auto", "geometry", "train"])
+        self.assertEqual(self.status()["run"]["plan"],
+                         ["ingest", "sfm", "normals", "train", "coverage", "export"])
+        self.assertEqual(self.states()["masks"], "disabled")
+        self.assertFalse(self.has_record("masks"))
+        self.assertIn("--no-masks", self.spirula.commands("sfm", "auto")[0])
+        self.assertFalse(models._ACCEPTED_FILE.exists())              # no SAM licence was taken
+
     def test_the_coverage_stage_reads_the_trained_splat_and_the_cameras(self):
         self.assertEqual(self.run_job(), 0)
         splat, images, cameras, kw = self.coverage_calls[0]
@@ -321,7 +331,7 @@ class StagesTest(PipelineCase):
         self.assertEqual(self.record("coverage")["result"]["regions"], 2)
 
     def test_gpu_stages_hold_the_lock_and_the_others_do_not(self):
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         locked = {" ".join(c[:2]) if c[0] in ("sam", "sfm") else c[0]: held
                   for c, held in zip(self.spirula.calls, self.spirula.lock_seen)}
         self.assertEqual(locked, {"sam track": True, "sfm auto": True, "geometry": True,
@@ -350,7 +360,7 @@ class StagesTest(PipelineCase):
     # ---- masks
 
     def test_masks_are_named_after_their_images(self):
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         masks = sorted(p.name for p in self.job_file("dataset", "masks", "photos").iterdir())
         self.assertEqual(masks, [f"p_{i:05d}.png" for i in range(1, 9)])
         self.assertFalse(self.job_file("dataset", "masks_raw").exists())
@@ -366,13 +376,13 @@ class StagesTest(PipelineCase):
         self.assertEqual(self.spirula.value(self.train_call(), "--load-masks"), "1")
 
     def test_the_mask_prompt_is_a_workflow_parameter(self):
-        self.assertEqual(self.run_job(sets=["masks.prompt=person; dog"]), 0)
+        self.assertEqual(self.run_job(enable=["masks"], sets=["masks.prompt=person; dog"]), 0)
         call = self.spirula.commands("sam", "track")[0]
         self.assertEqual(self.spirula.value(call, "--text"), "person; dog")
 
     def test_licences_of_the_weights_are_recorded_when_the_stage_runs(self):
         self.assertFalse(models._ACCEPTED_FILE.exists())
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         accepted = self.accepted()
         self.assertEqual(set(accepted), {"sam3"})
         self.assertEqual(accepted["sam3"]["via"], "feature-enabled")
@@ -387,7 +397,7 @@ class StagesTest(PipelineCase):
     def test_missing_weights_are_downloaded_when_the_stage_starts(self):
         (config.MODELS / "sam3-f16.ggml").unlink()
         (config.MODELS / "moge2-vitb-normal.onnx").unlink()
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         self.assertEqual(sorted(self.downloads), ["moge2-vitb-normal.onnx", "sam3-f16.ggml"])
         self.assertIn("sam3=yes", self.spirula.commands("sam", "track")[0])
 
@@ -398,14 +408,14 @@ class StagesTest(PipelineCase):
             raise proc.ProcError("curl.exe failed with exit code 6")
 
         models._download_one = broken
-        self.assertEqual(self.run_job(), 1)
+        self.assertEqual(self.run_job(enable=["masks"]), 1)
         status = self.status()
         self.assertIn("下载模型失败", status["error"])
         self.assertEqual(status["stages"]["masks"]["state"], "failed")
         self.assertEqual(self.spirula.calls, [])
 
     def test_the_sam2_engine_passes_its_detector(self):
-        self.assertEqual(self.run_job(sets=["masks.engine=sam2"]), 0)
+        self.assertEqual(self.run_job(enable=["masks"], sets=["masks.engine=sam2"]), 0)
         call = self.spirula.commands("sam", "track")[0]
         self.assertTrue(self.spirula.value(call, "--model").endswith("sam2.1_hiera_large_f16.ggml"))
         self.assertTrue(self.spirula.value(call, "--detector").endswith("grounding-dino-base.safetensors"))
@@ -415,7 +425,7 @@ class StagesTest(PipelineCase):
 
     def test_large_masks_are_pointed_out(self):
         self.spirula.masks_kept = 40.0
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         self.assertTrue(any("抠除的区域很大" in w for w in self.status()["warnings"]))
 
     def test_a_missing_mask_stops_the_scan(self):
@@ -429,7 +439,7 @@ class StagesTest(PipelineCase):
             return result
 
         pipeline.Job.tool = lambda job, name, args, **kw: drop_one(job, name, args, **kw)
-        self.assertEqual(self.run_job(), 1)
+        self.assertEqual(self.run_job(enable=["masks"]), 1)
         self.assertIn("7/8", self.status()["error"])
         self.assertEqual(self.states()["masks"], "failed")
 
@@ -444,7 +454,7 @@ class StagesTest(PipelineCase):
         self.assertEqual(self.spirula.value(call, "--num-iterations"), "7000")
 
     def test_subject_scan_keeps_the_subject_and_trains_for_it(self):
-        self.assertEqual(self.run_job(sets=["masks.kind=subject"]), 0)
+        self.assertEqual(self.run_job(enable=["masks"], sets=["masks.kind=subject"]), 0)
         call = self.spirula.commands("sam", "track")[0]
         self.assertTrue(self.spirula.value(call, "--model").endswith("birefnet-general.safetensors"))
         self.assertNotIn("--text", call)
@@ -453,7 +463,7 @@ class StagesTest(PipelineCase):
         self.assertEqual(self.train_call()[1], "centered-object")
 
     def test_masks_that_are_switched_off_are_not_seen_by_later_stages(self):
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         self.assertTrue(self.job_file("dataset", "masks").is_dir())
         self.spirula.calls.clear()
         self.assertEqual(self.run_job(disable=["masks"]), 0)
@@ -473,7 +483,8 @@ class StagesTest(PipelineCase):
     def test_video_frames_get_their_own_folder_and_are_treated_as_a_sequence(self):
         video = Path(self.tmp.name) / "walk.mp4"
         video.write_bytes(b"\0" * 64)
-        self.assertEqual(self.run_job(source=video), 0)
+        self.assertEqual(self.run_job(source=video, enable=["masks"],
+                                      sets=["ingest.video_frames=240"]), 0)
         extract = self.spirula.commands("sam", "extract")[0]
         self.assertEqual(extract[2], str(video))
         self.assertTrue(self.spirula.value(extract, "-o").endswith(os.path.join("images", "v1")))
@@ -517,7 +528,7 @@ class StagesTest(PipelineCase):
 
     def test_photos_and_video_together(self):
         (self.photos / "clip.mp4").write_bytes(b"\0" * 64)
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         tracked = [(Path(self.spirula.value(c, "--frames")).name, self.spirula.value(c, "--mask-mode"))
                    for c in self.spirula.commands("sam", "track")]
         self.assertEqual(tracked, [("photos", "image"), ("v1", "image")])
@@ -526,7 +537,7 @@ class StagesTest(PipelineCase):
     # ---- camera poses
 
     def test_pose_estimation_is_given_the_image_folder_not_the_dataset(self):
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         call = self.spirula.commands("sfm", "auto")[0]
         self.assertEqual(Path(call[2]), self.job_file("dataset", "images"))
         self.assertEqual(Path(self.spirula.value(call, "-o")), self.job_file("dataset"))
@@ -587,7 +598,7 @@ class StagesTest(PipelineCase):
         call = self.train_call()
         self.assertEqual([self.spirula.value(call, f) for f in
                           ("--load-normals", "--load-depths", "--load-masks", "--seed-pointcloud")],
-                         ["1", "0", "1", "sparse"])
+                         ["1", "0", "0", "sparse"])               # no masks unless asked for
         self.assertEqual(self.spirula.value(call, "--disable-viewer"), "1")
         self.assertEqual(self.spirula.value(call, "--keep-viewer-alive"), "0")
         self.assertEqual(call[1], "3dgs")
@@ -597,7 +608,7 @@ class StagesTest(PipelineCase):
         self.assertEqual(self.record("normals")["result"]["normals"], True)
 
     def test_dense_seed_is_used_when_switched_on(self):
-        self.assertEqual(self.run_job(enable=["dense_seed"]), 0)
+        self.assertEqual(self.run_job(enable=["dense_seed", "masks"]), 0)
         dense = self.spirula.commands("dense")[0]
         self.assertTrue(self.spirula.value(dense, "--checkpoint").endswith("romav2.0.1.pt"))
         self.assertEqual(self.spirula.value(dense, "--preset"), "balanced")
@@ -788,7 +799,7 @@ class SeparationTest(PipelineCase):
         self.assertEqual((self.status()["state"], self.status()["run"]["plan"]), ("done", []))
 
     def test_a_changed_parameter_makes_that_stage_and_what_follows_stale_and_nothing_else(self):
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         flow = pipeline.build_workflow(self.job_file(), None, [], [], ["train.iterations=1000"])
         pipeline.write_workflow(self.job_file(), flow)
         view = pipeline.job_view(self.job_file())
@@ -800,7 +811,7 @@ class SeparationTest(PipelineCase):
         self.assertEqual([c[0] for c in self.spirula.calls], ["train"])
 
     def test_changing_the_masks_parameters_redoes_everything_after_them(self):
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         self.spirula.calls.clear()
         self.assertEqual(self.run_job(sets=["masks.prompt=person; car"]), 0)
         self.assertEqual(self.order(), ["sam track", "sfm auto", "geometry", "train"])
@@ -836,7 +847,7 @@ class SeparationTest(PipelineCase):
         self.assertEqual(report["files"], {})
 
     def test_reset_deletes_a_stage_and_what_only_it_produced(self):
-        self.assertEqual(self.run_job(), 0)
+        self.assertEqual(self.run_job(enable=["masks"]), 0)
         pipeline.reset_stage(self.job_file(), "train")
         self.assertFalse(self.has_record("train"))
         self.assertFalse(self.job_file("train").exists())
@@ -989,7 +1000,7 @@ class SeparationTest(PipelineCase):
         self.assertEqual(self.states()["export"], "done")
 
     def test_a_mesh_without_a_splat_is_made_in_the_photos_frame(self):
-        self.assertEqual(self.run_job(template="mesh_only", sets=["masks.kind=moving"]), 0)
+        self.assertEqual(self.run_job(template="mesh_only", enable=["masks"], sets=["masks.kind=moving"]), 0)
         self.assertEqual(self.mesh_calls[0]["run_dir"], None)
         self.assertEqual(self.spirula.commands("train"), [])
         self.assertEqual(self.states()["train"], "disabled")

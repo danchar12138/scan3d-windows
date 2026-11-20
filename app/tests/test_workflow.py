@@ -18,6 +18,7 @@ import config  # noqa: E402
 import workflow as wf  # noqa: E402
 
 NO_USER: dict = {}
+MASKS_ON = {"masks": {"enabled": True}}      # masks are opt-in: no template switches them on
 
 
 def resolve(template=None, overrides=None, user=None):
@@ -113,11 +114,24 @@ class TemplateTest(unittest.TestCase):
     def test_what_each_template_switches_on(self):
         on = lambda t: [s for s in wf.STAGE_ORDER if resolve(t)["stages"][s]["enabled"]]
         self.assertEqual(on("preview"), ["ingest", "sfm", "train", "export"])
-        self.assertEqual(on("standard"), ["ingest", "masks", "sfm", "normals", "train", "coverage", "export"])
+        self.assertEqual(on("standard"), ["ingest", "sfm", "normals", "train", "coverage", "export"])
         self.assertEqual(on("high"), on("standard"))
-        self.assertEqual(on("full"), ["ingest", "masks", "sfm", "normals", "train", "dense", "mesh",
+        self.assertEqual(on("full"), ["ingest", "sfm", "normals", "train", "dense", "mesh",
                                       "coverage", "export"])
-        self.assertEqual(on("mesh_only"), ["ingest", "masks", "sfm", "dense", "mesh", "export"])
+        self.assertEqual(on("mesh_only"), ["ingest", "sfm", "dense", "mesh", "export"])
+
+    def test_no_builtin_template_switches_the_masks_on(self):
+        for tid in ("preview", "preview_mesh", "standard", "high", "full", "mesh_only"):
+            self.assertIn(tid, wf.TEMPLATES)
+            self.assertFalse(resolve(tid)["stages"]["masks"]["enabled"], tid)
+            self.assertNotIn("masks", wf.effective_enabled(resolve(tid)), tid)
+        # opting in is still one override away
+        self.assertTrue(resolve("standard", MASKS_ON)["stages"]["masks"]["enabled"])
+
+    def test_video_frames_defaults_to_480(self):
+        params = {p["key"]: p for p in wf.STAGES["ingest"]["params"]}
+        self.assertEqual(params["video_frames"]["default"], 480)
+        self.assertEqual(resolve("standard")["stages"]["ingest"]["params"]["video_frames"], 480)
 
     def test_template_numbers(self):
         p = lambda t, s, k: resolve(t)["stages"][s]["params"][k]
@@ -171,7 +185,8 @@ class TemplateTest(unittest.TestCase):
         self.assertEqual(resolve("x", user=user)["stages"]["train"]["params"]["iterations"], 30000)
         flow = resolve("y", user=user)
         self.assertEqual(flow["stages"]["train"]["params"]["iterations"], 2000)
-        self.assertTrue(flow["stages"]["masks"]["enabled"])                           # standard
+        self.assertTrue(flow["stages"]["normals"]["enabled"])                         # standard
+        self.assertFalse(flow["stages"]["masks"]["enabled"])
 
     def test_the_default_comes_from_the_user_else_standard(self):
         self.assertEqual(resolve()["template"], "standard")
@@ -327,7 +342,7 @@ class DependencyTest(unittest.TestCase):
         self.assertEqual(wf.effective_enabled(flow), ["ingest", "sfm", "export"])
 
     def test_consumed_are_the_hard_and_the_switched_on_soft_dependencies(self):
-        flow = resolve("full")
+        flow = resolve("full", MASKS_ON)
         self.assertEqual(wf.consumed(flow, "train"), ["sfm", "masks", "normals"])
         self.assertEqual(wf.consumed(flow, "mesh"), ["dense", "masks", "train"])
         self.assertEqual(wf.consumed(flow, "dense"), ["sfm", "masks"])
@@ -335,15 +350,15 @@ class DependencyTest(unittest.TestCase):
         flow = resolve("preview")
         self.assertEqual(wf.consumed(flow, "train"), ["sfm"])
         self.assertEqual(wf.consumed(flow, "export"), ["train"])
-        self.assertEqual(wf.consumed(resolve("mesh_only"), "mesh"), ["dense", "masks"])
+        self.assertEqual(wf.consumed(resolve("mesh_only", MASKS_ON), "mesh"), ["dense", "masks"])
 
     def test_dense_seed_consumes_masks(self):
-        flow = resolve("standard", {"dense_seed": {"enabled": True}})
+        flow = resolve("standard", {"dense_seed": {"enabled": True}, **MASKS_ON})
         self.assertEqual(wf.consumed(flow, "dense_seed"), ["sfm", "masks"])
         self.assertEqual(wf.consumed(flow, "train"), ["sfm", "masks", "normals", "dense_seed"])
 
     def test_downstream_follows_consumption(self):
-        flow = resolve("full")
+        flow = resolve("full", MASKS_ON)
         self.assertEqual(wf.downstream(flow, "masks"),
                          ["masks", "sfm", "normals", "train", "dense", "mesh", "coverage", "export"])
         self.assertEqual(wf.downstream(flow, "mesh"), ["mesh", "export"])
@@ -362,13 +377,14 @@ class FingerprintTest(unittest.TestCase):
         self.assertTrue(all(len(v) == 16 for v in a.values()))
 
     def test_a_parameter_changes_that_stage_and_what_consumes_it_only(self):
-        a, b = self.fps("full"), self.fps("full", {"mesh": {"params": {"visual_faces": 100000}}})
+        full = lambda extra=None: self.fps("full", {**MASKS_ON, **(extra or {})})
+        a, b = full(), full({"mesh": {"params": {"visual_faces": 100000}}})
         self.assertEqual([k for k in a if a[k] != b[k]], ["mesh", "export"])
-        b = self.fps("full", {"train": {"params": {"iterations": 12000}}})
+        b = full({"train": {"params": {"iterations": 12000}}})
         self.assertEqual([k for k in a if a[k] != b[k]], ["train", "mesh", "coverage", "export"])
-        b = self.fps("full", {"dense": {"params": {"image_size": 800}}})
+        b = full({"dense": {"params": {"image_size": 800}}})
         self.assertEqual([k for k in a if a[k] != b[k]], ["dense", "mesh", "export"])
-        b = self.fps("full", {"masks": {"params": {"prompt": "person; car"}}})
+        b = full({"masks": {"enabled": True, "params": {"prompt": "person; car"}}})
         self.assertEqual([k for k in a if a[k] == b[k]], ["ingest"])
 
     def test_the_input_changes_everything(self):
@@ -399,7 +415,7 @@ class StateTest(unittest.TestCase):
                               "export": "pending"})
 
     def test_everything_current_is_done(self):
-        flow = resolve("full")
+        flow = resolve("full", MASKS_ON)
         st = states(flow, wf.effective_enabled(flow), export_inputs=["train", "mesh", "coverage"])
         self.assertEqual({s for s in st.values()}, {"done", "disabled"})
         self.assertEqual([s for s, v in st.items() if v == "disabled"], ["dense_seed"])
@@ -433,7 +449,7 @@ class StateTest(unittest.TestCase):
         self.assertEqual([st[s] for s in ("ingest", "sfm", "train", "export")], ["stale"] * 4)
 
     def test_export_is_done_only_for_the_inputs_it_saw(self):
-        flow = resolve("full")
+        flow = resolve("full", MASKS_ON)
         enabled = wf.effective_enabled(flow)
         exported = [s for s in enabled if s != "export"]
         # export ran when only the splat was done; the mesh and coverage were pending
@@ -461,7 +477,7 @@ class StateTest(unittest.TestCase):
 
 class PlanTest(unittest.TestCase):
     def setUp(self):
-        self.full = resolve("full")
+        self.full = resolve("full", MASKS_ON)
         self.all = wf.effective_enabled(self.full)
         self.none = states(self.full, [])
         self.done = states(self.full, self.all, export_inputs=["train", "mesh", "coverage"])
@@ -577,9 +593,9 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(ctx.exception.code, "stage_disabled")
 
     def test_stale_stages_are_run_like_pending_ones(self):
-        flow = resolve("full")
+        flow = resolve("full", MASKS_ON)
         records = records_for(flow, self.all, export_inputs=["train", "mesh", "coverage"])
-        changed = resolve("full", {"mesh": {"params": {"visual_faces": 100000}}})
+        changed = resolve("full", {**MASKS_ON, "mesh": {"params": {"visual_faces": 100000}}})
         st = wf.stage_states(changed, records, "sig")
         self.assertEqual(plan_of(changed, st), [("mesh", "requested"), ("export", "requested")])
 

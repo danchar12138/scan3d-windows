@@ -2650,10 +2650,10 @@ class TemplateTests(ServerCase):
         self.assertEqual(self.ids(schema), ["preview", "preview_mesh", "standard", "high", "full", "mesh_only"])
         standard = schema["templates"][2]
         self.assertEqual((standard["label"], standard["builtin"]), ("标准（高斯）", True))
-        self.assertEqual(standard["enabled"], ["ingest", "masks", "sfm", "normals", "train",
-                                               "coverage", "export"])
+        self.assertEqual(standard["enabled"], ["ingest", "sfm", "normals", "train",
+                                               "coverage", "export"])       # masks are opt-in
         self.assertEqual(schema["templates"][5]["enabled"],
-                         ["ingest", "masks", "sfm", "dense", "mesh", "export"])
+                         ["ingest", "sfm", "dense", "mesh", "export"])
         self.assertEqual([f["id"] for f in schema["features"]],
                          ["masks", "normals", "dense_seed", "sfm"])
         self.assertNotIn("features_error", schema)
@@ -2818,11 +2818,11 @@ class WorkflowTests(ServerCase):
         self.assertEqual(stages["train"]["params"]["iterations"], 5000)
         self.assertEqual(stages["train"]["params"]["cap_max"], 2000000)         # complete
         self.assertEqual([s for s in workflow.STAGE_ORDER if stages[s]["enabled"]],
-                         ["ingest", "masks", "sfm", "normals", "train", "dense", "mesh", "export"])
+                         ["ingest", "sfm", "normals", "train", "dense", "mesh", "export"])
         self.assertEqual(view["changes"], {"train": {"params": {"iterations": 5000}},
                                            "coverage": {"enabled": False}})
         self.assertEqual(self.stage_states(view), {
-            "ingest": "pending", "masks": "pending", "sfm": "pending", "normals": "pending",
+            "ingest": "pending", "masks": "disabled", "sfm": "pending", "normals": "pending",
             "dense_seed": "disabled", "train": "pending", "dense": "pending", "mesh": "pending",
             "coverage": "disabled", "export": "pending"})
         self.assertEqual(view["run"], {"to": None, "only": [], "force": [], "plan": []})
@@ -2850,7 +2850,8 @@ class WorkflowTests(ServerCase):
         self.assertEqual(list(self.runs.iterdir()), [])
 
     def test_the_view_says_which_licences_apply_and_which_weights_will_come(self):
-        job = self.create()                                       # standard: masks, normals
+        # standard with the masks switched on: masks, normals
+        job = self.create(workflow={"masks": {"enabled": True}})
         view = self.job(job)
         self.assertEqual(view["licences"], [{"label": "SAM License (Meta)",
                                              "url": "https://example.invalid/sam3", "id": "sam3",
@@ -2936,7 +2937,7 @@ class WorkflowTests(ServerCase):
         self.assertEqual(self.request("GET", "/api/jobs/%s/workflow" % job)[0], 405)
 
     def test_changing_a_parameter_makes_that_stage_and_what_follows_stale(self):
-        job = self.create_with_photo(step=0.005)
+        job = self.create_with_photo(step=0.005, workflow={"masks": {"enabled": True}})
         self.run_to_done(job)
         self.assertEqual(set(self.stage_states(self.job(job)).values()), {"done", "disabled"})
         status, view = self.api("PUT", "/api/jobs/%s/workflow" % job,
@@ -2953,7 +2954,7 @@ class WorkflowTests(ServerCase):
         self.assertEqual(set(self.stage_states(view).values()), {"done", "disabled"})
 
     def test_plan_says_what_a_click_would_do_and_queues_nothing(self):
-        job = self.create_with_photo(step=0.005)
+        job = self.create_with_photo(step=0.005, workflow={"masks": {"enabled": True}})
         status, plan = self.api("POST", "/api/jobs/%s/plan" % job, {})
         self.assertEqual(status, 200, plan)
         self.assertEqual([(s["stage"], s["reason"], s["label"]) for s in plan["steps"]], [
@@ -3009,7 +3010,8 @@ class WorkflowTests(ServerCase):
         self.assertEqual([(s["stage"], s["reason"]) for s in plan["steps"]], [("normals", "requested")])
 
     def test_run_to_only_and_force_reach_the_pipeline_and_are_remembered_by_the_queue(self):
-        job = self.create_with_photo(step=0.005, extra=["--startup-delay", "0.8"])
+        job = self.create_with_photo(step=0.005, extra=["--startup-delay", "0.8"],
+                                     workflow={"masks": {"enabled": True}})
         view = self.start(job, {"to": "sfm"})
         self.assertEqual(view["run"], {"to": "sfm", "only": [], "force": [],
                                        "plan": ["ingest", "masks", "sfm", "export"]})
@@ -3059,7 +3061,8 @@ class WorkflowTests(ServerCase):
         self.wait_state(job, "done")
 
     def test_a_run_that_fails_keeps_what_finished_before_it_and_can_be_repeated(self):
-        job = self.create_with_photo(mode="fail", step=0.005, extra=["--fail-stage", "train"])
+        job = self.create_with_photo(mode="fail", step=0.005, extra=["--fail-stage", "train"],
+                                     workflow={"masks": {"enabled": True}})
         self.start(job)
         view = self.wait_state(job, ("failed", "done", "cancelled"))
         self.assertEqual((view["state"], view["error"]), ("failed", "stub: train failed"))
@@ -3303,7 +3306,7 @@ class RealPipelineHelperTests(ServerCase):
         status, plan = self.api("POST", "/api/jobs/%s/plan" % job, {"to": "train"})
         self.assertEqual(status, 200, plan)
         self.assertEqual([s["stage"] for s in plan["steps"]],
-                         ["ingest", "masks", "sfm", "normals", "train", "export"])
+                         ["ingest", "sfm", "normals", "train", "export"])
         status, error = self.api("POST", "/api/jobs/%s/plan" % job, {"only": ["mesh"]})
         self.assertEqual((status, error["error"]), (400, "needs_upstream"))
         status, view = self.api("PUT", "/api/jobs/%s/workflow" % job, {"train": {"params": {"iterations": 1}}})

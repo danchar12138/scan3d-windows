@@ -28,6 +28,7 @@
     <symbol id="i-play" viewBox="0 0 24 24"><path d="M8 5.5v13l10.5-6.5z" fill="currentColor"/></symbol>
     <symbol id="i-back" viewBox="0 0 24 24"><path d="M14.5 6l-6 6 6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V5M7.5 9.5L12 5l4.5 4.5M5 15v3.5A1.5 1.5 0 0 0 6.5 20h11a1.5 1.5 0 0 0 1.5-1.5V15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></symbol>
   </defs>
 </svg>
 
@@ -47,33 +48,36 @@
   <!-- ===================================================== the task list -->
   <aside class="side" id="side" aria-labelledby="side-title">
     <div class="side-head">
-      <h2 id="side-title">任务 <span class="count" id="side-count"></span></h2>
-      <a class="btn small primary" href="#/" id="btn-new"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"/></svg>新建任务</a>
+      <h2 id="side-title">扫描记录 <span class="count" id="side-count"></span></h2>
+      <a class="btn small primary" href="#/" id="btn-new"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-plus"/></svg>新建</a>
     </div>
-    <p class="empty" id="jobs-empty">还没有任务。</p>
+    <p class="empty" id="jobs-empty">还没有扫描。</p>
     <ul class="job-list" id="job-list"></ul>
   </aside>
 
   <main class="content" id="content">
 
-  <!-- ===================================================== home: new task -->
+  <!-- ===================================================== home: new scan -->
   <div id="view-home">
-    <section class="card" id="new-scan" aria-labelledby="new-scan-title">
-      <h1 id="new-scan-title">新建任务</h1>
-      <p class="lead">围绕物体或场景拍一组照片或一段视频。每个任务有一张工作流图：可以只做到高斯，也可以再加网格，每一步单独运行。</p>
+    <section class="card hero" id="new-scan" aria-labelledby="new-scan-title">
+      <div class="hero-head">
+        <h1 id="new-scan-title">新建扫描</h1>
+        <p class="lead">拖入一组照片或一段视频，几分钟后就能在网页里旋转查看这个三维场景。</p>
+      </div>
 
       <div class="tabs" id="source-tabs" role="tablist" hidden>
         <button type="button" class="tab is-active" id="tab-upload" role="tab" aria-selected="true">上传照片或视频</button>
-        <button type="button" class="tab" id="tab-path" role="tab" aria-selected="false">使用这台电脑上的文件夹</button>
+        <button type="button" class="tab" id="tab-path" role="tab" aria-selected="false">用这台电脑上的文件夹</button>
       </div>
 
       <div id="source-upload">
         <div class="dropzone" id="dropzone">
+          <svg class="dropzone-ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-upload"/></svg>
           <p class="dropzone-title">把照片或视频拖到这里</p>
           <label class="btn" for="file-input">选择文件</label>
           <input class="visually-hidden" type="file" id="file-input" multiple
                  accept="image/*,video/*,.jpg,.jpeg,.png,.webp,.heic,.heif,.tif,.tiff,.bmp,.mp4,.mov,.m4v,.mkv,.avi,.webm">
-          <p class="hint">支持 JPG、PNG、BMP 图片和 MP4、MOV、M4V、MKV、AVI、WebM 视频。HEIC、WebP、TIFF 图片会被跳过，请先在手机相机里把照片格式设为 JPG。<br>建议 50–300 张相互重叠的照片，或一段 1–2 分钟的环绕视频。</p>
+          <p class="hint">照片用 JPG（HEIC、WebP、TIFF 会被跳过），视频支持 MP4、MOV 等。照片 50–150 张，或一段 1–2 分钟的环绕视频。</p>
         </div>
 
         <div class="file-summary" id="file-summary" hidden>
@@ -88,27 +92,42 @@
           <span class="field-label">文件夹或视频文件的完整路径</span>
           <input type="text" id="local-path" autocomplete="off" spellcheck="false" placeholder="例如 D:\photos\living-room">
         </label>
-        <p class="hint">文件夹里放图片和（或）视频；也可以直接填一个视频文件的路径。文件不会被复制或修改。</p>
+        <p class="hint">文件夹里放图片和（或）视频，也可以直接填一个视频文件的路径。文件不会被复制或修改。</p>
       </div>
 
-      <fieldset class="quality" id="tpl-picker" hidden>
-        <legend>模板：要做到哪一步</legend>
-        <div class="quality-grid" id="tpl-options"></div>
-        <p class="hint tpl-hint">模板只是起点：建好任务后，工作流图里每个阶段的开关和参数都能再改。同一时间只运行一个任务，其余的会排队。</p>
-      </fieldset>
+      <section class="block" id="tpl-picker" aria-labelledby="goal-title" hidden>
+        <h2 class="block-title" id="goal-title">想要什么结果</h2>
+        <div class="goal-grid" id="tpl-options" role="radiogroup" aria-labelledby="goal-title"></div>
+        <details class="more-box" id="tpl-more" hidden>
+          <summary>更多方案</summary>
+          <div class="goal-grid" id="tpl-options-more" role="radiogroup" aria-label="更多方案"></div>
+        </details>
+      </section>
 
-      <label class="field">
-        <span class="field-label">名称（可选）</span>
-        <input type="text" id="job-name" autocomplete="off" autocapitalize="none" spellcheck="false"
-               maxlength="64" placeholder="留空则自动生成，例如 scan-20260101-120000">
-        <span class="hint">只能用英文字母、数字、- 和 _。</span>
-      </label>
+      <section class="block" aria-labelledby="mask-title">
+        <h2 class="block-title" id="mask-title">要不要抠图 <span class="tag">可选</span></h2>
+        <fieldset class="seg seg-wide" id="mask-choice">
+          <legend class="visually-hidden">抠图</legend>
+          <label><input type="radio" name="mask" value="off" checked><span>不抠（默认）</span></label>
+          <label><input type="radio" name="mask" value="moving"><span>去掉走动的人</span></label>
+          <label><input type="radio" name="mask" value="subject"><span>只留主体物体</span></label>
+        </fieldset>
+        <p class="hint" id="mask-hint">默认不抠图，最快也最稳。画面里有路人在动时选“去掉走动的人”；只拍一件物体、不要背景时选“只留主体物体”。选了会多下载一个模型。</p>
+      </section>
 
-      <label class="check" for="opt-start">
-        <input type="checkbox" id="opt-start" checked>
-        <span>素材备好后马上按模板运行</span>
-      </label>
-      <p class="hint option-note">不勾选的话，只建好任务，先去看工作流图、调整要做的阶段，再点「运行」。</p>
+      <details class="more-box" id="more-settings">
+        <summary>更多设置</summary>
+        <label class="field">
+          <span class="field-label">名称（可选）</span>
+          <input type="text" id="job-name" autocomplete="off" autocapitalize="none" spellcheck="false"
+                 maxlength="64" placeholder="留空则自动生成，例如 scan-20260101-120000">
+          <span class="hint">只能用英文字母、数字、- 和 _。</span>
+        </label>
+        <label class="check" for="opt-start">
+          <input type="checkbox" id="opt-start" checked>
+          <span>素材备好后马上开始</span>
+        </label>
+      </details>
 
       <div class="upload-progress" id="upload-progress" hidden>
         <div class="progress"><div class="progress-bar" id="upload-bar"></div></div>
@@ -118,11 +137,39 @@
 
       <p class="form-error" id="form-error" role="alert" hidden></p>
 
-      <div class="actions">
-        <button type="button" class="btn primary" id="btn-start">上传并运行</button>
+      <div class="actions hero-actions">
+        <button type="button" class="btn primary big" id="btn-start">开始扫描</button>
         <button type="button" class="btn" id="btn-abort" hidden>取消上传</button>
       </div>
     </section>
+
+    <!-- ===================================================== how to shoot -->
+    <details class="card tips" id="capture-tips" open>
+      <summary><h2>怎么拍，结果才好</h2><span class="tips-sub">拍得好比任何设置都重要</span></summary>
+      <div class="tips-grid">
+        <section aria-labelledby="tips-photo">
+          <h3 id="tips-photo">拍照片（推荐）</h3>
+          <ul class="tips-list">
+            <li><b>光线足</b>：室内开灯，白天靠窗。光线暗时手机会放慢快门，手一抖就糊。</li>
+            <li><b>用普通拍照模式，不要人像模式</b>：虚化会让物体本身一部分在焦外。点一下物体对焦，长按锁定对焦和曝光。</li>
+            <li><b>离远一点</b>：物体占画面三分之一到一半就够，贴得太近景深很浅，物体会一半清楚一半糊。</li>
+            <li><b>一张一张拍</b>：站稳，拍完等一秒再移动，每张之间换一小步。</li>
+            <li><b>张数够</b>：50–150 张，绕物体至少一整圈，平视一圈再俯视一圈，相邻两张重叠七成以上。</li>
+            <li><b>白色、光滑的东西</b>：下面垫一张有图案的纸或布，位姿才找得准。</li>
+          </ul>
+        </section>
+        <section aria-labelledby="tips-video">
+          <h3 id="tips-video">拍视频</h3>
+          <ul class="tips-list">
+            <li><b>光线足、锁定对焦和曝光</b>，用主摄，不用变焦；视频格式选 H.264（兼容性最好）。</li>
+            <li><b>慢慢走，像散步一样绕物体</b>，不要原地快速转，不要突然停下或掉头。</li>
+            <li><b>1–2 分钟</b>，绕一圈就够；想拍得更全，换个高度再绕一圈。</li>
+            <li><b>双手持机，手肘贴身体</b>；会自动丢掉模糊的帧，但整段都糊的视频救不回来。</li>
+          </ul>
+        </section>
+      </div>
+      <p class="hint">光线暗（快门慢）和镜头光圈大（景深浅）会让照片糊，帧数太少会明显变差，这几条在这个项目里测过；其余是三维重建通用的经验。结果页的“拍摄覆盖”会标出哪里照片不够，按提示补拍再扫一次。</p>
+    </details>
 
     <section class="card slim" id="lan-card" hidden>
       <h2>用手机访问</h2>
@@ -151,9 +198,9 @@
     </details>
   </div>
 
-  <!-- ===================================================== one task -->
+  <!-- ===================================================== one scan -->
   <div id="view-detail" hidden>
-    <a class="back" href="#/"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-back"/></svg>全部任务</a>
+    <a class="back" href="#/"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-back"/></svg>全部扫描</a>
 
     <section class="card job-head" aria-labelledby="d-name">
       <div class="head-row">
@@ -162,19 +209,29 @@
           <span class="badge" id="d-state"></span>
         </div>
         <div class="head-actions">
-          <button type="button" class="btn primary run-btn" id="btn-job-start" hidden><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-play"/></svg>运行</button>
+          <button type="button" class="btn primary run-btn" id="btn-job-start" hidden><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><use href="#i-play"/></svg><span id="btn-job-start-text">运行</span></button>
           <button type="button" class="btn danger" id="btn-job-cancel" hidden>停止</button>
-          <button type="button" class="btn" id="btn-job-folder" hidden>打开任务文件夹</button>
-          <button type="button" class="btn quiet-danger" id="btn-job-delete" hidden>删除</button>
+          <details class="menu" id="job-menu">
+            <summary class="btn icon-btn" aria-label="更多操作"><svg class="ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="5.5" cy="12" r="1.8" fill="currentColor"/><circle cx="12" cy="12" r="1.8" fill="currentColor"/><circle cx="18.5" cy="12" r="1.8" fill="currentColor"/></svg></summary>
+            <div class="menu-pop">
+              <button type="button" class="menu-item" id="btn-job-folder" hidden>打开任务文件夹</button>
+              <button type="button" class="menu-item danger" id="btn-job-delete" hidden>删除这个扫描</button>
+            </div>
+          </details>
         </div>
       </div>
       <p class="meta" id="d-meta"></p>
+
+      <ol class="steps" id="d-steps" aria-label="进度"></ol>
       <p class="message" id="d-message" role="status"></p>
 
       <div class="error-box" id="d-error" role="alert" hidden>
         <h2 id="d-error-title">运行失败</h2>
         <pre id="d-error-text"></pre>
-        <p class="hint">点上面的「运行」会从没做完的地方继续；失败的阶段在图里是红色，选中它能看到原因和日志。</p>
+        <div class="actions">
+          <button type="button" class="btn small" id="btn-show-log">查看日志</button>
+        </div>
+        <p class="hint">点上面的“继续运行”会从没做完的地方接着做。</p>
       </div>
       <ul class="warn-box" id="d-warnings" hidden></ul>
 
@@ -186,36 +243,34 @@
       <p class="form-error" id="d-action-error" role="alert" hidden></p>
     </section>
 
-    <!-- ===================================================== the workflow graph -->
-    <section class="card graph-card" id="wf-card" aria-labelledby="wf-title">
-      <div class="wf-head">
-        <h2 id="wf-title">工作流</h2>
-        <button type="button" class="btn small tpl-btn" id="wf-template-btn" aria-expanded="false" aria-controls="wf-templates">模板：<span id="wf-template-name"></span> ▾</button>
+    <!-- ===================================================== the results -->
+    <section class="card viewer" id="d-viewer" hidden aria-labelledby="viewer-title">
+      <div class="viewer-head">
+        <h2 id="viewer-title">结果</h2>
+        <details class="menu dl-menu" id="d-outputs" hidden>
+          <summary class="btn small"><span id="d-outputs-count">下载</span></summary>
+          <div class="menu-pop menu-pop-wide">
+            <ul class="output-list" id="d-output-list"></ul>
+            <div class="actions">
+              <button type="button" class="btn small" id="btn-open-folder" hidden>打开输出文件夹</button>
+              <button type="button" class="btn small" id="btn-open-viewer" hidden>在查看器中打开</button>
+            </div>
+          </div>
+        </details>
       </div>
-      <p class="hint" id="wf-busy-note"></p>
-      <div class="templates" id="wf-templates" hidden></div>
-      <div class="graph-wrap" id="wf-wrap">
-        <div class="graph" id="wf-graph">
-          <svg class="edges" id="wf-edges" aria-hidden="true" focusable="false"></svg>
-        </div>
-      </div>
-      <ul class="legend" id="wf-legend" aria-label="状态说明"></ul>
-      <p class="hint">点一个阶段看它的参数和结果；阶段上的开关决定这个阶段做不做。灰色虚线的阶段没有打开；带锁的开关表示它是必需的，或者别的阶段要用它。</p>
-    </section>
 
-    <span id="np-home"></span>
-    <section class="card node-panel" id="np" hidden></section>
-
-    <!-- ===================================================== everything in output/, in the page -->
-    <section class="card viewer" id="d-viewer" hidden>
-      <h2>在线查看</h2>
       <nav class="tabs viewer-tabs" id="v-tabs" aria-label="查看内容">
-        <a class="tab" data-view="report" href="#/">报告</a>
         <a class="tab" data-view="splat" href="#/">高斯</a>
         <a class="tab" data-view="mesh" href="#/">网格</a>
-        <a class="tab" data-view="collision" href="#/">碰撞网格</a>
-        <a class="tab" data-view="overlay" href="#/">叠加对齐</a>
         <a class="tab" data-view="coverage" href="#/">拍摄覆盖</a>
+        <details class="tab-more" id="v-more" hidden>
+          <summary class="tab">更多</summary>
+          <div class="tab-more-pop">
+            <a class="tab" data-view="collision" href="#/">碰撞网格</a>
+            <a class="tab" data-view="overlay" href="#/">叠加对齐</a>
+            <a class="tab" data-view="report" href="#/">报告</a>
+          </div>
+        </details>
       </nav>
 
       <div id="v-3d" hidden>
@@ -266,9 +321,9 @@
           <h3 id="v-coverage-title">拍得不足的地方</h3>
           <ol class="coverage-list" id="v-coverage-list"></ol>
           <p id="v-coverage-none" hidden>没有发现成片拍得不足的地方。</p>
-          <p class="hint">“从这里补拍”会把视角移到建议的拍摄位置，朝着白色标出的地方，照着这个方向补拍几张；把视角拉远可以看到这个位置（白色线框）。没拍到的东西无法凭空补出来：补拍后，把新照片和原来的照片放在一起重新扫描，这些地方才会变好。</p>
+          <p class="hint">“从这里补拍”会把视角移到建议的拍摄位置，朝着白色标出的地方。补拍几张后，把新照片和原来的放在一起重新扫描，这些地方才会变好。</p>
         </div>
-        <p class="hint">拖动旋转，滚轮或双指缩放，右键拖动或双指平移。开始时的视角是其中一张照片的拍摄位置；高斯在拍摄位置附近看最清楚，离得越远越模糊。</p>
+        <p class="hint">拖动旋转，滚轮或双指缩放，右键拖动或双指平移。高斯在拍摄位置附近最清楚，离得越远越模糊。</p>
       </div>
 
       <div id="v-report" hidden>
@@ -288,23 +343,41 @@
       </div>
     </section>
 
-    <details class="card outputs" id="d-outputs" hidden>
-      <summary id="d-outputs-count">输出文件</summary>
-      <ul class="output-list" id="d-output-list"></ul>
-      <div class="actions">
-        <button type="button" class="btn" id="btn-open-folder" hidden>打开输出文件夹</button>
-        <button type="button" class="btn" id="btn-open-viewer" hidden>在查看器中打开</button>
+    <!-- ===================================================== advanced: every step, switches and parameters -->
+    <details class="card adv" id="d-adv">
+      <summary><h2>调整每一步</h2><span class="adv-sub">高级：开关、参数、模板，只要不改就不用看</span></summary>
+      <div class="adv-body">
+        <div class="graph-card" id="wf-card">
+          <div class="wf-head">
+            <h3 id="wf-title">工作流</h3>
+            <button type="button" class="btn small tpl-btn" id="wf-template-btn" aria-expanded="false" aria-controls="wf-templates">模板：<span id="wf-template-name"></span> ▾</button>
+          </div>
+          <p class="hint" id="wf-busy-note"></p>
+          <div class="templates" id="wf-templates" hidden></div>
+          <div class="graph-wrap" id="wf-wrap">
+            <div class="graph" id="wf-graph">
+              <svg class="edges" id="wf-edges" aria-hidden="true" focusable="false"></svg>
+            </div>
+          </div>
+          <ul class="legend" id="wf-legend" aria-label="状态说明"></ul>
+          <p class="hint">点一个阶段看它的参数和结果；阶段上的开关决定它做不做。灰色虚线的阶段没有打开；带锁的开关表示它是必需的，或者别的阶段要用它。</p>
+        </div>
+        <span id="np-home"></span>
+        <section class="card node-panel" id="np" hidden></section>
       </div>
     </details>
 
-    <details class="card log" id="d-log">
+    <!-- ===================================================== the log -->
+    <details class="card log" id="d-files">
       <summary>运行日志</summary>
-      <div class="log-tools">
-        <label for="d-log-file" class="visually-hidden">日志文件</label>
-        <select id="d-log-file"></select>
-        <span class="hint" id="d-log-note"></span>
+      <div class="log-wrap" id="d-log">
+        <div class="log-tools">
+          <label for="d-log-file" class="visually-hidden">日志文件</label>
+          <select id="d-log-file"></select>
+          <span class="hint" id="d-log-note"></span>
+        </div>
+        <pre class="log-text" id="d-log-text" tabindex="0"></pre>
       </div>
-      <pre class="log-text" id="d-log-text" tabindex="0"></pre>
     </details>
   </div>
   </main>

@@ -501,37 +501,24 @@
     extra.textContent = "";
     chips.textContent = "";
     $("d-next").classList.remove("is-warn");
-    if (busy(job)) {
-      var plan = (job.run && job.run.plan) || [];
-      var done = plan.filter(function (id) { return stateOf(job, id, null) === "done"; }).length;
-      if (job.state === "queued") { setText(title, "排队中，轮到它时会按计划运行"); }
-      else {
-        var cur = job.stage ? "现在是「" + S3.stageLabel(job.stage) + "」" : "";
-        setText(title, "正在运行：计划共 " + plan.length + " 步，已完成 " + done + " 步" + (cur ? "，" + cur : ""));
-      }
-      plan.forEach(function (id, i) {
-        if (i) { chips.appendChild(el("span", "chip-arrow", "›")); }
-        var st = stateOf(job, id, null);
-        var chip = el("span", "chip s-" + st);
-        chip.appendChild(S3.icon((S3.STAGE_STATE[st] || S3.STAGE_STATE.pending).icon, "chip-ico"));
-        chip.appendChild(document.createTextNode(S3.stageLabel(id)));
-        chips.appendChild(chip);
-      });
+    if (busy(job)) {          // the step strip at the top of the page already says where it is
+      setText(title, "");
       return;
     }
     var result = planFor(PLAN_KINDS.all());
     if (result.loading) { setText(title, "正在算下一次会做什么…"); return; }
     if (!result.ok) {
       if (result.code === "nothing_to_do") {
-        setText(title, "打开的阶段都已完成，没有要运行的。想重做某一步，选中它再点「重新运行」。");
+        setText(title, "");           // everything is done: nothing to announce
       } else {
         $("d-next").classList.add("is-warn");
         setText(title, result.message || "现在无法运行");
       }
       return;
     }
-    setText(title, "点「运行」会做 " + result.steps.length + " 步：");
-    stepChips(result.steps, chips);
+    var names = result.steps.filter(function (s) { return s.stage !== "export"; })
+      .map(function (s) { return S3.stageLabel(s.stage); });
+    setText(title, "点「" + $("btn-job-start-text").textContent + "」会做：" + (names.length ? names.join("、") : "整理输出文件"));
     extrasText(result).forEach(function (t) { extra.appendChild(el("p", "next-note", t)); });
     if (ctx.effect && ctx.effect.text) { extra.appendChild(el("p", "next-effect", ctx.effect.text)); }
   }

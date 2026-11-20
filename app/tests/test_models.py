@@ -169,7 +169,9 @@ class ModelsTest(unittest.TestCase):
         self.assertEqual(models.features_table(self.settings)["disk_mb"], 3)
 
     def test_needs_lists_licences_and_downloads_of_the_stages_that_will_run(self):
-        flow = wf.resolve("standard")                 # masks (SAM 3) and normals (ViT-B), coverage
+        # masks are opt-in: the template alone needs no SAM 3 and no licence
+        self.assertEqual(models.needs(wf.resolve("standard"), self.settings)["licences"], [])
+        flow = wf.resolve("standard", {"masks": {"enabled": True}})   # masks (SAM 3), normals (ViT-B), coverage
         need = models.needs(flow, self.settings)
         self.assertEqual([l["id"] for l in need["licences"]], ["sam3"])
         self.assertEqual(need["licences"][0]["stage"], "masks")
@@ -254,10 +256,12 @@ class ModelsTest(unittest.TestCase):
 
     def test_download_with_no_names_fetches_what_the_default_template_uses(self):
         wanted = set(models.default_features(self.settings))
-        self.assertTrue({"sam3", "normals_vitb", "aliked"} <= wanted)
+        self.assertTrue({"normals_vitb", "aliked"} <= wanted)
+        self.assertNotIn("sam3", wanted)                          # masks are opt-in now
         self.assertNotIn("dense_seed", wanted)
         done = models.download_features(None, log_path=self.log, settings=self.settings, echo=None)
-        self.assertIn("sam3-f16.ggml", done)
+        self.assertIn("moge2-vitb-normal.onnx", done)
+        self.assertNotIn("sam3-f16.ggml", done)
         self.assertNotIn("romav2.0.1.pt", done)
 
     def test_progress_runs_over_the_whole_download(self):

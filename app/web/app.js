@@ -1,5 +1,5 @@
-/* scan3d UI: the page itself. Task list, new task (upload or local path), task page (header,
- * overview, logs), models panel, phone pairing, polling and routing. The workflow graph and the
+/* scan3d UI: the page itself. Scan list, new scan (upload or local path), scan page (status,
+ * steps, logs), models panel, phone pairing, polling and routing. The workflow graph and the
  * node panel are in workflow.js, the result viewer in jobview.js, shared helpers in common.js.
  * Talks to the JSON API in app/server.py. Everything put on the page from data goes through
  * textContent, never innerHTML. */
@@ -182,7 +182,40 @@
     $("models-remote").hidden = !!loopback;
   }
 
-  // ------------------------------------------------------------------ new task: template picker
+  // ------------------------------------------------------------------ new scan: what result to make
+
+  // The built-in templates in plain words. The three at the top are what most people want; the
+  // rest sit behind "更多方案". Templates the user saved show the text they wrote.
+  var GOAL_MAIN = ["preview", "standard", "full"];
+  var GOAL_TEXT = {
+    preview: { time: "几分钟", text: "先看看素材能不能用，只出高斯。" },
+    preview_mesh: { time: "约 5 分钟", text: "快速预览，再做一个小网格看看。" },
+    standard: { time: "约 15–25 分钟", text: "清晰的高斯，平时用这个。" },
+    high: { time: "约 40 分钟", text: "更细，但用时翻倍，要放大细看才值得。" },
+    full: { time: "30 分钟到一个多小时", text: "高斯加带贴图的网格，要导入游戏引擎时用。" },
+    mesh_only: { time: "约 10–40 分钟", text: "只要网格，不训练高斯，用时看照片多少。" }
+  };
+
+  function goalCard(t, chosen) {
+    var label = el("label", "goal");
+    var input = document.createElement("input");
+    input.type = "radio";
+    input.name = "template";
+    input.value = t.id;
+    input.checked = t.id === chosen;
+    input.disabled = uploadLocked() || state.busy;
+    input.addEventListener("change", function () { state.template = t.id; });
+    var body = el("span", "goal-body");
+    var name = el("span", "goal-name", t.label);
+    if (t.id === defaultTemplate()) { name.appendChild(el("span", "tag is-accent", "推荐")); }
+    body.appendChild(name);
+    var text = GOAL_TEXT[t.id];
+    body.appendChild(el("span", "goal-desc", text ? text.text : (t.desc || "")));
+    if (text) { body.appendChild(el("span", "goal-time", text.time)); }
+    label.appendChild(input);
+    label.appendChild(body);
+    return label;
+  }
 
   function renderTemplatePicker() {
     var holder = $("tpl-picker");
@@ -192,31 +225,31 @@
     var chosen = state.template && list.some(function (t) { return t.id === state.template; })
       ? state.template : defaultTemplate() || list[0].id;
     state.template = chosen;
-    var box = $("tpl-options");
+    var main = GOAL_MAIN.map(function (id) { return list.filter(function (t) { return t.id === id; })[0]; })
+      .filter(Boolean);
+    if (!main.length) { main = list.slice(0, 3); }
+    var rest = list.filter(function (t) { return main.indexOf(t) < 0; });
+    var box = $("tpl-options"), more = $("tpl-options-more");
     box.textContent = "";
-    list.forEach(function (t) {
-      var label = el("label", "quality-option");
-      var input = document.createElement("input");
-      input.type = "radio";
-      input.name = "template";
-      input.value = t.id;
-      input.checked = t.id === chosen;
-      input.disabled = uploadLocked() || state.busy;
-      input.addEventListener("change", function () { state.template = t.id; });
-      var body = el("span", "quality-body");
-      var name = el("span", "quality-name", t.label);
-      if (t.id === defaultTemplate()) { name.appendChild(el("span", "tag", "默认")); }
-      body.appendChild(name);
-      if (t.desc) { body.appendChild(el("span", "quality-desc", t.desc)); }
-      var runs = S3.templateStages(t);
-      if (runs) { body.appendChild(el("span", "quality-desc quality-runs", runs)); }
-      label.appendChild(input);
-      label.appendChild(body);
-      box.appendChild(label);
-    });
+    more.textContent = "";
+    main.forEach(function (t) { box.appendChild(goalCard(t, chosen)); });
+    rest.forEach(function (t) { more.appendChild(goalCard(t, chosen)); });
+    $("tpl-more").hidden = rest.length === 0;
+    if (rest.some(function (t) { return t.id === chosen; })) { $("tpl-more").open = true; }
   }
 
-  // ------------------------------------------------------------------ new task: choosing files
+  // What the choice of masking adds to the new scan, as a partial workflow ({stage: {...}}).
+  function maskOverride(template) {
+    var picked = document.querySelector('input[name="mask"]:checked');
+    var choice = picked ? picked.value : "off";
+    if (choice === "off") {
+      var t = templateList().filter(function (x) { return x.id === template; })[0];
+      return t && Array.isArray(t.enabled) && t.enabled.indexOf("masks") >= 0 ? { masks: { enabled: false } } : null;
+    }
+    return { masks: { enabled: true, params: { kind: choice } } };
+  }
+
+  // ------------------------------------------------------------------ new scan: choosing files
 
   var stripControl;
   try { stripControl = new RegExp("[\\p{Cc}\\p{Cf}\\p{Cs}]", "gu"); }
@@ -328,7 +361,7 @@
     row.fill.style.width = (100 * item.sent / Math.max(1, item.size)).toFixed(1) + "%";
   }
 
-  // ------------------------------------------------------------------ new task: uploading
+  // ------------------------------------------------------------------ new scan: uploading
 
   function renderForm() {
     var up = state.upload;
@@ -336,8 +369,8 @@
     var paused = !!(up && up.job && !up.running);
     var locked = running || state.busy;
     $("btn-start").disabled = locked;
-    setText($("btn-start"), paused ? "继续上传" : (running ? "正在上传…" : ($("opt-start").checked ? "上传并运行" : "上传")));
-    if (state.mode === "path") { setText($("btn-start"), locked ? "正在创建…" : ($("opt-start").checked ? "创建并运行" : "创建")); }
+    setText($("btn-start"), paused ? "继续上传" : (running ? "正在上传…" : ($("opt-start").checked ? "开始扫描" : "上传素材")));
+    if (state.mode === "path") { setText($("btn-start"), locked ? "正在创建…" : ($("opt-start").checked ? "开始扫描" : "创建")); }
     $("btn-abort").hidden = !(running || paused);
     setText($("btn-abort"), paused ? "放弃并删除" : "取消上传");
     $("file-input").disabled = uploadLocked();
@@ -346,7 +379,7 @@
     $("opt-start").disabled = locked;
     $("tab-upload").disabled = uploadLocked() || state.busy;
     $("tab-path").disabled = uploadLocked() || state.busy;
-    var radios = document.querySelectorAll('input[name="template"]');
+    var radios = document.querySelectorAll('input[name="template"], input[name="mask"]');
     for (var i = 0; i < radios.length; i++) { radios[i].disabled = locked || paused; }
     $("btn-clear-files").hidden = uploadLocked();
     $("upload-progress").hidden = !(running || paused);
@@ -450,14 +483,14 @@
     return tryOnce();
   }
 
-  function runUpload(name, template, startNow) {
+  function runUpload(name, template, startNow, workflow) {
     var up = state.upload || (state.upload = { job: null });
     up.running = true;
     up.aborted = false;
     showError("form-error", "");
     renderForm();
 
-    var created = up.job ? Promise.resolve() : api("POST", "/api/jobs", { name: name || null, template: template })
+    var created = up.job ? Promise.resolve() : api("POST", "/api/jobs", { name: name || null, template: template, workflow: workflow || undefined })
       .then(function (job) { up.job = job.job; });
 
     created.then(function () {
@@ -541,7 +574,8 @@
       if (!path) { showError("form-error", "请填写文件夹或视频文件的完整路径。"); return; }
       state.busy = true;
       renderForm();
-      api("POST", "/api/jobs", { name: name || null, template: template, path: path, start: startNow })
+      api("POST", "/api/jobs", { name: name || null, template: template, path: path, start: startNow,
+                                 workflow: maskOverride(template) || undefined })
         .then(function (job) {
           $("job-name").value = "";
           $("local-path").value = "";
@@ -554,7 +588,7 @@
       showError("form-error", "请先选择照片或视频。");
       return;
     }
-    runUpload(name, template, startNow);
+    runUpload(name, template, startNow, maskOverride(template));
   }
 
   function onAbort() {
@@ -646,35 +680,17 @@
       name: el("span", "job-name", name),
       badge: el("span", "badge"),
       sub: el("span", "job-sub"),
-      dots: el("span", "dots"),
       progress: el("div", "progress"),
       bar: el("div", "progress-bar"),
-      act: null, actKind: null, dotEls: []
+      act: null, actKind: null
     };
-    row.dots.setAttribute("aria-hidden", "true");
     row.progress.appendChild(row.bar);
     link.appendChild(row.name);
     link.appendChild(row.badge);
     link.appendChild(row.sub);
-    link.appendChild(row.dots);
     link.appendChild(row.progress);
     li.appendChild(link);
     return row;
-  }
-
-  function updateDots(row, job) {
-    var schema = (S3.schema && S3.schema.stages) || [];
-    if (row.dotEls.length !== schema.length) {
-      row.dots.textContent = "";
-      row.dotEls = schema.map(function () { var d = el("i", "dot"); row.dots.appendChild(d); return d; });
-    }
-    schema.forEach(function (s, i) {
-      var st = (job.stages && job.stages[s.id] && job.stages[s.id].state) || "";
-      var cls = "dot" + (st ? " s-" + st : "");
-      S3.setClass(row.dotEls[i], cls);
-      var tip = s.label + (st ? "：" + (S3.STAGE_STATE[st] ? S3.STAGE_STATE[st].word : st) : "");
-      if (row.dotEls[i].getAttribute("data-tip") !== tip) { S3.setTip(row.dotEls[i], tip); }
-    });
   }
 
   function updateJobAction(row, job) {
@@ -726,7 +742,6 @@
       var active = job.state === "running" || job.state === "queued";
       if (!active) { row.cancelAsked = 0; }
       setText(row.sub, active && (row.cancelAsked || job.cancelling) ? "正在停止，等当前这一步结束…" : jobSummary(job));
-      updateDots(row, job);
       var p = stageProgressOf(job);
       S3.setClass(row.progress, "progress" + (job.state === "running" && p === null ? " is-indeterminate" : ""));
       row.bar.style.width = job.state === "running" && p !== null ? (100 * S3.clamp01(p)).toFixed(1) + "%" : "";
@@ -780,13 +795,16 @@
     var box = $("d-outputs");
     box.hidden = files.length === 0;
     if (!files.length) { return; }
-    setText($("d-outputs-count"), "输出文件（" + files.length + "）");
+    setText($("d-outputs-count"), "下载（" + files.length + "）");
     var signature = files.map(function (f) { return f.path + ":" + f.size + (f.outdated ? ":old" : ""); }).join("|");
     var list = $("d-output-list");
     if (list.getAttribute("data-signature") !== signature) {
       list.setAttribute("data-signature", signature);
       list.textContent = "";
-      files.forEach(function (file) {
+      var MAIN = { splat: 1, mesh: 1, collision: 1 };
+      var main = files.filter(function (f) { return MAIN[f.key] && !f.outdated; });
+      var rest = files.filter(function (f) { return main.indexOf(f) < 0; });
+      function addRow(file) {
         var row = el("li", "output-row");
         var label = OUTPUT_LABEL[file.key] || OUTPUT_NAME_LABEL[file.name] || file.name;
         row.appendChild(el("span", "output-label", file.outdated ? OUTPUT_OUTDATED_LABEL : label));
@@ -796,7 +814,10 @@
         link.setAttribute("download", "");
         row.appendChild(link);
         list.appendChild(row);
-      });
+      }
+      main.forEach(addRow);
+      if (main.length && rest.length) { list.appendChild(el("li", "output-divider", "其他文件")); }
+      rest.forEach(addRow);
     }
     $("btn-open-folder").hidden = !has(job, "open_folder");
     $("btn-open-viewer").hidden = !has(job, "open_viewer");
@@ -824,6 +845,44 @@
     var id = name.replace(/\.log$/, "");
     var label = S3.stageLabel(id);
     return label && label !== id ? label + "（" + name + "）" : name;
+  }
+
+  // The simple progress strip: the stages this scan will run (or ran), in order, each with its
+  // state. The full graph with switches and parameters is under "调整每一步".
+  var STEP_HIDDEN = { export: true };
+
+  function renderSteps(job) {
+    var list = $("d-steps");
+    var schema = (S3.schema && S3.schema.stages) || [];
+    var rows = [];
+    schema.forEach(function (s) {
+      var entry = job.stages && job.stages[s.id];
+      var st = entry && entry.state;
+      if (!st || st === "disabled" || STEP_HIDDEN[s.id]) { return; }
+      var word = (S3.STAGE_STATE[st] || {}).word || st;
+      var text = s.label;
+      if (st === "running" && typeof entry.progress === "number") { text += " " + Math.round(100 * S3.clamp01(entry.progress)) + "%"; }
+      rows.push({ id: s.id, st: st, text: text, word: word });
+    });
+    var signature = rows.map(function (r) { return r.id + ":" + r.st + ":" + r.text; }).join("|");
+    if (list.getAttribute("data-signature") === signature) { return; }
+    list.setAttribute("data-signature", signature);
+    list.textContent = "";
+    list.hidden = rows.length === 0;
+    rows.forEach(function (r) {
+      var li = el("li", "step s-" + r.st);
+      li.appendChild(S3.icon((S3.STAGE_STATE[r.st] || S3.STAGE_STATE.pending).icon, "step-ico"));
+      li.appendChild(el("span", "step-text", r.text));
+      li.setAttribute("title", r.word);
+      list.appendChild(li);
+    });
+  }
+
+  function runLabel(job) {
+    if (job.state === "created") { return "开始扫描"; }
+    if (job.state === "failed" || job.state === "cancelled") { return "继续运行"; }
+    if (job.state === "done") { return "再运行"; }
+    return "运行";
   }
 
   function renderDetail(job) {
@@ -871,24 +930,24 @@
     warningList.hidden = warnings.length === 0;
 
     renderOutputs(job);
+    renderSteps(job);
     if (S3.wf) { S3.wf.update(job); }
+    $("d-next").hidden = isBusy(job) || !$("d-next-title").textContent;
     window.scan3dJobView.update(job, state.route.tab);
 
     var busy = isBusy(job);
     var empty = job.state === "created" && !(job.uploads && job.uploads.count) && job.source === "upload";
     var run = $("btn-job-start");
     run.hidden = busy || empty;
-    setText(run, job.state === "created" ? "运行" : "运行");
+    run.setAttribute("data-state", job.state);
+    setText($("btn-job-start-text"), runLabel(job));
     var stop = $("btn-job-cancel");
     stop.hidden = !(busy || has(job, "cancel")) || !!job.cancelling;
     $("btn-job-delete").hidden = !has(job, "delete");
     $("btn-job-folder").hidden = !has(job, "open_folder");
 
     renderLogFiles(job);
-    if (failed && state.logOpenedFor !== job.job) {
-      state.logOpenedFor = job.job;   // show the log once; the user may close it again
-      $("d-log").open = true;
-    }
+    $("job-menu").hidden = $("btn-job-folder").hidden && $("btn-job-delete").hidden;
   }
 
   function refreshDetail() {
@@ -919,7 +978,7 @@
   }
 
   function refreshLog() {
-    var details = $("d-log");
+    var details = $("d-files");
     var job = state.detail;
     if (!details.open || !job) { return Promise.resolve(); }
     var file = $("d-log-file").value || "pipeline.log";
@@ -1147,12 +1206,15 @@
         setText($("d-name"), job);
         $("d-state").className = "badge";
         ["d-state", "d-meta", "d-message"].forEach(function (id) { setText($(id), ""); });
-        ["d-error", "d-warnings", "d-outputs", "d-viewer", "btn-job-start", "btn-job-cancel", "btn-job-delete", "btn-job-folder"]
+        ["d-error", "d-warnings", "d-outputs", "d-viewer", "btn-job-start", "btn-job-cancel", "btn-job-delete", "btn-job-folder", "job-menu"]
           .forEach(function (id) { $(id).hidden = true; });
-        $("d-log").open = false;
+        $("d-files").open = false;
         $("d-log-text").textContent = "";
         $("d-log-file").removeAttribute("data-signature");
         state.log = { job: null, file: null, offset: null, raw: "" };
+        $("d-steps").textContent = "";
+        $("d-steps").removeAttribute("data-signature");
+        $("d-adv").open = false;
       } else {
         window.scan3dJobView.update(state.detail, state.route.tab);   // a tab was chosen
         if (state.route.tab) { scrollToViewer(); }
@@ -1192,7 +1254,7 @@
       setTimeout(scrollToViewer, 60);
     },
     showLog: function (file) {
-      var details = $("d-log");
+      var details = $("d-files");
       details.open = true;
       var select = $("d-log-file");
       if (state.detail) { state.logChoice = { job: state.detail.job, file: file }; }
@@ -1260,7 +1322,26 @@
     $("btn-job-folder").addEventListener("click", openFolder);
     $("btn-open-viewer").addEventListener("click", function () { jobAction("POST", "/open-viewer", {}); });
 
-    $("d-log").addEventListener("toggle", function () { refreshLog().catch(function () {}); });
+    $("d-files").addEventListener("toggle", function () { refreshLog().catch(function () {}); });
+    $("d-adv").addEventListener("toggle", function () {
+      if ($("d-adv").open && S3.wf) { S3.wf.relayout(); }       // the graph is measured while visible
+    });
+    $("btn-show-log").addEventListener("click", function () { S3.app.showLog("pipeline.log"); });
+
+    // Small pop-up menus (job actions, downloads, more result tabs) close when something else is clicked.
+    document.addEventListener("click", function (event) {
+      var open = document.querySelectorAll("details.menu[open], details.tab-more[open]");
+      for (var i = 0; i < open.length; i++) {
+        var inside = open[i].contains(event.target);
+        var picked = inside && event.target.closest && event.target.closest(".menu-pop button, .menu-pop a, .tab-more-pop a");
+        if (!inside || picked) { open[i].open = false; }
+      }
+    });
+    document.addEventListener("keydown", function (event) {
+      if (event.key !== "Escape") { return; }
+      var open = document.querySelectorAll("details.menu[open], details.tab-more[open]");
+      for (var i = 0; i < open.length; i++) { open[i].open = false; }
+    });
     $("d-log-file").addEventListener("change", function () {
       if (state.detail) { state.logChoice = { job: state.detail.job, file: $("d-log-file").value }; }
       refreshLog().catch(function () {});

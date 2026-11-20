@@ -10,6 +10,8 @@
 
   var TABS = ["report", "splat", "mesh", "collision", "overlay", "coverage"];
   var SPLAT_TABS = ["splat", "overlay", "coverage"];      // the tabs that show the splat
+  var MORE_TABS = ["collision", "overlay", "report"];     // kept under "更多"
+  var FIRST_CHOICE = ["splat", "mesh", "collision", "overlay", "coverage", "report"];     // what opens first
   function stageName(key) {      // the label the server's schema gives the stage
     var label = window.S3 && window.S3.stageLabel ? window.S3.stageLabel(key) : "";
     return label || key;
@@ -405,18 +407,19 @@
   function renderQualityLabels() {
     var variants = (current.previews && current.previews.variants) || {};
     var total = current.report && current.report.stages && current.report.stages.train && current.report.stages.train.gaussians;
-    function label(name, variant, fallback) {
-      var bits = [];
+    function label(node, name, variant, tip) {
+      var size = variant && variant.state === "ready" && isNum(variant.size) ? "  " + fmtBytes(variant.size) : "";
+      node.textContent = name + size;
       var most = variant && variant.max_gaussians;
-      if (isNum(most) && !(isNum(total) && total <= most)) { bits.push("最多 " + fmtWan(most) + "个"); }
-      else if (isNum(total)) { bits.push(fmtWan(total) + "个"); }
-      if (variant && variant.state === "ready" && isNum(variant.size)) { bits.push(fmtBytes(variant.size)); }
-      return name + (bits.length ? "（" + bits.join("，") + "）" : fallback);
+      var count = isNum(most) && !(isNum(total) && total <= most) ? "最多 " + fmtWan(most) + "个高斯"
+        : (isNum(total) ? fmtWan(total) + "个高斯" : "");
+      S3.setTip(node.parentNode, (count ? count + "。" : "") + tip);
     }
-    $("v-quality-lite").textContent = label("轻量", variants.lite, "");
-    $("v-quality-full").textContent = label("完整", variants.full, "");
+    label($("v-quality-lite"), "轻量", variants.lite, "精简了高斯，不含随视角变化的颜色（反光、高光），适合手机。");
+    label($("v-quality-full"), "完整", variants.full, "全部高斯，含随视角变化的颜色，数值经过压缩，和原文件差别很难看出来。");
     var source = sourceFile();
-    $("v-quality-original").textContent = "原画质" + (source && isNum(source.size) ? "（" + fmtBytes(source.size) + "）" : "");
+    $("v-quality-original").textContent = "原画质" + (source && isNum(source.size) ? "  " + fmtBytes(source.size) : "");
+    S3.setTip($("v-quality-original").parentNode, "直接读取 splat.ply，和下载到的文件完全一致，文件大，加载慢。");
   }
 
   // splat.ply itself: what the server said about it, or failing that the entry in the file list.
@@ -607,19 +610,11 @@
     if (!(info.splats > 0)) { return ""; }
     var variants = (current.previews && current.previews.variants) || {};
     var source = sourceFile() || {};
-    var text = "正在显示 " + fmtCount(info.splats) + " 个高斯。";
-    var flat = source.sh_degree === 0 ? "这个点云本身不含随视角变化的颜色。" : "";
-    if (tier === "lite") {
-      text += "轻量：只保留最重要的一部分高斯，不含随视角变化的颜色（反光、高光），适合手机。";
-    } else if (tier === "full") {
-      text += flat || (info.shDegree > 0
-        ? "完整：全部高斯，包含随视角变化的颜色；数值经过压缩，和原文件的差别很难看出来。"
-        : "完整：全部高斯。");
-      if (variants.full && variants.full.output_outdated) {
-        text += "输出文件夹里的 preview.spz 是旧版本（不含随视角变化的颜色），网页已经另外生成了新的并改用它。";
-      }
-    } else {
-      text += "原画质：直接读取 splat.ply，和下载到的文件完全一致。" + flat;
+    var text = "正在显示 " + fmtCount(info.splats) + " 个高斯";
+    text += tier === "lite" ? "（轻量档，适合手机）。" : tier === "original" ? "（原画质，和 splat.ply 一致）。" : "。";
+    if (source.sh_degree === 0) { text += "这个点云本身不含随视角变化的颜色。"; }
+    if (tier === "full" && variants.full && variants.full.output_outdated) {
+      text += "输出文件夹里的 preview.spz 是旧版本，网页已经另外生成了新的并改用它。";
     }
     return text;
   }
@@ -716,6 +711,8 @@
       links[i].classList.toggle("is-active", on);
       if (on) { links[i].setAttribute("aria-current", "page"); } else { links[i].removeAttribute("aria-current"); }
     }
+    var more = $("v-more");
+    more.querySelector("summary").classList.toggle("is-active", !!more.querySelector("a.is-active"));
     $("v-report").hidden = tab !== "report";
     $("v-3d").hidden = tab === "report";
     if (tab === "report") {
@@ -749,7 +746,8 @@
       links[i].hidden = !available[name];
       links[i].setAttribute("href", "#/job/" + encodeURIComponent(job.job) + "/view/" + name);
     }
-    var tab = requested && available[requested] ? requested : (available.report ? "report" : TABS.filter(function (t) { return available[t]; })[0]);
+    $("v-more").hidden = !TABS.some(function (name) { return MORE_TABS.indexOf(name) >= 0 && available[name]; });
+    var tab = requested && available[requested] ? requested : FIRST_CHOICE.filter(function (t) { return available[t]; })[0];
     var signature = job.job + "|" + tab + "|" + (job.output_files || []).map(function (f) { return f.path + ":" + f.size; }).join(",");
     if (signature === current.signature) { return; }
     if (current.job !== job.job) {
